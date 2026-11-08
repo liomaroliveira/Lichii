@@ -123,7 +123,69 @@ void CheckLayout(const Layout& layout, bool native) {
     CHECK(swizzled == expected);
 }
 
+struct Subrect {
+    u32 origin_x;
+    u32 origin_y;
+    u32 extent_x;
+    u32 lines;
+    u32 pitch;
+};
+
+// SwizzleSubrect: the lines start at origin_y in each slice and continue into the next one.
+void CheckSubrect(const Layout& layout, const Subrect& rect, bool native) {
+    INFO("width " << layout.width << " height " << layout.height << " depth " << layout.depth
+                  << " bpp " << layout.bpp << " block height " << layout.block_height
+                  << " block depth " << layout.block_depth << " origin " << rect.origin_x << ","
+                  << rect.origin_y << " extent " << rect.extent_x << " lines " << rect.lines
+                  << " pitch " << rect.pitch << " native " << native);
+    const size_t guest_bytes = GuestBytes(layout);
+    const std::vector<u8> source =
+        RandomBytes(size_t{rect.pitch} * layout.height * layout.depth, rect.extent_x * 7 + 3);
+    std::vector<u8> swizzled(guest_bytes, 0x5a);
+    std::vector<u8> expected(guest_bytes, 0x5a);
+    u32 remaining = rect.lines;
+    const u32 lines_per_slice = (std::min)(rect.lines, layout.height - rect.origin_y);
+    for (u32 z = 0; z < layout.depth && remaining != 0; ++z) {
+        const u32 lines = (std::min)(remaining, lines_per_slice);
+        for (u32 line = 0; line < lines; ++line) {
+            for (u32 x = 0; x < rect.extent_x * layout.bpp; ++x) {
+                expected[BlockLinearOffset(layout, rect.origin_x * layout.bpp + x,
+                                           rect.origin_y + line, z, native)] =
+                    source[(size_t{z} * layout.height + line) * rect.pitch + x];
+            }
+        }
+        remaining -= lines;
+    }
+    SwizzleSubrect(swizzled, source, layout.bpp, layout.width, layout.height, layout.depth,
+                   rect.origin_x, rect.origin_y, rect.extent_x, rect.lines, layout.block_height,
+                   layout.block_depth, rect.pitch, native);
+    CHECK(swizzled == expected);
+}
+
 } // Anonymous namespace
+
+TEST_CASE("Block linear subrect swizzle matches the GOB layout", "[block_linear_swizzle]") {
+    // Origins and extents that start and end inside 16-byte units and GOBs.
+    for (const u32 bpp : {1U, 2U, 4U, 8U, 16U}) {
+        for (const u32 block_height : {0U, 2U, 4U}) {
+            for (const bool native : {false, true}) {
+                const Layout layout{100, 40, 1, bpp, block_height, 0, 0};
+                for (const Subrect rect : {Subrect{0, 0, 100, 40, 100 * bpp},
+                                           Subrect{3, 5, 17, 9, 17 * bpp},
+                                           Subrect{13, 7, 61, 33, 64 * bpp},
+                                           Subrect{99, 39, 1, 1, bpp},
+                                           Subrect{31, 0, 2, 40, 5 * bpp}}) {
+                    CheckSubrect(layout, rect, native);
+                }
+            }
+        }
+    }
+    // Lines that continue into the next slices.
+    for (const bool native : {false, true}) {
+        CheckSubrect({24, 9, 3, 4, 1, 1, 0}, {5, 2, 11, 20, 11 * 4}, native);
+        CheckSubrect({40, 16, 2, 16, 2, 0, 0}, {1, 0, 37, 32, 40 * 16}, native);
+    }
+}
 
 TEST_CASE("Block linear swizzle matches the GOB layout", "[block_linear_swizzle]") {
     // Widths whose rows are and aren't a whole number of 16-byte units (UnswizzleTexture widens
@@ -154,6 +216,27 @@ TEST_CASE("Block linear swizzle matches the GOB layout", "[block_linear_swizzle]
             CheckLayout({37, 19, 1, 4, 2, 0, alignment}, native);
             CheckLayout({64, 24, 1, 16, 3, 0, alignment}, native);
         }
+    }
+}
+
+TEST_CASE("Block linear subrect swizzle microbenchmark", "[.block_linear_swizzle_benchmark]") {
+    // A DMA copy of a 1024x1024 RGBA8 region from pitch linear into block linear.
+    const Layout layout{1024, 1024, 1, 4, 4, 0, 0};
+    const std::vector<u8> source = RandomBytes(LinearBytes(layout), 2);
+    std::vector<u8> guest(GuestBytes(layout));
+    for (const bool native : {false, true}) {
+        constexpr int iterations = 200;
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < iterations; ++i) {
+            SwizzleSubrect(guest, source, layout.bpp, layout.width, layout.height, 1, 0, 0,
+                           layout.width, layout.height, layout.block_height, 0,
+                           layout.width * layout.bpp, native);
+        }
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::printf("1024x1024 RGBA8 subrect swizzle%s: %.3f ms, %.2f GB/s\n",
+                    native ? " (native tiling)" : "", seconds * 1e3 / iterations,
+                    LinearBytes(layout) * iterations / seconds / 1e9);
     }
 }
 
