@@ -793,6 +793,8 @@ public:
                      VmaAllocation& allocation) noexcept;
     /// Destroys every kept image of this allocator and keeps nothing more (allocator teardown).
     static void Clear(VmaAllocator allocator) noexcept;
+    /// Keeps images of a new allocator again, though it has the address of a cleared one.
+    static void Open(VmaAllocator allocator) noexcept;
     /// Device memory the kept images hold (free memory to the texture cache's collector).
     [[nodiscard]] static u64 KeptBytes() noexcept;
     /// Drops the oldest kept images until at most `bytes` are kept.

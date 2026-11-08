@@ -736,6 +736,14 @@ void ImageRecycler::Shrink(u64 bytes) noexcept {
     TrimRecycler(state, RecyclerCap - bytes, std::chrono::steady_clock::now());
 }
 
+void ImageRecycler::Open(VmaAllocator allocator) noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    if (state.closed == allocator) {
+        state.closed = nullptr;
+    }
+}
+
 void ImageRecycler::Clear(VmaAllocator allocator) noexcept {
     RecyclerState& state = Recycler();
     std::scoped_lock lock{state.mutex};
