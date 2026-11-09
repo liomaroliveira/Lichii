@@ -478,6 +478,8 @@ private:
     void UpdateStatusButtons();
     void UpdateUISettings();
     void UpdateInputDrivers();
+    /// EDEN_NX2_AUTOMAP=1: maps a newly connected controller to player 1 when its own is gone.
+    void Nx2AutoMapController();
     void HideMouseCursor();
     void ShowMouseCursor();
     void OpenURL(const QUrl& url);
@@ -584,6 +586,7 @@ private:
 #endif
     QTimer mouse_hide_timer;
     QTimer update_input_timer;
+    QTimer nx2_automap_timer;
 
     QString startup_icon_theme;
 
