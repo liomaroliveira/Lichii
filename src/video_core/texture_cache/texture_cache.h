@@ -194,6 +194,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
+        trace_delete_reason = aggressive_mode      ? "gc-aggressive"
+                              : high_priority_mode ? "gc-high-priority"
+                                                   : "gc";
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
@@ -1383,6 +1386,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, id);
         }
         UnregisterImage(id);
+        trace_delete_reason = "unmap";
         DeleteImage(id);
     }
     ClearStale(cpu_addr, size);
@@ -3016,11 +3020,27 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                  gpu_addr, info.size.width, info.size.height, info.size.depth, info.resources.levels,
                  static_cast<u32>(info.format), info.block.width, info.block.height, info.block.depth);
     }
+    // EDEN_NX2_TC_TRACE=1: log every image the cache creates (time, format, size, joins) and deletes
+    static const bool tc_trace = [] {
+        const char* const v = std::getenv("EDEN_NX2_TC_TRACE");
+        return v != nullptr && v[0] == '1';
+    }();
+    const auto tc_t0 = tc_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
     if (!image_id) {
         return image_id;
     }
     const Image& image = slot_images[image_id];
+    if (tc_trace) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc_t0).count();
+        LOG_WARNING(HW_GPU,
+                    "TCTRACE create id={} gpu={:#x} type={} fmt={} {}x{}x{} lv={} ly={} guest={}KiB "
+                    "joined={} found={} ms={:.2f} frame={}",
+                    image_id.index, image.gpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
+                    info.size.width, info.size.height, info.size.depth, image.info.resources.levels,
+                    image.info.resources.layers, image.guest_size_bytes / 1024, join_overlap_ids.size(),
+                    join_overlaps_found.size(), ms, frame_tick);
+    }
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
     if (is_new) {
@@ -3195,6 +3215,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, overlap_id);
         }
         UnregisterImage(overlap_id);
+        trace_delete_reason = "join-ignored";
         DeleteImage(overlap_id);
     }
 
@@ -3393,6 +3414,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, copy_object.id);
         }
         UnregisterImage(copy_object.id);
+        trace_delete_reason = "join";
         DeleteImage(copy_object.id);
     }
 
@@ -4054,6 +4076,22 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    {
+        static const bool tc_trace = [] {
+            const char* const v = std::getenv("EDEN_NX2_TC_TRACE");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (tc_trace) {
+            LOG_WARNING(HW_GPU,
+                        "TCTRACE delete id={} gpu={:#x} fmt={} {}x{}x{} guest={}KiB immediate={} "
+                        "reason={} frame={}",
+                        image_id.index, image.gpu_addr, static_cast<u32>(image.info.format),
+                        image.info.size.width, image.info.size.height, image.info.size.depth,
+                        image.guest_size_bytes / 1024, immediate_delete, trace_delete_reason,
+                        frame_tick);
+        }
+        trace_delete_reason = "other";
+    }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
