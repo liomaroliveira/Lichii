@@ -11,6 +11,8 @@
 #include <QScopeGuard>
 #include <QFile>
 #include <cstdlib>
+#include <optional>
+#include <string_view>
 #include <QSysInfo>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
@@ -494,6 +496,13 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     update_input_timer.setInterval(default_input_update_timeout);
     connect(&update_input_timer, &QTimer::timeout, this, &MainWindow::UpdateInputDrivers);
     update_input_timer.start();
+    // EDEN_NX2_AUTOMAP=1: a controller connected while playing (a stream's virtual pad, a pad switched
+    // from cable to its wireless dongle) takes over player 1 when player 1's own controller is absent.
+    if (const char* automap = std::getenv("EDEN_NX2_AUTOMAP"); automap != nullptr && automap[0] == '1') {
+        nx2_automap_timer.setInterval(2000);
+        connect(&nx2_automap_timer, &QTimer::timeout, this, &MainWindow::Nx2AutoMapController);
+        nx2_automap_timer.start();
+    }
 
     if (has_broken_vulkan) {
         UISettings::values.has_broken_vulkan = true;
@@ -5193,6 +5202,59 @@ void MainWindow::UpdatePostShaderText() {
     post_shader_status_button->setText(QString::fromStdString(preset).toUpper());
 }
 #endif
+
+void MainWindow::Nx2AutoMapController() {
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller == nullptr || controller->IsConfiguring()) {
+        return;
+    }
+    const Common::ParamPackage current = controller->GetButtonParam(Settings::NativeButton::A);
+    const std::string current_guid = current.Get("guid", "");
+    const int current_port = current.Get("port", 0);
+    const bool uses_pad = !current_guid.empty();
+    std::optional<Common::ParamPackage> candidate;
+    for (const auto& device : input_subsystem->GetInputDevices()) {
+        if (device.Get("engine", "") != "sdl" || !device.Has("guid") || device.Has("guid2")) {
+            continue;
+        }
+        if (uses_pad && device.Get("guid", "") == current_guid &&
+            device.Get("port", 0) == current_port) {
+            return; // player 1's controller is connected
+        }
+        if (!candidate) {
+            candidate = device;
+        }
+    }
+    if (!candidate) {
+        return;
+    }
+    const auto buttons = input_subsystem->GetButtonMappingForDevice(*candidate);
+    if (buttons.empty()) {
+        return;
+    }
+    for (const auto& [index, param] : buttons) {
+        controller->SetButtonParam(index, param);
+    }
+    for (const auto& [index, param] : input_subsystem->GetAnalogMappingForDevice(*candidate)) {
+        controller->SetStickParam(index, param);
+    }
+    // EDEN_NX2_AUTOMAP_LAYOUT=xbox: A/B/X/Y by the Xbox letters (A at the bottom) instead of the
+    // Switch positions.
+    if (const char* layout = std::getenv("EDEN_NX2_AUTOMAP_LAYOUT");
+        layout != nullptr && std::string_view{layout} == "xbox") {
+        const auto swap = [controller](int first, int second) {
+            const auto a = controller->GetButtonParam(first);
+            controller->SetButtonParam(first, controller->GetButtonParam(second));
+            controller->SetButtonParam(second, a);
+        };
+        swap(Settings::NativeButton::A, Settings::NativeButton::B);
+        swap(Settings::NativeButton::X, Settings::NativeButton::Y);
+    }
+    controller->SaveCurrentConfig();
+    LOG_INFO(Frontend, "Player 1 mapped to {} (its controller was not connected)",
+             candidate->Get("display", "?"));
+}
 
 void MainWindow::UpdateFrameGenButton() {
     // EDEN_NX2_FRAMEGEN_STATUS_FILE=<path>: keep the button's state in a file (an overlay such as
