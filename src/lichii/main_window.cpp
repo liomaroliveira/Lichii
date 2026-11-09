@@ -8,6 +8,9 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <QScopeGuard>
+#include <QFile>
+#include <cstdlib>
 #include <QSysInfo>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
@@ -1426,6 +1429,23 @@ void MainWindow::InitializeHotkeys() {
         Settings::ToggleStandardMode();
         SetFPSSuffix();
     });
+
+    // Frame generation on/off while playing (the status bar button does the same, but it is hidden
+    // in fullscreen): each key turns its type on, or off when that type is already running.
+    const auto toggle_frame_gen = [this](Settings::FrameGenType type) {
+        if (Settings::values.frame_gen.GetValue() &&
+            Settings::values.frame_gen_type.GetValue() == type) {
+            Settings::values.frame_gen.SetValue(false);
+        } else {
+            Settings::values.frame_gen_type.SetValue(type);
+            Settings::values.frame_gen.SetValue(true);
+        }
+        UpdateFrameGenButton();
+    };
+    connect_shortcut(QStringLiteral("Toggle Frame Generation (LSFG)"),
+                     [toggle_frame_gen] { toggle_frame_gen(Settings::FrameGenType::Lsfg); });
+    connect_shortcut(QStringLiteral("Toggle Frame Generation (Optical Flow)"),
+                     [toggle_frame_gen] { toggle_frame_gen(Settings::FrameGenType::Fsr3); });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
         Settings::ToggleTurboMode();
@@ -5445,6 +5465,20 @@ void MainWindow::UpdatePostShaderText() {
 #endif
 
 void MainWindow::UpdateFrameGenButton() {
+    // EDEN_NX2_FRAMEGEN_STATUS_FILE=<path>: keep the button's state in a file (an overlay such as
+    // MangoHud can show it in fullscreen, where the status bar is hidden). Written on changes only.
+    const auto write_status = qScopeGuard([this] {
+        static const char* const path = std::getenv("EDEN_NX2_FRAMEGEN_STATUS_FILE");
+        static QString last;
+        if (path == nullptr || frame_gen_status_button->text() == last) {
+            return;
+        }
+        last = frame_gen_status_button->text();
+        QFile file(QString::fromLocal8Bit(path));
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            file.write(last.toUtf8() + '\n');
+        }
+    });
     const bool enabled = Settings::values.frame_gen.GetValue();
     frame_gen_status_button->setChecked(enabled);
     if (!enabled) {
