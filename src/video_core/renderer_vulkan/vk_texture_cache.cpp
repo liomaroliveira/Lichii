@@ -76,6 +76,7 @@ using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::SurfaceType;
 
 namespace {
+// The levels a host image of the guest's size can have: one when multisampled.
 [[nodiscard]] u32 FullHostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
@@ -105,10 +106,12 @@ std::atomic<bool> even_bc_shapes{false};
     return 0;
 }
 
+// The same for the guest size and full level chain of `info`.
 [[nodiscard]] u32 FirstUnevenBlockMip(const VideoCommon::ImageInfo& info) {
     return FirstUnevenBlockMip(info.size.width, info.size.height, FullHostMipCount(info));
 }
 
+// The size of `info` decoded to RGBA8: every level of every layer.
 [[nodiscard]] u64 DecodedAstcBytes(const VideoCommon::ImageInfo& info) {
     u64 bytes = 0;
     for (u32 level = 0; level < FullHostMipCount(info); ++level) {
@@ -176,11 +179,13 @@ struct BcShape {
     return shape && (shape->width != info.size.width || shape->height != info.size.height);
 }
 
+// The levels of the host image: those of its even BC shape when it has one (EvenBcShape).
 [[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     const auto shape = EvenBcShape(info);
     return shape ? shape->levels : FullHostMipCount(info);
 }
 
+// `copies` limited to the levels both host images have; none when either is a resized BC copy.
 [[nodiscard]] std::span<const VideoCommon::ImageCopy> HostImageCopies(
     const Image& dst, const Image& src, std::span<const VideoCommon::ImageCopy> copies,
     boost::container::small_vector<VideoCommon::ImageCopy, 16>& filtered) {
@@ -5239,6 +5244,8 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+// Decodes the ASTC levels into a temporary RGBA8 image of the guest's size, encodes each to
+// BC1/BC3 at the host image's size and copies the blocks into it.
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {

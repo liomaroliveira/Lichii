@@ -903,6 +903,8 @@ BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,
 
 BcEncoderPass::~BcEncoderPass() = default;
 
+// Encodes one level of `source` as `width` x `height` texels of BC1/BC3 blocks into `buffer`; the
+// shader resamples when the source level has another size.
 void BcEncoderPass::Encode(VkImageView source, u32 source_width, u32 source_height, u32 width,
                            u32 height, u32 layers, bool bc3, VkBuffer buffer,
                            VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
