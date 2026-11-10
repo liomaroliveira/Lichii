@@ -25,6 +25,12 @@ constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
+// slEvaluateFeature returns eWarnOutOfVRAM after it has evaluated DLSS, when the VRAM budget is
+// used up (commonInterface.cpp, slEvaluateFeatureInternal). The output is written; it is a warning.
+bool Evaluated(sl::Result result) {
+    return result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM;
+}
+
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
     return value ? std::atoi(value) : fallback;
@@ -403,7 +409,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             [&] {
                 api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
                                                   reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
-                return api_result == sl::Result::eOk;
+                if (api_result == sl::Result::eWarnOutOfVRAM && !vram_warned.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan, "NVIDIA DLSS: Streamline reports the VRAM budget is "
+                                               "used up; DLSS stays on");
+                }
+                return Evaluated(api_result);
             },
             [&] {
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
