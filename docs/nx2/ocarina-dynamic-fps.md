@@ -63,12 +63,21 @@ no pass to apply the shift. Measured before this patch at the save in Zora's
 Domain, frames that ran the simulation out of 10: no patch 10, FPS Unlock capped
 at 60 fps 4 (step 0.998 to 1.003), FPS Unlock at about 99 fps 0.
 
-Both built-ins replace that `fcvtzs` with `bl 0x3C46400` and drop the `mul` that
-followed it. The routine adds `iterations * step` to a remainder at `0x4E9FE10`,
-runs the rounded whole number of passes and keeps the rest, with at least one
-pass whenever the step is positive so the origin shift is always applied. A
+Both built-ins replace that `fcvtzs` with `bl 0x3C46300` and drop the `mul` that
+followed it. The routine adds `iterations * step` to a remainder kept per water
+object, runs the rounded whole number of passes and keeps the rest, with at least
+one pass whenever the step is positive so the origin shift is always applied. A
 paused game (step 0) still runs none. The final pass `6a7f45ab293a93b1` was never
-affected. The routine uses x9, w8, s0-s2 only, none live at the patch site.
+affected.
+
+The remainders live in 8 slots of 16 bytes from `0x4E9FE10` (the water object
+from `x21` at the patch site, then the remainder as a float), with the next slot
+to reuse at `0x4E9FE90`. An object without a slot takes the next one in turn, so
+two water objects drawn in the same frame don't pull from one shared fraction.
+The timer state is 0x98 bytes from `0x4E9FE00`. The routine is 148 bytes at
+`0x3C46300-0x3C46393`, clear of the Dynamic FPS routine at `0x3C46200` and of the
+ultrawide caves at `0x3C46400` and up. It uses w8, x9-x12 and s0-s2, none read
+by the game again before it writes them.
 
 ## Timing limits
 
