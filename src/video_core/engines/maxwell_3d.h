@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <cmath>
@@ -3276,6 +3277,33 @@ public:
     /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
     /// handles, so writing them doesn't end draw reuse.
     static bool IsFastDrawParameter(u32 method);
+
+    /// A write to a colour target slot that no draw renders to: the slots past rt_control's count,
+    /// and those its map does not name, are not part of any draw's state. Ocarina of Time
+    /// rewrites the size of slot 5 (and 1) between draws while drawing to fewer targets, and each
+    /// of those writes sent the next draw down the full path. The dirty flags are still set, so
+    /// the next full draw reads the slot, and a draw that starts using it changes rt_control
+    /// first, which ends the fast draws on its own. EDEN_NX2_FAST_DRAW_RT_NEUTRAL=0 turns it off.
+    bool IsInactiveRenderTargetWrite(u32 method) const {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_FAST_DRAW_RT_NEUTRAL");
+            return value == nullptr || value[0] != '0';
+        }();
+        constexpr u32 first = static_cast<u32>(MAXWELL3D_REG_INDEX(rt));
+        constexpr u32 words = static_cast<u32>(sizeof(Regs::RenderTargetConfig) / sizeof(u32));
+        if (!enabled || method < first || method >= first + Regs::NumRenderTargets * words) {
+            return false;
+        }
+        const u32 slot = (method - first) / words;
+        const u32 count = (std::min)(static_cast<u32>(regs.rt_control.count),
+                                     static_cast<u32>(Regs::NumRenderTargets));
+        for (u32 index = 0; index < count; ++index) {
+            if (regs.rt_control.Map(index) == slot) {
+                return false;
+            }
+        }
+        return true;
+    }
     /// Methods fast draw records as light changes (constant buffer data and binds).
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
@@ -3325,7 +3353,7 @@ private:
             draw_manager.DrawDeferred(*this, true);
         }
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method)) {
+            !IsFastDrawParameter(method) && !IsInactiveRenderTargetWrite(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         regs.reg_array[method] = argument;
