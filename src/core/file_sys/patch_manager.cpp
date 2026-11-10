@@ -107,13 +107,35 @@ constexpr std::array<u8, 128> FPS_UNLOCK_ROUTINE{
     0x0A, 0xD7, 0xA3, 0x3C, 0x00, 0x00, 0xC0, 0x40,
 };
 #undef DYNAMIC_FPS_ROUTINE_HEAD
+// The water ripple simulation runs iterations * (int)step passes per frame, so any step below 1.0
+// runs none: the ripples freeze and the grid shifts that follow the player are lost. With these
+// the pass count follows the step through an accumulator, with at least one pass while time moves.
+constexpr std::array<u8, 4> WATER_STEPS_ORIGINAL{0x09, 0x00, 0x38, 0x1E};
+constexpr std::array<u8, 4> WATER_STEPS_CALL{0x82, 0xFB, 0xEF, 0x94};
+constexpr std::array<u8, 4> WATER_MUL_ORIGINAL{0x08, 0x7D, 0x09, 0x1B};
+constexpr std::array<u8, 4> WATER_MUL_NOP{0x1F, 0x20, 0x03, 0xD5};
+// In: w8 iterations, s0 step. Out: w8 passes. Remainder kept at state + 0x10.
+constexpr std::array<u8, 84> WATER_STEPS_ROUTINE{
+    0x01, 0x01, 0x22, 0x1E, 0x00, 0x08, 0x21, 0x1E, 0x08, 0x20, 0x20, 0x1E, 0x0D, 0x02, 0x00,
+    0x54, 0xC9, 0x92, 0x00, 0xB0, 0x21, 0x11, 0x4E, 0xBD, 0x00, 0x28, 0x21, 0x1E, 0x01, 0x10,
+    0x2C, 0x1E, 0x02, 0x28, 0x21, 0x1E, 0x48, 0x00, 0x38, 0x1E, 0x1F, 0x05, 0x00, 0x71, 0x4A,
+    0x00, 0x00, 0x54, 0x28, 0x00, 0x80, 0x52, 0x01, 0x01, 0x22, 0x1E, 0x00, 0x38, 0x21, 0x1E,
+    0x01, 0x10, 0x3C, 0x1E, 0x00, 0x48, 0x21, 0x1E, 0x20, 0x11, 0x0E, 0xBD, 0xC0, 0x03, 0x5F,
+    0xD6, 0xE8, 0x03, 0x1F, 0x2A, 0xC0, 0x03, 0x5F, 0xD6,
+};
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
+    BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
+    BuiltinPatchRecord{0x3C46400, WATER_STEPS_ROUTINE, {}, true},
 };
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
+    BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
+    BuiltinPatchRecord{0x3C46400, WATER_STEPS_ROUTINE, {}, true},
 };
 
 constexpr std::array BUILTIN_PATCHES{
@@ -144,7 +166,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
         .state_offset = 0x4E9FE00,
-        .state_size = 16,
+        .state_size = 24,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
     BuiltinPatch{
@@ -154,7 +176,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
-        .state_size = 16,
+        .state_size = 24,
     },
 };
 
