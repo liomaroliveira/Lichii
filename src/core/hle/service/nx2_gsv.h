@@ -601,7 +601,7 @@ private:
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
     // memory (svc 0x80 clears GPU access) and reuses it as ordinary heap right after, so nothing
     // on the GPU side may keep it: drop the mapping 101 made at its own address and every other
-    // GPU range still mapped into it. GPU-only region tiles show the region's memory again.
+    // GPU range still mapped into it. Parts of GPU-only regions show the region's memory again.
     void SubDestroyMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 handle = w[2];
@@ -618,11 +618,15 @@ private:
                     }
                 }
                 for (const auto& [tile_address, tile_size] : tiles) {
-                    DropGpuOnlyTiles(tile_address, tile_size, true);
+                    DropGpuOnlyTiles(tile_address, tile_size, false);
                 }
-                const auto leftovers =
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().UnmapMemory(address, size);
+                auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+                const auto leftovers = registry.UnmapMemory(address, size);
                 for (const auto& [gpu_address, range_size] : leftovers) {
+                    // Only what still reached this memory: a later map of the range is kept.
+                    if (const auto backing = OwnBackingOf(gpu_address, range_size)) {
+                        registry.MapAt(gpu_address, *backing, range_size);
+                    }
                     // The first 32, then every 1000th.
                     if (++m_destroy_leftovers <= 32 || m_destroy_leftovers % 1000 == 0) {
                         LOG_WARNING(Service,
