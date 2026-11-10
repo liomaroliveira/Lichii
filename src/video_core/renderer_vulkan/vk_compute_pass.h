@@ -205,10 +205,13 @@ public:
                            ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
     ~BcEncoderPass();
 
-    /// Encodes every layer of one level (`source` is its RGBA8 storage view) into `buffer`,
-    /// `out_offset` bytes past `buffer_offset`; blocks are row-major, layer after layer.
-    void Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3, VkBuffer buffer,
-                VkDeviceSize buffer_offset, VkDeviceSize buffer_size, VkDeviceSize out_offset);
+    /// Encodes every layer of one level (`source` is its RGBA8 storage view, `source_width` x
+    /// `source_height`) into `buffer`, `out_offset` bytes past `buffer_offset`; blocks are
+    /// row-major, layer after layer. The level is encoded as `width` x `height`: when that is not
+    /// the source's size, from a bilinear resample of the source.
+    void Encode(VkImageView source, u32 source_width, u32 source_height, u32 width, u32 height,
+                u32 layers, bool bc3, VkBuffer buffer, VkDeviceSize buffer_offset,
+                VkDeviceSize buffer_size, VkDeviceSize out_offset);
 
 private:
     Scheduler& scheduler;
