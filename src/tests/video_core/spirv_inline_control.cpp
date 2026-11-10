@@ -102,3 +102,15 @@ TEST_CASE("Malformed modules are left alone", "[spirv_inline_control]") {
     zero_count.words[5] = 0; // an instruction with a word count of 0
     REQUIRE(VideoCommon::MarkSharedFunctionsDontInline(zero_count.words) == 0);
 }
+
+TEST_CASE("Graphics stages are marked like compute", "[spirv_inline_control]") {
+    // Same module with a Vertex (0) or Fragment (4) entry point instead of GLCompute.
+    for (const u32 execution_model : {0u, 4u}) {
+        Module m = Build(3, 5, 200);
+        m.words[6] = execution_model;
+        REQUIRE(VideoCommon::MarkSharedFunctionsDontInline(m.words) == 1);
+        REQUIRE(m.words[m.big_control] == 0x2);
+        REQUIRE(m.words[m.small_control] == 0);
+        REQUIRE(m.words[m.main_control] == 0);
+    }
+}

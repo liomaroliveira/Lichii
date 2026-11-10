@@ -388,6 +388,19 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
         std::memory_order::relaxed);
 }
 
+// EDEN_NX2_GRAPHICS_NOINLINE=0 turns it off: graphics modules are then built from the SPIR-V
+// exactly as emitted. On by default: functions a graphics stage calls from several places (the
+// global memory functions of native programs) are built as calls instead of being inlined at
+// each call site, as for compute (EDEN_NX2_COMPUTE_NOINLINE, video_core/spirv_inline_control.h).
+bool GraphicsNoInline() {
+    // The environment variable wins over the setting (shader_calls_not_inlined).
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_GRAPHICS_NOINLINE");
+        return value == nullptr || *value == '\0' ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    return forced >= 0 ? forced == 1 : Settings::values.shader_calls_not_inlined.GetValue();
+}
+
 vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
                                  const Shader::RuntimeInfo& runtime_info,
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
@@ -395,8 +408,23 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  std::span<const u32> reference = {}) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    // Every graphics module (monolithic pipelines, on the GPU thread or on a worker) is made
+    // here, so the pass runs once on every path.
+    std::vector<u32> module_code(code.begin(), code.end());
+    if (GraphicsNoInline()) {
+        if (const size_t marked = VideoCommon::MarkSharedFunctionsDontInline(module_code);
+            marked != 0) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_INFO(Render_Vulkan,
+                         "Graphics shader {:016x}: {} shared functions built as calls, not "
+                         "inlined",
+                         shader_hash, marked);
+            }
+        }
+    }
     device.SaveShader(code);
-    vk::ShaderModule module{BuildShader(device, code)};
+    vk::ShaderModule module{BuildShader(device, module_code)};
 
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
     // is independent and gated only by gpu_log_shader_dumps.
@@ -444,11 +472,12 @@ void DumpComputeSpirv(u64 shader_hash, std::span<const u32> code) {
 // site, which made NVIDIA spend 2-13 s on single compute shaders of a test title, every one a
 // freeze at its first dispatch (video_core/spirv_inline_control.h).
 bool ComputeNoInline() {
-    static const bool enabled = [] {
+    // The environment variable wins over the setting (shader_calls_not_inlined).
+    static const int forced = [] {
         const char* value = std::getenv("EDEN_NX2_COMPUTE_NOINLINE");
-        return !(value != nullptr && value[0] == '0');
+        return value == nullptr || *value == '\0' ? -1 : (value[0] == '0' ? 0 : 1);
     }();
-    return enabled;
+    return forced >= 0 ? forced == 1 : Settings::values.shader_calls_not_inlined.GetValue();
 }
 
 // The words a compute module is built from. The translation cache keeps the SPIR-V as emitted,
@@ -1662,6 +1691,14 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     }
 }
 
+namespace {
+/// Whether shared shader functions are built as calls (compute bit 0, graphics bit 1), for the
+/// precache markers: the SPIR-V the driver compiled differs between the two modes.
+u32 NoInlineBits() {
+    return (ComputeNoInline() ? 1U : 0U) | (GraphicsNoInline() ? 2U : 0U);
+}
+} // Anonymous namespace
+
 void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                                     std::unordered_set<u64> precached, std::stop_token stop_loading,
                                     const VideoCore::DiskResourceLoadCallback& callback) {
@@ -1671,7 +1708,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION);
+                                            device.GetDeviceID(), CACHE_VERSION, NoInlineBits());
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
