@@ -10,6 +10,7 @@
 
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_method_repeat.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
@@ -338,6 +339,7 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
 }
 
 void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
+    VideoCommon::MethodRepeat::Draw(); // TEST (E15.T1)
     draw_state.draw_element_count =
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
@@ -350,6 +352,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
 }
 
 void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
+    VideoCommon::MethodRepeat::Draw(); // TEST (E15.T1)
     draw_state.draw_element_count = 0;
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);

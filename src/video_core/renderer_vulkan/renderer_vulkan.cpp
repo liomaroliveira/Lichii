@@ -21,6 +21,7 @@
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
+#include "video_core/nx2_method_repeat.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
@@ -283,6 +284,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     scheduler.DispatchWork();
 #endif
 
+    VideoCommon::MethodRepeat::FrameEnd(); // TEST (E15.T1)
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
     if (trace) {

@@ -643,6 +643,7 @@ private:
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    size_t ExecuteEntry(const u64* entry, size_t words);
     /// The back, between entries: runs the tick hook if a thread asked for it.
     void MaybeTick() {
         if (tick_requested.load(std::memory_order_relaxed) &&
