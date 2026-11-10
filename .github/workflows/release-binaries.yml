@@ -126,7 +126,11 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
-      # The packages docs/Deps.md lists for macOS, plus ccache.
+      # The packages docs/Deps.md lists for macOS, plus ccache. The runner image can carry a
+      # freetype 2.15.0 bottle that links /usr/lib/libhvf.dylib, which macOS has only from 15.4, so
+      # the bundled copy stopped the app from starting on 15.0 to 15.3 (#892). Homebrew rebuilt the
+      # Sequoia bottle without HVF (homebrew-core 85373af); a rebuilt bottle keeps the version
+      # number, so only an updated tap and an explicit reinstall replace the image's copy.
       - name: Install macOS dependencies
         if: startsWith(matrix.platform, 'macos')
         shell: bash
@@ -137,6 +141,15 @@ jobs:
           brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja \
             nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
             vulkan-loader spirv-tools vulkan-utility-libraries ccache
+          freetype="$(brew --prefix freetype)/lib/libfreetype.6.dylib"
+          if otool -L "$freetype" | grep -F /usr/lib/libhvf.dylib > /dev/null; then
+            brew update --quiet
+            HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew reinstall freetype
+            if otool -L "$freetype" | grep -F /usr/lib/libhvf.dylib; then
+              echo "::error::$freetype still links libhvf.dylib, which macOS 15.0 to 15.3 lack"
+              exit 1
+            fi
+          fi
 
       - name: Install Qt on Linux x86_64
         if: startsWith(matrix.platform, 'linux') && runner.arch != 'ARM64'
@@ -490,6 +503,15 @@ jobs:
           if [ -n "$leaks" ]; then
             echo "References still pointing outside the bundle:"
             echo "$leaks" | sort -u
+            exit 1
+          fi
+          # dyld refuses to start the app when a linked system library is missing, and libhvf.dylib
+          # ships only with macOS 15.4 and later, newer than the 15.0 deployment target (#892).
+          hvf=$(for binary in $binaries; do
+            otool -L "$binary" | grep -F /usr/lib/libhvf.dylib > /dev/null && echo "$binary"
+          done || true)
+          if [ -n "$hvf" ]; then
+            echo "::error::these link /usr/lib/libhvf.dylib, which macOS 15.0 to 15.3 lack: $hvf"
             exit 1
           fi
           # macdeployqt invalidates the signatures. The programs get the entitlements when the
