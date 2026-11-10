@@ -636,6 +636,9 @@ private:
                                     m_destroy_leftovers);
                     }
                 }
+                // No GPU range reaches the memory any more: free its device range, so registering
+                // the address again gets a new one on the pages it has then.
+                registry.ReleaseBacking(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);
