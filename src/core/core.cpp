@@ -254,14 +254,22 @@ struct System::Impl {
             return;
         }
 
+        // The settings and time services start on the emulated cores, which only run once the
+        // game has finished loading (shaders included). Waiting for them here froze the UI
+        // thread for the whole loading screen when settings were applied during it. If they
+        // are not up yet there is nothing to refresh: they read the current settings when
+        // they start.
+        auto& service_manager = system.ServiceManager();
         auto settings_service =
-            system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys",
-                                                                                    true);
+            service_manager.GetService<Service::Set::ISystemSettingsServer>("set:sys");
         auto static_service_a =
-            system.ServiceManager().GetService<Service::Glue::Time::StaticService>("time:a", true);
-
+            service_manager.GetService<Service::Glue::Time::StaticService>("time:a");
         auto static_service_s =
-            system.ServiceManager().GetService<Service::PSC::Time::StaticService>("time:s", true);
+            service_manager.GetService<Service::PSC::Time::StaticService>("time:s");
+        if (!settings_service || !static_service_a || !static_service_s) {
+            LOG_INFO(Core, "Time services not started yet, they will use the current settings");
+            return;
+        }
 
         std::shared_ptr<Service::PSC::Time::SystemClock> user_clock;
         static_service_a->GetStandardUserSystemClock(&user_clock);
