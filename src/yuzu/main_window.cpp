@@ -2364,6 +2364,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     frame_gen_state = VideoCore::FrameGenState::Pending;
     frame_gen_frames = 0;
     frame_gen_generating = false;
+    frame_gen_fps = 0.0;
+    frame_gen_fps_timer.invalidate();
     refresh_button->setDisabled(true);
     SetFPSSuffix();
 
@@ -5170,6 +5172,20 @@ void MainWindow::UpdateStatusBar() {
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
 
+    // Before statsUpdated, so the performance overlay reads this update's generated frame rate.
+    const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();
+    const u64 new_generated_frames = frame_gen.generated_frames - frame_gen_frames;
+    const qint64 frame_gen_ms = frame_gen_fps_timer.isValid() ? frame_gen_fps_timer.restart() : 0;
+    if (!frame_gen_fps_timer.isValid()) {
+        frame_gen_fps_timer.start();
+    }
+    frame_gen_fps = frame_gen_ms > 0 ? static_cast<double>(new_generated_frames) * 1000.0 /
+                                           static_cast<double>(frame_gen_ms)
+                                     : 0.0;
+    frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;
+    frame_gen_frames = frame_gen.generated_frames;
+    frame_gen_state = frame_gen.state;
+
     emit statsUpdated(results, shader_notify);
 
     if (shaders_building > 0) {
@@ -5193,6 +5209,9 @@ void MainWindow::UpdateStatusBar() {
     }
 
     QString fpsText = tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
+    if (frame_gen_fps >= 0.5) {
+        fpsText = fpsText % tr(" + %1 generated").arg(std::round(frame_gen_fps), 0, 'f', 0);
+    }
     if (!m_fpsSuffix.isEmpty())
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
 
@@ -5200,10 +5219,6 @@ void MainWindow::UpdateStatusBar() {
 
     emu_frametime_label->setText(tr("Frame: %1 ms").arg(results.frametime * 1000.0, 0, 'f', 2));
 
-    const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();
-    frame_gen_generating = frame_gen.generated_frames > frame_gen_frames;
-    frame_gen_frames = frame_gen.generated_frames;
-    frame_gen_state = frame_gen.state;
     UpdateFrameGenButton();
 
     res_scale_label->setVisible(true);

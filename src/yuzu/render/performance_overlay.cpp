@@ -103,6 +103,10 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
         static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
 
         QString fpsText = tr("%1 fps").arg(std::round(fps), 0, 'f', 0);
+        // Frames frame generation added, kept short for the overlay's width.
+        if (const double generated = m_mainWindow->FrameGenFps(); generated >= 0.5) {
+            fpsText += tr(" (+%1)").arg(std::round(generated), 0, 'f', 0);
+        }
         // if (!m_fpsSuffix.isEmpty()) fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
         ui->fps->setText(fpsText);
 
