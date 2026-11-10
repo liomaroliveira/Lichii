@@ -14,6 +14,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "common/common_types.h"
 
@@ -274,6 +275,25 @@ public:
     }
     /// Logs g_acquire_stats every 10 s (front, while they count).
     void ReportAcquire();
+    /// Instance folding, front: one more instance of the instance loop `context`
+    /// draws. Nothing is sent: `flush(context, count)` sends the instances counted so far as one
+    /// entry before the next entry, Drain or Publish.
+    void FoldInstance(void (*flush)(void*, u32), void* context) {
+        if (fold_count != 0 && fold_context != context) {
+            FlushFold();
+        }
+        fold_flush = flush;
+        fold_context = context;
+        ++fold_count;
+    }
+    /// Sends the instances FoldInstance counted, if any.
+    void FlushFold() {
+        if (fold_count == 0) {
+            return;
+        }
+        const u32 count = std::exchange(fold_count, 0);
+        fold_flush(fold_context, count);
+    }
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
     /// The ring position after the entries sent so far, for WaitUntil.
@@ -382,6 +402,9 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        if (fold_count != 0) [[unlikely]] {
+            FlushFold();
+        }
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -438,6 +461,10 @@ private:
     // back writes back_engine on every engine switch, and next to these fields that made the
     // front miss the cache on almost every ring write (found by SerkiGohan).
     alignas(128) u64 write_position{};
+    // Instance folding: instances counted and not sent yet (front).
+    u32 fold_count{};
+    void (*fold_flush)(void*, u32){};
+    void* fold_context{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};

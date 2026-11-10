@@ -263,6 +263,11 @@ public:
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
+    /// List dispatches (nx2_list_dispatch.h): the call of macro `method` whose three parameters are the
+    /// GPU-written words at `address`. If the macro only stores a dispatch's grid, the front
+    /// stores a marker instead and the dispatch that carries it takes its grid from `address` on
+    /// the host GPU. False when the words have to be read.
+    bool FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method, GPUVAddr address);
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -392,6 +397,9 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+    /// List dispatches, back: where the grid of the dispatches whose QMD carries the
+    /// marker is, 0 if no list was taken.
+    GPUVAddr list_dispatch_address{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

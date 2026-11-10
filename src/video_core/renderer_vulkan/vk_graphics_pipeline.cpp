@@ -1468,6 +1468,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
+    if (buffer_cache.runtime.ListDrawArgsRequested()) {
+        // List draws (nx2_list_draw.h): outside the render pass, before the draw's counters start.
+        const auto [list_buffer, list_offset] = buffer_cache.GetDrawIndirectBuffer();
+        buffer_cache.runtime.RecordListDrawArgs(list_buffer->Handle(), list_offset,
+                                                IsMeshPipeline());
+    }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {
         scheduler.NoteRenderPassStores();

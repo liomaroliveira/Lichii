@@ -75,6 +75,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -1543,6 +1545,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.list_words) {
+        DrawListWords();
+        return;
+    }
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
     }
@@ -1630,6 +1636,88 @@ void RasterizerVulkan::DrawIndirect() {
         }
     }, true);
     buffer_cache.SetDrawIndirect(nullptr);
+}
+
+// List draws (nx2_list_draw.h): an array draw whose vertex count and first vertex are the two words at
+// indirect_state.indirect_start_address (Nx2ListDraw). The host GPU copies them into a draw
+// command and draws from it; draws that need the words on the CPU read them back, as the front
+// did before (a flush of the words, synchronous).
+bool RasterizerVulkan::Nx2ListDrawSupported() const {
+    // Task/mesh draws are drawn with vkCmdDrawMeshTasksIndirectEXT.
+    return Tegra::Nx2ListDraw::Mode() != 0 && device.IsExtMeshShaderSupported();
+}
+
+// List dispatches (nx2_list_dispatch.h): DispatchCompute's indirect path takes the grid from the buffer
+// cache's buffer at the list's address, which GPU work wrote: nothing is read back.
+bool RasterizerVulkan::Nx2ListDispatchSupported() const {
+    return Tegra::Nx2ListDispatch::Mode() != 0;
+}
+
+void RasterizerVulkan::DrawListWords() {
+    namespace ListDraw = Tegra::Nx2ListDraw;
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    // The draw command has one instance from instance 0 and counts vertices as they are drawn
+    // (a task/mesh pipeline ignores all three; the pipeline is not known yet).
+    const bool quads = draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                       draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip;
+    const bool on_cpu = ListDraw::Mode() != 1 || quads || draw_state.base_instance != 0 ||
+                        maxwell3d->regs.transform_feedback_enabled != 0;
+    if (on_cpu) {
+        const GPUVAddr address = params.indirect_start_address;
+        std::array<u32, 2> words{};
+        if (gpu_memory->IsMemoryDirty(address, sizeof(words),
+                                      VideoCommon::CacheType::BufferCache)) {
+            gpu_memory->FlushRegion(address, sizeof(words), VideoCommon::CacheType::BufferCache);
+        }
+        gpu_memory->ReadBlockUnsafe(address, words.data(), sizeof(words));
+        ListDraw::Count(ListDraw::g_stats.read_back);
+        if (words[0] == 0) {
+            ListDraw::Count(ListDraw::g_stats.read_zero);
+        }
+        if (words[1] != 0) {
+            ListDraw::Count(ListDraw::g_stats.read_first);
+        }
+        draw_state.vertex_buffer.count = words[0];
+        draw_state.vertex_buffer.first = words[1];
+        draw_state.draw_element_count = words[0];
+        Draw(false, 1);
+        if (words[0] != 0 && mesh_draw) {
+            ListDraw::Count(ListDraw::g_stats.read_mesh);
+        }
+        return;
+    }
+    if (Common::DkbFrameTrace::Enabled()) {
+        ++trace_indirect;
+    }
+    buffer_cache.SetDrawIndirect(&params);
+    buffer_cache_runtime.RequestListDrawArgs();
+    bool recorded = false;
+    bool mesh = false;
+    PrepareDraw(false, [this, &mesh, &recorded] {
+        const auto args = buffer_cache_runtime.TakeListDrawArgs();
+        if (args.buffer == VK_NULL_HANDLE) {
+            return;
+        }
+        recorded = true;
+        mesh = args.mesh;
+        scheduler.Record([this, args](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
+            if (args.mesh) {
+                cmdbuf.DrawMeshTasksIndirectEXT(args.buffer, args.offset, 1, 0);
+            } else {
+                cmdbuf.DrawIndirect(args.buffer, args.offset, 1, 0);
+            }
+        });
+    }, true);
+    // A draw that was not prepared as far as its copy leaves the request behind.
+    (void)buffer_cache_runtime.TakeListDrawArgs();
+    buffer_cache.SetDrawIndirect(nullptr);
+    ListDraw::Count(!recorded ? ListDraw::g_stats.not_recorded
+                    : mesh    ? ListDraw::g_stats.indirect_mesh
+                              : ListDraw::g_stats.indirect);
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {

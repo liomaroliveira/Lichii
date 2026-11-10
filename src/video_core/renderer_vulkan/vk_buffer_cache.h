@@ -304,6 +304,31 @@ public:
         return max_dynamic_storage_buffers;
     }
 
+    // List draws (nx2_list_draw.h): the arguments of an array draw whose vertex count and first vertex
+    // are two GPU-written words (Nx2ListDraw). The rasterizer asks for them before it prepares
+    // the draw, the pipeline records their copy before it requests the render pass, and the draw
+    // takes them.
+    struct ListDrawArgs {
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        bool mesh{}; ///< A task/mesh draw command (group counts)
+    };
+    void RequestListDrawArgs() noexcept {
+        list_draw_requested = true;
+        list_draw_args = {};
+    }
+    [[nodiscard]] bool ListDrawArgsRequested() const noexcept {
+        return list_draw_requested;
+    }
+    /// Records the copy of the words at `offset` of `source`, outside the render pass, into a
+    /// vertex draw command or (`mesh`) a task/mesh one.
+    void RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh);
+    /// The arguments recorded since the request (no buffer if none were), ending the request.
+    [[nodiscard]] ListDrawArgs TakeListDrawArgs() noexcept {
+        list_draw_requested = false;
+        return std::exchange(list_draw_args, {});
+    }
+
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
@@ -329,6 +354,16 @@ private:
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
 
     vk::Buffer null_buffer;
+
+    /// Slots of two draw commands each, a vertex one (count, 1 instance, first, instance 0) and a
+    /// task/mesh one (count, 1, 1): the host GPU copies the list words over the count and the
+    /// first vertex, the other words are written once.
+    static constexpr u32 LIST_DRAW_SLOTS = 1024;
+    static constexpr u32 LIST_DRAW_SLOT_BYTES = 32;
+    vk::Buffer list_draw_buffer;
+    u32 list_draw_cursor{};
+    bool list_draw_requested{};
+    ListDrawArgs list_draw_args{};
 
     std::unique_ptr<Uint8Pass> uint8_pass;
     std::unique_ptr<VertexRepackPass> vertex_repack_pass;

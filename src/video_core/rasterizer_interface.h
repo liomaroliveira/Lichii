@@ -133,6 +133,17 @@ public:
     virtual void FinishReport([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
 
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
+    /// Switch 2, list draws (nx2_list_draw.h): whether DrawIndirect draws from an array draw's two
+    /// GPU-written list words (IndirectParams::list_words) without reading them back.
+    [[nodiscard]] virtual bool Nx2ListDrawSupported() const {
+        return false;
+    }
+    /// Switch 2, list dispatches (nx2_list_dispatch.h): whether DispatchCompute dispatches from a grid at
+    /// KeplerCompute::GetIndirectComputeAddress that only the host GPU has.
+    [[nodiscard]] virtual bool Nx2ListDispatchSupported() const {
+        return false;
+    }
+
     enum class GpuWrittenList {
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
         Copied,  ///< `out` (within one 4 KiB page) is filled from the copy made after its writer

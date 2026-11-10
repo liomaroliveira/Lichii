@@ -620,6 +620,70 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     });
 }
 
+void BufferCacheRuntime::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh) {
+    if (source == VK_NULL_HANDLE) {
+        return;
+    }
+    if (!list_draw_buffer) {
+        const VkBufferCreateInfo create_info{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = VkDeviceSize{LIST_DRAW_SLOTS} * LIST_DRAW_SLOT_BYTES,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        list_draw_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::Upload);
+        if (device.HasDebuggingToolAttached()) {
+            list_draw_buffer.SetObjectNameEXT("List draw arguments");
+        }
+        // Written once: the host GPU only ever copies over words 0 and 2 of the vertex command
+        // and word 0 of the task/mesh command.
+        const std::span<u8> mapped = list_draw_buffer.Mapped();
+        constexpr std::array<u32, LIST_DRAW_SLOT_BYTES / sizeof(u32)> slot{0, 1, 0, 0, 0, 1, 1, 0};
+        for (u32 i = 0; i < LIST_DRAW_SLOTS; ++i) {
+            std::memcpy(mapped.data() + size_t{i} * LIST_DRAW_SLOT_BYTES, slot.data(),
+                        LIST_DRAW_SLOT_BYTES);
+        }
+    }
+    // The copies and the draws that read them run in the order they are recorded: a slot is
+    // free again as soon as the next copy into it is recorded after its draw.
+    const VkDeviceSize slot = VkDeviceSize{list_draw_cursor} * LIST_DRAW_SLOT_BYTES;
+    list_draw_cursor = (list_draw_cursor + 1) % LIST_DRAW_SLOTS;
+    const VkDeviceSize args = slot + (mesh ? 16 : 0);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([source, offset, destination = *list_draw_buffer, args,
+                      mesh](vk::CommandBuffer cmdbuf) {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        static constexpr VkMemoryBarrier WRITE_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+        };
+        // (count, first) -> word 0 and, for vertex draws, word 2.
+        const std::array<VkBufferCopy, 2> copies{{
+            {.srcOffset = offset, .dstOffset = args, .size = sizeof(u32)},
+            {.srcOffset = offset + sizeof(u32), .dstOffset = args + 2 * sizeof(u32),
+             .size = sizeof(u32)},
+        }};
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        cmdbuf.CopyBuffer(source, destination,
+                          std::span<const VkBufferCopy>{copies.data(), mesh ? 1U : 2U});
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                               0, WRITE_BARRIER);
+    });
+    list_draw_args = {*list_draw_buffer, args, mesh};
+}
+
 void BufferCacheRuntime::PreCopyBarrier() {
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

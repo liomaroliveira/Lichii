@@ -3075,6 +3075,9 @@ public:
             /// Deferred instances already drawn by flushes in the middle of the current loop.
             u32 drawn_instances{};
             std::vector<u8> inline_index_draw_indexes;
+            /// List draws (nx2_list_draw.h): the next draw.end draws the array whose vertex count and
+            /// first vertex are the two words at this address (Maxwell3D::FrontTakeListDraw).
+            GPUVAddr list_draw_address{};
         };
         struct DrawTextureState {
             f32 dst_x0;
@@ -3097,6 +3100,9 @@ public:
             size_t buffer_size;
             size_t max_draw_counts;
             size_t stride;
+            /// List draws (nx2_list_draw.h): indirect_start_address holds a vertex count and a first
+            /// vertex, not a draw command.
+            bool list_words{};
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
@@ -3116,6 +3122,9 @@ public:
         void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 index);
         void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 method, const u32* base_start, u32 amount);
         void DrawBegin(Maxwell3D& maxwell3d);
+        /// Instance folding: as `count` draw.begin writes of the register's value,
+        /// which is a later instance of an instance loop.
+        void AddLoopInstances(Maxwell3D& maxwell3d, u32 count);
         void DrawEnd(Maxwell3D& maxwell3d, u32 instance_count = 1, bool force_draw = false);
         void DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument);
         void DrawTexture(Maxwell3D& maxwell3d);
@@ -3216,6 +3225,10 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// List draws (nx2_list_draw.h): the call of macro `method` whose two parameters are the GPU-written
+    /// words at `address`. Returns whether the call was sent to the back without reading them.
+    bool FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                           GPUVAddr address);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3464,12 +3477,17 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    bool FrontIsListDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);
     u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    /// GpuSplit::FoldInstance's flush, `engine` a Maxwell3D.
+    static void FlushFoldedInstances(void* engine, u32 count);
+    /// Whether the front counts an instance loop's later instances (FrontWrite).
+    static bool FoldInstancesEnabled();
     void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
                          u32 amount);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,

@@ -32,6 +32,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/nx2_list_dispatch.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -569,6 +570,30 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    // List dispatches (nx2_list_dispatch.h): the front stored the marker for a grid it did not read; the
+    // grid is at the address it sent, on the host GPU.
+    struct ListGrid {
+        std::optional<GPUVAddr>& indirect;
+        bool active{};
+        ~ListGrid() {
+            if (active) {
+                indirect = std::nullopt;
+            }
+        }
+    } list_grid{indirect_compute};
+    if (Nx2ListDispatch::IsMarker(qmd[12], qmd[13], qmd[14])) {
+        if (list_dispatch_address == 0) {
+            Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.orphan);
+            LOG_ERROR(HW_GPU, "List dispatch: a QMD carries the grid marker and no list was taken");
+            return true;
+        }
+        launch_description.grid_dim_x.Assign(1);
+        launch_description.grid_dim_y.Assign(1);
+        launch_description.grid_dim_z.Assign(1);
+        indirect_compute = list_dispatch_address;
+        list_grid.active = true;
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.indirect);
+    }
     dlss_chain.output_pass = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
@@ -1508,6 +1533,15 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// List dispatches (nx2_list_dispatch.h): by macro engine and start in its code of that generation,
+    /// whether the macro only stores a dispatch's grid.
+    struct GridMacro {
+        const MacroEngine* engine;
+        u64 generation;
+        u32 start;
+        bool stores_grid;
+    };
+    std::vector<GridMacro> grid_macros;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1634,6 +1668,56 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
         // 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true);
     }
+}
+
+bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method,
+                                          GPUVAddr address) {
+    namespace ListDispatch = Tegra::Nx2ListDispatch;
+    auto& fs = Front(split);
+    // The three words must be the whole call.
+    if (fs.executing_macro || !fs.parameters.empty() || method < 0xe00 ||
+        method >= fs.registers.size() || rasterizer == nullptr ||
+        !rasterizer->Nx2ListDispatchSupported()) {
+        return false;
+    }
+    const auto positions = FrontMacroPositions(fs);
+    if (positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    auto& macro = FrontMacroEngine(fs);
+    auto known = std::ranges::find_if(fs.grid_macros, [&](const FrontState::GridMacro& entry) {
+        return entry.engine == &macro && entry.generation == macro.native_code_generation &&
+               entry.start == start;
+    });
+    if (known == fs.grid_macros.end()) {
+        if (fs.grid_macros.size() >= 64) {
+            fs.grid_macros.clear();
+        }
+        const bool stores_grid =
+            ListDispatch::IsStoreGridMacro(std::span<const u32>{macro.native_code}, start);
+        if (stores_grid) {
+            LOG_INFO(HW_GPU, "List dispatch: the compute macro at {:#x} stores a grid", start);
+        }
+        fs.grid_macros.push_back({&macro, macro.native_code_generation, start, stores_grid});
+        known = fs.grid_macros.end() - 1;
+    }
+    if (!known->stores_grid) {
+        return false;
+    }
+    // As the macro, with the marker for the words: the macro that uploads the QMD copies it
+    // into the grid words, where the dispatch finds it.
+    if (native_data_ram) {
+        macro.native_interpreter.active_dram = native_data_ram;
+    }
+    auto& data_ram = *macro.native_interpreter.active_dram;
+    data_ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
+    data_ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
+    data_ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
+    // Writes no guest memory itself.
+    split.Defer([this, address] { list_dispatch_address = address; }, 0,
+                VideoCommon::GpuSplit::Writes::Noted);
+    return true;
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
