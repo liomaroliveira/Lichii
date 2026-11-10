@@ -45,6 +45,18 @@ constexpr size_t DynamicRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46200;
 constexpr size_t DynamicStateOffset = sizeof(Loader::NSOHeader) + 0x4E9FE00;
 constexpr size_t DynamicRoutineSize = 120;
 constexpr size_t UnlockRoutineSize = 128;
+constexpr size_t DynamicStateSize = 24;
+constexpr size_t WaterHookOffset = sizeof(Loader::NSOHeader) + 0x475F8;
+constexpr size_t WaterMulOffset = sizeof(Loader::NSOHeader) + 0x4760C;
+constexpr size_t WaterRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46400;
+constexpr size_t WaterRoutineSize = 84;
+constexpr u32 WaterOriginalInstruction = 0x1E380009;
+constexpr u32 WaterMulOriginalInstruction = 0x1B097D08;
+constexpr u32 WaterCallInstruction = 0x94EFFB82;
+constexpr std::string_view WaterRoutine =
+    "0101221E0008211E0820201E0D020054C99200B021114EBD0028211E01102C1E0228211E"
+    "4800381E1F0500714A000054280080520101221E0038211E01103C1E0048211E20110EBD"
+    "C0035FD6E8031F2AC0035FD6";
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 
@@ -276,6 +288,10 @@ std::vector<u8> MakeDynamicMain() {
     for (const auto& [offset, original] : GroundVelocityBranches) {
         std::memcpy(nso.data() + offset, &original, sizeof(original));
     }
+    std::memcpy(nso.data() + WaterHookOffset, &WaterOriginalInstruction,
+                sizeof(WaterOriginalInstruction));
+    std::memcpy(nso.data() + WaterMulOffset, &WaterMulOriginalInstruction,
+                sizeof(WaterMulOriginalInstruction));
     return nso;
 }
 
@@ -298,6 +314,17 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
         "2818201ECA9200B04A0138912BE03BD54C0140F94B0100F9CC0200B46B010CCB0DE03BD5"
         "4E0180D2AE09CE9A7F010EEBCB818B9A4C0540F94C0000B5EC030BAA6E010CCB8C0D8E8B"
         "4C0500F98201239EA301239E4218231E4208211E";
+    const auto water_patched = [](const std::vector<u8>& nso) {
+        return WordAt(nso, WaterHookOffset) == WaterCallInstruction &&
+               WordAt(nso, WaterMulOffset) == NopInstruction &&
+               Common::HexToString(std::span{nso}.subspan(WaterRoutineOffset, WaterRoutineSize)) ==
+                   WaterRoutine;
+    };
+    const auto water_untouched = [](const std::vector<u8>& nso) {
+        return WordAt(nso, WaterHookOffset) == WaterOriginalInstruction &&
+               WordAt(nso, WaterMulOffset) == WaterMulOriginalInstruction &&
+               WordAt(nso, WaterRoutineOffset) == 0;
+    };
     const auto nso = MakeDynamicMain();
 
     // Default: FPS Unlock applies, Dynamic FPS is listed as replaced by it when it applies.
@@ -311,6 +338,7 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
             std::string{RoutineHead} + "E300001C4268231EC300001C4278231E4840201EC0035FD6"
                                        "1F2003D50AD7A33C0000C040");
     REQUIRE(WordAt(patched) == BranchInstruction);
+    REQUIRE(water_patched(patched));
 
     // Unchecking only Dynamic FPS keeps FPS Unlock.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
@@ -328,6 +356,7 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
             std::string{RoutineHead} + "C300001C0309231E4020231E4D0000544840201EC0035FD6"
                                        "0AD7833F");
     REQUIRE(WordAt(patched, DynamicRoutineOffset + DynamicRoutineSize) == 0);
+    REQUIRE(water_patched(patched));
 
     // Both unchecked: hook and code cave stay untouched.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock},
@@ -335,6 +364,7 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0);
+    REQUIRE(water_untouched(patched));
 
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
     patched = manager.PatchNSO(nso, "main");
@@ -538,7 +568,7 @@ TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transact
         nso.resize(DynamicRoutineOffset + DynamicRoutineSize - 1);
     }
     SECTION("Incomplete timer state") {
-        nso.resize(DynamicStateOffset + 15);
+        nso.resize(DynamicStateOffset + DynamicStateSize - 1);
     }
     SECTION("Timer state outside BSS") {
         Loader::NSOHeader header;
@@ -553,7 +583,16 @@ TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transact
         nso[DynamicRoutineOffset + DynamicRoutineSize - 1] = 1;
     }
     SECTION("Nonzero timer state") {
-        nso[DynamicStateOffset + 15] = 1;
+        nso[DynamicStateOffset + DynamicStateSize - 1] = 1;
+    }
+    SECTION("Wrong original water hook") {
+        nso[WaterHookOffset] ^= 1;
+    }
+    SECTION("Wrong original water multiply") {
+        nso[WaterMulOffset] ^= 1;
+    }
+    SECTION("Nonzero water code cave") {
+        nso[WaterRoutineOffset + WaterRoutineSize - 1] = 1;
     }
     SECTION("Code cave outside executable padding") {
         Loader::NSOHeader header;
