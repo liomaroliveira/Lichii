@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <optional>
+#include <set>
 
 #include <filesystem>
 #include <QElapsedTimer>
@@ -612,6 +613,7 @@ private:
     QTimer mouse_hide_timer;
     QTimer update_input_timer;
     QTimer nx2_automap_timer;
+    std::optional<std::set<std::string>> nx2_automap_seen; ///< controllers at the last check
 
     QString startup_icon_theme;
 
