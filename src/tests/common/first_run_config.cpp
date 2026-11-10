@@ -392,3 +392,56 @@ TEST_CASE("A config path beneath a non-directory is not seeded", "[config]") {
         std::make_optional(Common::FS::PathToUTF8String(directory.path / "file" / "config.ini"))};
     CheckLegacyProfile();
 }
+
+TEST_CASE("DLSS old profiles default to M and preserve native quality values",
+          "[config][dlss_mode]") {
+    ConfigDirectory directory;
+    directory.Write("qt-config.ini", "[Renderer]\nnvidia_dlss=true\nnvidia_dlss\\default=false\n");
+    FileConfig config{std::string{"qt-config"}};
+    CHECK(Settings::values.nvidia_dlss.GetValue());
+    CHECK(Settings::values.nvidia_dlss_preset.GetValue() == Settings::NvidiaDlssPreset::M);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality ==
+          Settings::NvidiaDlssQuality::Automatic);
+    directory.Write("qt-config.ini",
+                    "[Renderer]\nnvidia_dlss_quality=1\nnvidia_dlss_quality\\default=false\n"
+                    "nvidia_dlss_preset=0\nnvidia_dlss_preset\\default=false\n");
+    FileConfig native_config{std::string{"qt-config"}};
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+}
+
+TEST_CASE("DLSS config round-trips choices and publishes per-game overrides",
+          "[config][dlss_mode]") {
+    ConfigDirectory directory;
+    FileConfig config{std::string{"qt-config"}};
+    for (const auto& [name, value] :
+         Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Canonicalizations()) {
+        Settings::values.nvidia_dlss_preset.SetValue(value);
+        config.SaveValues();
+        Settings::values.nvidia_dlss_preset.LoadString("");
+        FileConfig loaded{std::string{"qt-config"}};
+        CHECK(Settings::values.nvidia_dlss_preset.GetValue() == value);
+        CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == value);
+    }
+    for (const auto& [name, value] :
+         Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Canonicalizations()) {
+        Settings::values.nvidia_dlss_quality.SetValue(value);
+        config.SaveValues();
+        Settings::values.nvidia_dlss_quality.LoadString("");
+        FileConfig loaded{std::string{"qt-config"}};
+        CHECK(Settings::values.nvidia_dlss_quality.GetValue() == value);
+        CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality == value);
+    }
+    Settings::values.nvidia_dlss_preset = Settings::NvidiaDlssPreset::K;
+    config.SaveValues();
+    directory.Write("custom/game.ini",
+                    "[Renderer]\nnvidia_dlss_preset=0\nnvidia_dlss_preset\\default=false\n"
+                    "nvidia_dlss_preset\\use_global=false\n");
+    FileConfig game{std::string{"game"}, Config::ConfigType::PerGameConfig};
+    CHECK_FALSE(Settings::values.nvidia_dlss_preset.UsingGlobal());
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+    Settings::values.nvidia_dlss_preset.SetGlobal(true);
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::K);
+}
