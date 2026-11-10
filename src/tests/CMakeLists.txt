@@ -301,6 +301,7 @@ if (NOT ANDROID)
 
     add_executable(config_tests
         common/first_run_config.cpp
+        common/recommended_settings.cpp
         ../frontend_common/config.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
