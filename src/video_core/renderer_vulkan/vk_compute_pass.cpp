@@ -237,8 +237,6 @@ struct BcEncoderPushConstants {
     u32 height;
     u32 bc3;
     u32 out_offset; // in 8-byte units
-    u32 source_width;
-    u32 source_height;
 };
 
 struct QueriesPrefixScanPushConstants {
@@ -903,9 +901,8 @@ BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,
 
 BcEncoderPass::~BcEncoderPass() = default;
 
-void BcEncoderPass::Encode(VkImageView source, u32 source_width, u32 source_height, u32 width,
-                           u32 height, u32 layers, bool bc3, VkBuffer buffer,
-                           VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
+void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3,
+                           VkBuffer buffer, VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
                            VkDeviceSize out_offset) {
     scheduler.RequestOutsideRenderPassOperationContext();
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
@@ -919,8 +916,6 @@ void BcEncoderPass::Encode(VkImageView source, u32 source_width, u32 source_heig
         .height = height,
         .bc3 = bc3 ? 1U : 0U,
         .out_offset = static_cast<u32>(out_offset / 8),
-        .source_width = source_width,
-        .source_height = source_height,
     };
     const VkPipeline vk_pipeline = *pipeline;
     scheduler.Record([this, vk_pipeline, uniforms, layers, descriptor_data](vk::CommandBuffer cmdbuf) {

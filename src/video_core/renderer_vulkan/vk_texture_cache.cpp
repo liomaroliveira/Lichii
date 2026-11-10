@@ -76,126 +76,16 @@ using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::SurfaceType;
 
 namespace {
-[[nodiscard]] u32 FullHostMipCount(const VideoCommon::ImageInfo& info) {
+[[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
     return VideoCommon::HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
                                           static_cast<u32>(info.resources.levels));
 }
 
-// Whether ASTC whose BC copy would have uneven block mips gets a BC copy of an even shape
-// (EvenBcShape): AMD drivers without ASTC, with the GPU BC encoder. Set once by
-// TextureCacheRuntime.
-std::atomic<bool> even_bc_shapes{false};
-
-// The first level of a `width` x `height` image whose size in 4x4 blocks is not its level 0 block
-// count shifted down (341 texels: 86 blocks at level 0, 85 texels = 22 blocks at level 2, not
-// 86 >> 2 = 21); 0 if every level is even.
-[[nodiscard]] u32 FirstUnevenBlockMip(u32 width, u32 height, u32 levels) {
-    const u32 blocks_x = Common::DivCeil(width, 4U);
-    const u32 blocks_y = Common::DivCeil(height, 4U);
-    for (u32 level = 1; level < levels; ++level) {
-        const u32 level_x = Common::DivCeil((std::max)(width >> level, 1U), 4U);
-        const u32 level_y = Common::DivCeil((std::max)(height >> level, 1U), 4U);
-        if (level_x != (std::max)(blocks_x >> level, 1U) ||
-            level_y != (std::max)(blocks_y >> level, 1U)) {
-            return level;
-        }
-    }
-    return 0;
-}
-
-[[nodiscard]] u32 FirstUnevenBlockMip(const VideoCommon::ImageInfo& info) {
-    return FirstUnevenBlockMip(info.size.width, info.size.height, FullHostMipCount(info));
-}
-
-[[nodiscard]] u64 DecodedAstcBytes(const VideoCommon::ImageInfo& info) {
-    u64 bytes = 0;
-    for (u32 level = 0; level < FullHostMipCount(info); ++level) {
-        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
-                 (std::max)(info.size.height >> level, 1U) * 4;
-    }
-    return bytes * static_cast<u64>(info.resources.layers);
-}
-
-// `texels` rounded up to the nearest size whose 4x4 blocks halve evenly down to its last level of
-// 16 texels or more (1365 -> 1536, 683 -> 768; 1536 and 768 stay). The rule of Hookshot #705.
-[[nodiscard]] u32 EvenBlockSize(u32 texels, u32 levels) {
-    u32 kept = 0;
-    while (kept < levels && (texels >> kept) >= 16) {
-        ++kept;
-    }
-    return Common::AlignUp(texels, 4U << (kept != 0 ? kept - 1 : 0));
-}
-
-struct BcShape {
-    u32 width;
-    u32 height;
-    u32 levels;
-};
-
-// The shape of the BC copy of an ASTC image whose own shape has uneven block mips, where the
-// driver samples those wrong (even_bc_shapes). The same size without its uneven tail when that
-// tail starts at 32 texels or less (1536: level 8 = 6 texels, 768: level 7, 576: level 5 = 18
-// texels). Else the nearest larger size whose levels are even (1365x1365 -> 1536x1536 with 8
-// levels, 3072x960 -> 3072x1024), which the BC encoder resamples the decoded texels to: normalized
-// coordinates address it the same, texel coordinates and textureSize don't. nullopt for images
-// that keep their shape, and for those neither rule gives an even shape.
-[[nodiscard]] std::optional<BcShape> EvenBcShape(const VideoCommon::ImageInfo& info) {
-    if (!even_bc_shapes.load(std::memory_order_relaxed) || !IsPixelFormatASTC(info.format) ||
-        info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples > 1 ||
-        info.resources.levels <= 1 || FirstUnevenBlockMip(info) == 0 ||
-        DecodedAstcBytes(info) > (u64{1} << 30)) {
-        return std::nullopt;
-    }
-    const u32 levels = FullHostMipCount(info);
-    // The levels a `width` x `height` copy keeps: all when even, those before a tiny uneven tail,
-    // 0 when its uneven levels are larger.
-    const auto kept_levels = [levels](u32 width, u32 height) {
-        constexpr u32 MaxTailTexels = 32;
-        const u32 first = FirstUnevenBlockMip(width, height, levels);
-        if (first == 0) {
-            return levels;
-        }
-        return (std::max)({width >> first, height >> first, 1U}) <= MaxTailTexels ? first : 0U;
-    };
-    if (const u32 kept = kept_levels(info.size.width, info.size.height); kept != 0) {
-        return BcShape{info.size.width, info.size.height, kept};
-    }
-    const u32 width = EvenBlockSize(info.size.width, levels);
-    const u32 height = EvenBlockSize(info.size.height, levels);
-    if (const u32 kept = kept_levels(width, height); kept != 0) {
-        return BcShape{width, height, kept};
-    }
-    return std::nullopt;
-}
-
-// Whether the host image of `info` has another size than the guest image (EvenBcShape).
-[[nodiscard]] bool HasResizedBcCopy(const VideoCommon::ImageInfo& info) {
-    const auto shape = EvenBcShape(info);
-    return shape && (shape->width != info.size.width || shape->height != info.size.height);
-}
-
-[[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
-    const auto shape = EvenBcShape(info);
-    return shape ? shape->levels : FullHostMipCount(info);
-}
-
 [[nodiscard]] std::span<const VideoCommon::ImageCopy> HostImageCopies(
     const Image& dst, const Image& src, std::span<const VideoCommon::ImageCopy> copies,
     boost::container::small_vector<VideoCommon::ImageCopy, 16>& filtered) {
-    // The texels of a resized BC copy are not at the guest's coordinates.
-    if (HasResizedBcCopy(src.info) || HasResizedBcCopy(dst.info)) {
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-            LOG_WARNING(Render_Vulkan,
-                        "Copy from a {}x{} image to a {}x{} image skipped: one is a resized BC "
-                        "copy of ASTC",
-                        src.info.size.width, src.info.size.height, dst.info.size.width,
-                        dst.info.size.height);
-        }
-        return {};
-    }
     if (src.HostMipLevels() >= static_cast<u32>(src.info.resources.levels) &&
         dst.HostMipLevels() >= static_cast<u32>(dst.info.resources.levels))
         return copies;
@@ -309,13 +199,35 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         info.type != ImageType::e2D || info.size.depth != 1) {
         return false;
     }
-    return DecodedAstcBytes(info) > (u64{1} << 30);
+    u64 bytes = 0;
+    for (s32 level = 0; level < static_cast<s32>(HostMipCount(info)); ++level) {
+        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                 (std::max)(info.size.height >> level, 1U) * 4;
+    }
+    return bytes * info.resources.layers > (u64{1} << 30);
 }
 
-// ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (FirstUnevenBlockMip) on
-// an AMD driver, which samples those wrong (dark lines along the seams of distant terrain in
-// title 1 on an RX 6600 XT, Windows driver; RGBA8 copies don't show them), and no BC copy of an
-// even shape (EvenBcShape): kept as the GPU decoder's RGBA8 instead, like huge arrays.
+// Whether a block-compressed copy of `info` has a mip level whose size in 4x4 blocks is not its
+// level 0 block count shifted down (341 texels: 86 blocks at level 0, 85 texels = 22 blocks at
+// level 2, not 86 >> 2 = 21). On AMD (RX 6600 XT, Windows driver) the BC1/BC3 copies of such
+// images show dark lines along the seams of distant terrain in title 1; RGBA8 copies don't.
+[[nodiscard]] bool HasUnevenBlockMips(const ImageInfo& info) {
+    const u32 blocks_x = Common::DivCeil(info.size.width, 4U);
+    const u32 blocks_y = Common::DivCeil(info.size.height, 4U);
+    for (s32 level = 1; level < info.resources.levels; ++level) {
+        const u32 level_x = Common::DivCeil((std::max)(info.size.width >> level, 1U), 4U);
+        const u32 level_y = Common::DivCeil((std::max)(info.size.height >> level, 1U), 4U);
+        if (level_x != (std::max)(blocks_x >> level, 1U) ||
+            level_y != (std::max)(blocks_y >> level, 1U)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
+// an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
+// arrays.
 [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
@@ -328,7 +240,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
-    return FirstUnevenBlockMip(info) != 0 && !EvenBcShape(info) && !IsHugeAstcArray(device, info);
+    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -516,16 +428,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
-// An ASTC image re-compressed to BC with an even shape (EvenBcShape) has that size and levels.
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
-    if (const auto shape = EvenBcShape(info)) {
-        ImageInfo host = info;
-        host.size.width = shape->width;
-        host.size.height = shape->height;
-        host.resources.levels = static_cast<s32>(shape->levels);
-        return host;
-    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -1408,12 +1312,6 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
                                     compute_pass_descriptor_queue);
         }
     }
-    // The drivers IsUnevenMipRgba8Astc covers, when images are transcoded by the BC encoder.
-    const VkDriverIdKHR driver = device.GetDriverID();
-    even_bc_shapes = bc_encoder_pass.has_value() && !device.IsOptimalAstcSupported() &&
-                     Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
-                     (driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                      driver == VK_DRIVER_ID_AMD_OPEN_SOURCE || driver == VK_DRIVER_ID_MESA_RADV);
     if (!device.IsKhrImageFormatListSupported()) {
         return;
     }
@@ -3156,18 +3054,6 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                              "{} images so far",
                              info.size.width, info.size.height, info.resources.layers,
                              info.resources.levels, count);
-                }
-            }
-            if (const auto shape = EvenBcShape(info)) {
-                static std::atomic<u32> even_images{0};
-                const u32 count = ++even_images;
-                if (count <= 4 || (count & (count - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan,
-                             "ASTC {}x{}x{} with {} levels re-compressed as {}x{} with {} levels "
-                             "(even BC block mips), {} images so far",
-                             info.size.width, info.size.height, info.resources.layers,
-                             info.resources.levels, shape->width, shape->height, shape->levels,
-                             count);
                 }
             }
             break;
@@ -5247,11 +5133,6 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 height = info.size.height;
     const u32 levels = static_cast<u32>(HostMipCount(info));
     const u32 layers = static_cast<u32>(info.resources.layers);
-    // The size the levels are encoded at: the host image's, which is not the decoded image's when
-    // it has an even shape (EvenBcShape); the encoder then resamples.
-    const auto even_shape = EvenBcShape(info);
-    const u32 host_width = even_shape ? even_shape->width : width;
-    const u32 host_height = even_shape ? even_shape->height : height;
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
@@ -5335,8 +5216,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
-        const u32 level_width = (std::max)(host_width >> level, 1U);
-        const u32 level_height = (std::max)(host_height >> level, 1U);
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
@@ -5357,8 +5238,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     }
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], (std::max)(width >> level, 1U),
-                                (std::max)(height >> level, 1U), copies[level].image_extent.width,
+        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
                                 copies[level].image_extent.height, layers, bc3, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
