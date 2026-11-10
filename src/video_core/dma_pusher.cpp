@@ -46,6 +46,7 @@
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_stats.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/nx2_sensitivity.h"
 
 namespace Tegra {
 
@@ -550,6 +551,7 @@ bool DmaPusher::Step() {
 }
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+    VideoCommon::Sensitivity::Front().Event(); // TEST (EDEN_NX2_DELAY_FRONT_MS)
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {

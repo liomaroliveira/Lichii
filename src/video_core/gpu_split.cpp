@@ -31,6 +31,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sensitivity.h"
 
 namespace VideoCommon {
 
@@ -617,6 +618,7 @@ void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
+    Sensitivity::Back().Event(); // TEST (EDEN_NX2_DELAY_BACK_MS)
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
