@@ -63,8 +63,7 @@ void Nx2ListSlots::NoteOwed(DAddr device_addr, u32 value, u32 guest_word) {
         Stats::NoteCompared(Stats::Check::Owed, Tegra::Nx2ListIndirect::PlaceholderSlot(value),
                             Bytes(std::span{&guest_word, 1}), Bytes(std::span{&value, 1}));
     }
-    if (guest_word != value || !Tegra::Nx2ListIndirect::IsPlaceholder(value) ||
-        Tegra::Nx2ListIndirect::PlaceholderSlot(value) >= SlotCount) {
+    if (guest_word != value || !Tegra::Nx2ListIndirect::IsPlaceholder(value)) {
         return; // It wrote nothing there
     }
     Stats::Count(Stats::Get().owed); // TEST
@@ -80,9 +79,6 @@ void Nx2ListSlots::NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) {
             continue;
         }
         const u32 slot = Tegra::Nx2ListIndirect::PlaceholderSlot(word);
-        if (slot >= SlotCount) {
-            continue;
-        }
         if (std::ranges::find(slots, slot) == slots.end()) {
             slots[count++] = slot;
         }

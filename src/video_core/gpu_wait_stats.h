@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -20,8 +19,7 @@
 #include "core/hardware_properties.h"
 #include "video_core/rasterizer_download_area.h"
 
-// TEST: how long guest threads wait for the GPU. Off unless EDEN_NX2_GPU_WAITS or
-// EDEN_NX2_GPU_PROFILE is set: then one line every 10 s ("GPU waits").
+// TEST: how long guest threads wait for the GPU. Always on: one line every 10 s ("GPU waits").
 //
 // A guest read of GPU-written memory that GetFlushArea can't serve (reactive flushing) queues a
 // flush on the GPU thread and waits for it. Each wait is timed from the request to the wake-up and
@@ -419,18 +417,9 @@ inline double Ms(u64 ns) {
     return static_cast<double>(ns) / 1e6;
 }
 
-inline bool ReportEnabled() {
-    static const bool enabled = std::getenv("EDEN_NX2_GPU_WAITS") != nullptr ||
-                                std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
-    return enabled;
-}
-
 /// Logs the window's totals every 10 s. Called by the GPU thread between commands, so its own
 /// idle time is complete; `split_active` says whether the back thread's counts apply.
 inline void MaybeReport(bool split_active) {
-    if (!ReportEnabled()) {
-        return;
-    }
     const u64 now = Now();
     if (g_report.window_start == 0) {
         (void)Snapshot(now);

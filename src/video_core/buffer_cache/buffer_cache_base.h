@@ -994,7 +994,7 @@ private:
     static u64 ReadCheckEvery() {
         static const u64 every = [] {
             const char* value = std::getenv("EDEN_NX2_READ_CHECK");
-            if (value == nullptr || value[0] == '0') {
+            if (value == nullptr) {
                 return u64{0};
             }
             return (std::max)(u64{1}, static_cast<u64>(std::strtoull(value, nullptr, 10)));
