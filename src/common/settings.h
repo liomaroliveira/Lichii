@@ -671,6 +671,12 @@ struct Values {
                                                          true,
                                                          true};
 
+    // Large shader functions called from several places are built as calls instead of being
+    // copied into every caller (much faster driver compiles). EDEN_NX2_COMPUTE_NOINLINE=0 and
+    // EDEN_NX2_GRAPHICS_NOINLINE=0 still override.
+    SwitchableSetting<bool> shader_calls_not_inlined{linkage, true, "shader_calls_not_inlined",
+                                                     Category::RendererAdvanced};
+
     // Precache shaders before the game starts: the compute programs in the game files and the
     // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
     // driver's cache holds them before the game first uses them.
