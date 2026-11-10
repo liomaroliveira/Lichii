@@ -460,6 +460,9 @@ struct System::Impl {
 
         if (!app_loader) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+            // The kernel is already initialized. Left running, it is destroyed with the global
+            // System after main() returns, when device memory is already gone, and exit crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
 
