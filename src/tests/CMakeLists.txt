@@ -33,6 +33,7 @@ add_executable(tests
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
     audio_core/batch_decoder.cpp
+    audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
