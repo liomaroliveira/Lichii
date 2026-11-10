@@ -1133,6 +1133,25 @@ void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
     }
 }
 
+bool Maxwell3D::SameConstantData(GPUVAddr address, const u32* data, size_t size) const {
+    // Draws rewrite their constant data before each draw, much of it unchanged (Ocarina of Time:
+    // ~20k draws a second went down the full path because a write reached the words their texture
+    // handles are read from). Bytes that are already there change nothing a delta draw keeps.
+    // The cbuf path writes guest memory directly (WriteBlockCached, no cache flush), so reading
+    // it back sees what the previous writes left. EDEN_NX2_FAST_DRAW_SAME_DATA=0 turns it off.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_DRAW_SAME_DATA");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr size_t MaxCompared = 1024;
+    if (!enabled || size > MaxCompared) {
+        return false;
+    }
+    std::array<u32, MaxCompared / sizeof(u32)> current;
+    memory_manager.ReadBlockUnsafe(address, current.data(), size);
+    return std::memcmp(current.data(), data, size) == 0;
+}
+
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     // Write the input value to the current const buffer at the current position.
@@ -1147,7 +1166,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        if (VideoCommon::Nx2FastDraw::Enabled()) {
+        if (VideoCommon::Nx2FastDraw::Enabled() && !SameConstantData(address, start_base, write_size)) {
             NoteFastDrawConstantData(address, address + write_size);
         }
         memory_manager.WriteBlockCached(address, start_base, write_size);

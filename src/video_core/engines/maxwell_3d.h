@@ -3316,6 +3316,8 @@ public:
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+    /// Whether [address, address + size) already holds data (cbuf writes that change nothing).
+    bool SameConstantData(GPUVAddr address, const u32* data, size_t size) const;
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
