@@ -622,6 +622,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     Sensitivity::Back().Event(); // TEST (EDEN_NX2_DELAY_BACK_MS)
     if (MethodRepeat::Enabled()) [[unlikely]] { // TEST (E15.T1, EDEN_NX2_METHOD_REPEAT)
         auto& counter = MethodRepeat::Get();
+        using Tegra::Engines::Maxwell3D;
         counter.SetConstBufferData(MAXWELL3D_REG_INDEX(const_buffer.buffer));
         return counter.Execute(entry, [&] { return ExecuteEntry(entry, words); });
     }
