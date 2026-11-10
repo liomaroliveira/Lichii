@@ -86,22 +86,28 @@ public:
     std::vector<std::pair<u64, u64>> UnmapMemory(u64 cpu_address, u64 size) {
         std::scoped_lock lk{mutex};
         const u64 end = cpu_address + size;
-        std::vector<std::pair<u64, u64>> ranges;
+        struct Range {
+            u64 gpu_address;
+            u64 size;
+            bool own; ///< The mapping at the memory's own address
+        };
+        std::vector<Range> ranges;
         for (const auto& m : mappings) {
             const u64 first = (std::max)(m.cpu_address, cpu_address);
             const u64 last = (std::min)(m.cpu_address + m.size, end);
             if (first < last) {
-                ranges.emplace_back(m.gpu_address + (first - m.cpu_address), last - first);
+                ranges.push_back({m.gpu_address + (first - m.cpu_address), last - first,
+                                  m.gpu_address == m.cpu_address});
             }
         }
         std::vector<std::pair<u64, u64>> leftovers;
-        for (const auto& [gpu_address, range_size] : ranges) {
-            TrimMappings(gpu_address, range_size);
+        for (const auto& range : ranges) {
+            TrimMappings(range.gpu_address, range.size);
             for (auto& [owner, listener] : listeners) {
-                listener.unmap(gpu_address, range_size);
+                listener.unmap(range.gpu_address, range.size);
             }
-            if (gpu_address < cpu_address || gpu_address >= end) {
-                leftovers.emplace_back(gpu_address, range_size);
+            if (!range.own) {
+                leftovers.emplace_back(range.gpu_address, range.size);
             }
         }
         return leftovers;
