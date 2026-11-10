@@ -415,7 +415,6 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore, location);
     AllocateNewContext();
-    submitted_serial = record_serial; // what AllocateNewContext recorded counts as submitted
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     return signal_value;
@@ -495,7 +494,6 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     SubmitExecution(signal_semaphore, wait_semaphore, location);
     Wait(presubmit_tick);
     AllocateNewContext();
-    submitted_serial = record_serial;
     VideoCommon::GpuWaitStats::AddHostWait(VideoCommon::GpuWaitStats::Now() - wait_start);
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
@@ -551,7 +549,6 @@ void Scheduler::DispatchWork() {
 
 void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies,
                              std::source_location location) {
-    ++record_serial;
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
     }
@@ -582,7 +579,6 @@ void Scheduler::FlushUploads() {
 
 void Scheduler::RecordReorderedUpload(VkBuffer src, VkBuffer dst,
                                       std::span<const VkBufferCopy> copies, u64 prior_tick) {
-    ++record_serial;
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordReorderedUpload");
     }

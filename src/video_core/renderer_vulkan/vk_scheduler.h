@@ -256,14 +256,6 @@ public:
             location, RecordSite::Own, 0);
     }
 
-    /// Whether a command or upload was recorded since the last Flush or Finish. A flush with
-    /// nothing to submit is skipped (port of Fritchii's EXP61: a fence with a download is flushed
-    /// by InnerFence::Queue and then again by FlushCommands with an empty command buffer, ~4,600
-    /// empty submits a second in Castle Town).
-    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        return record_serial != submitted_serial;
-    }
-
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
@@ -481,7 +473,6 @@ private:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
-        ++record_serial;
         if (uploads_pending) {
             // Uploads recorded before this command go before it.
             FlushUploads();
@@ -612,8 +603,6 @@ private:
     std::unique_ptr<UploadBatch> upload_batch;
     std::source_location upload_batch_site{};
     bool uploads_pending{};
-    u64 record_serial = 0;    ///< commands and uploads recorded (RecordedSinceSubmit)
-    u64 submitted_serial = 0; ///< record_serial at the last Flush or Finish
     /// Records the pending uploads as one command.
     void FlushUploads();
     /// RecordReorderedUpload's copies, recorded when the submission is.
