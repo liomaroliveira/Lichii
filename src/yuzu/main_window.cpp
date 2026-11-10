@@ -5278,21 +5278,39 @@ void MainWindow::Nx2AutoMapController() {
         return;
     }
     const Common::ParamPackage current = controller->GetButtonParam(Settings::NativeButton::A);
-    const std::string current_guid = current.Get("guid", "");
-    const int current_port = current.Get("port", 0);
-    const bool uses_pad = !current_guid.empty();
-    std::optional<Common::ParamPackage> candidate;
+    const auto key = [](const Common::ParamPackage& p) {
+        return p.Get("guid", "") + ':' + std::to_string(p.Get("port", 0));
+    };
+    const std::string current_key = current.Has("guid") ? key(current) : std::string{};
+    // Controllers now, and which of them were not there at the last check. A controller that was
+    // just connected (turned on, switched from cable to its dongle, a stream's virtual pad) takes
+    // player 1: a wireless receiver stays connected while its pad runs on the cable, so "player 1's
+    // controller is gone" alone missed the switch back to the cable.
+    std::set<std::string> now;
+    std::optional<Common::ParamPackage> newest, any_other;
+    bool current_present = false;
     for (const auto& device : input_subsystem->GetInputDevices()) {
         if (device.Get("engine", "") != "sdl" || !device.Has("guid") || device.Has("guid2")) {
             continue;
         }
-        if (uses_pad && device.Get("guid", "") == current_guid &&
-            device.Get("port", 0) == current_port) {
-            return; // player 1's controller is connected
+        const std::string device_key = key(device);
+        now.insert(device_key);
+        if (device_key == current_key) {
+            current_present = true;
+            continue;
         }
-        if (!candidate) {
-            candidate = device;
+        if (nx2_automap_seen && !nx2_automap_seen->contains(device_key)) {
+            newest = device;
         }
+        if (!any_other) {
+            any_other = device;
+        }
+    }
+    nx2_automap_seen = std::move(now);
+    // A new controller, else any controller when player 1's own is absent
+    std::optional<Common::ParamPackage> candidate = newest;
+    if (!candidate && !current_present) {
+        candidate = any_other;
     }
     if (!candidate) {
         return;
