@@ -45,18 +45,20 @@ constexpr size_t DynamicRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46200;
 constexpr size_t DynamicStateOffset = sizeof(Loader::NSOHeader) + 0x4E9FE00;
 constexpr size_t DynamicRoutineSize = 120;
 constexpr size_t UnlockRoutineSize = 128;
-constexpr size_t DynamicStateSize = 24;
+constexpr size_t DynamicStateSize = 0x98;
 constexpr size_t WaterHookOffset = sizeof(Loader::NSOHeader) + 0x475F8;
 constexpr size_t WaterMulOffset = sizeof(Loader::NSOHeader) + 0x4760C;
-constexpr size_t WaterRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46400;
-constexpr size_t WaterRoutineSize = 84;
+constexpr size_t WaterRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46300;
+constexpr size_t WaterRoutineSize = 148;
 constexpr u32 WaterOriginalInstruction = 0x1E380009;
 constexpr u32 WaterMulOriginalInstruction = 0x1B097D08;
-constexpr u32 WaterCallInstruction = 0x94EFFB82;
+constexpr u32 WaterCallInstruction = 0x94EFFB42;
 constexpr std::string_view WaterRoutine =
-    "0101221E0008211E0820201E0D020054C99200B021114EBD0028211E01102C1E0228211E"
-    "4800381E1F0500714A000054280080520101221E0038211E01103C1E0048211E20110EBD"
-    "C0035FD6E8031F2AC0035FD6";
+    "0101221E0008211E0820201E0D040054C99200B0294138912A010291EB0309AA6C0140F9"
+    "9F0115EB600100546B4100917F010AEB61FFFF544C0140B92B512C8B750100F97F0900B9"
+    "8C0500118C0900124C0100B9610940BD0028211E01102C1E0228211E4800381E1F050071"
+    "4A000054280080520101221E0038211E01103C1E0048211E600900BDC0035FD6E8031F2A"
+    "C0035FD6";
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 
