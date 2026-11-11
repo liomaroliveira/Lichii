@@ -32,6 +32,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/nx2_grid_taint.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
@@ -1671,7 +1672,8 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
 }
 
 bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method,
-                                          GPUVAddr address) {
+                                          GPUVAddr address,
+                                          const Nx2ListDispatch::ListReader& reader) {
     namespace ListDispatch = Tegra::Nx2ListDispatch;
     auto& fs = Front(split);
     // The three words must be the whole call.
@@ -1714,6 +1716,9 @@ bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 meth
     data_ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
     data_ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
     data_ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
+    if (grid_list != nullptr) {
+        *grid_list = reader;
+    }
     // Writes no guest memory itself.
     split.Defer([this, address] { list_dispatch_address = address; }, 0,
                 VideoCommon::GpuSplit::Writes::Noted);
@@ -1756,6 +1761,81 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     const auto read = [&fs](u32 address) {
         return address < fs.registers.size() ? fs.registers[address] : 0U;
     };
+    // List guard (nx2_list_dispatch.h): the data RAM holds the marker of a grid the front did not read. A
+    // macro may run on it if it does not read the grid words, or only copies them into an upload
+    // (the QMD's grid, where the dispatch finds the marker): what the call does with them is
+    // followed in a dry run. Anything else gets the real words first.
+    // The engine's registers keep a copy of the QMD (0xc8 on): its grid holds the marker too
+    // once a macro copied it there.
+    constexpr u32 grid_register = 0xc8 + 12;
+    const bool marker_in_registers =
+        Nx2ListDispatch::IsMarker(fs.registers[grid_register], fs.registers[grid_register + 1],
+                                  fs.registers[grid_register + 2]) &&
+        fs.registers[grid_register + 1] == Nx2ListDispatch::MarkerY &&
+        fs.registers[grid_register + 2] == Nx2ListDispatch::MarkerZ;
+    if (const int guard = Nx2ListDispatch::GuardMode();
+        guard != 0 && grid_list != nullptr &&
+        (marker_in_registers ||
+         Nx2ListDispatch::HasMarker(*macro.native_interpreter.active_dram))) [[unlikely]] {
+        namespace ListDispatch = Nx2ListDispatch;
+        const bool stores_grid =
+            std::ranges::any_of(fs.grid_macros, [&](const FrontState::GridMacro& entry) {
+                return entry.engine == &macro &&
+                       entry.generation == macro.native_code_generation &&
+                       entry.start == start && entry.stores_grid;
+            });
+        if (!stores_grid) {
+            const auto result = Nx2GridTaint::DryRun(
+                std::span<const u32>{macro.native_code}, start, fs.parameters,
+                *macro.native_interpreter.active_dram, read, grid_register);
+            constexpr u32 data_upload = KEPLER_COMPUTE_REG_INDEX(data_upload);
+            if (!Nx2GridTaint::MayRunOnMarker(result, data_upload, grid_register)) {
+                ListDispatch::Count(ListDispatch::g_guard.compute_unsafe);
+                if (static u32 logged{}; logged < 24) {
+                    ++logged;
+                    std::string grid_emits;
+                    for (size_t i = 0; i < result.emits.size(); ++i) {
+                        if (result.emits[i].grid) {
+                            grid_emits += fmt::format(" #{}:{:#x}={:#x}", i, result.emits[i].method,
+                                                      result.emits[i].value);
+                        }
+                    }
+                    LOG_INFO(HW_GPU,
+                             "List guard: compute macro at {:#x} is unsafe on the marker: {} "
+                             "(completed {}, safe {}, read the grid {}, {} of {} parameters, {} "
+                             "emits, grid emits:{})",
+                             start, result.reason.empty() ? "grid words emitted elsewhere"
+                                                          : result.reason,
+                             result.completed, result.safe, result.read_grid, result.consumed,
+                             fs.parameters.size(), result.emits.size(), grid_emits);
+                }
+                if (guard == 2) {
+                    // The real words, wherever the marker is: the data RAM, the registers.
+                    std::array<u32, 3> words{};
+                    if (!grid_list->Read(words)) {
+                        ListDispatch::Count(ListDispatch::g_guard.failed);
+                    } else {
+                        auto& data_ram = *macro.native_interpreter.active_dram;
+                        if (ListDispatch::HasMarker(data_ram)) {
+                            data_ram[ListDispatch::DramGridX] = words[0];
+                            data_ram[ListDispatch::DramGridY] = words[1];
+                            data_ram[ListDispatch::DramGridZ] = words[2];
+                        }
+                        if (marker_in_registers) {
+                            for (u32 word = 0; word < 3; ++word) {
+                                FrontApply(fs, grid_register + word, words[word]);
+                                split.MacroWrite(this, grid_register + word, words[word]);
+                            }
+                        }
+                        ListDispatch::Count(ListDispatch::g_guard.grid_resolves);
+                    }
+                }
+            } else {
+                ListDispatch::Count(result.read_grid ? ListDispatch::g_guard.compute_copies
+                                                     : ListDispatch::g_guard.compute_unaffected);
+            }
+        }
+    }
     const auto emit = [&](u32 address, u32 value) {
         if (address >= 0xe00) {
             return false;

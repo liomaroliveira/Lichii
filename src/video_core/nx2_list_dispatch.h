@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "video_core/nx2_list_draw.h"
 #include "video_core/macro_turing.h"
+#include "video_core/nx2_list_reader.h"
 
 // List dispatches (nx2_list_dispatch.h): compute dispatches whose grid is GPU-written.
 //
@@ -115,6 +116,52 @@ inline constexpr u32 MarkerZ = 0x7E57;
     return true;
 }
 
+/// Whether the three grid words of the data RAM `ram` hold the marker.
+template <typename Ram>
+[[nodiscard]] inline bool HasMarker(const Ram& ram) {
+    return ram[DramGridX] == MarkerX && ram[DramGridY] == MarkerY && ram[DramGridZ] == MarkerZ;
+}
+
+/// EDEN_NX2_LIST_GUARD, read once: 2 (the default) = the words a list draw or a list dispatch
+/// left on the host GPU are read back before anything can use their values, 1 = what could use
+/// them is only counted, 0 = off.
+[[nodiscard]] inline int GuardMode() {
+    static const int mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_LIST_GUARD");
+        return value != nullptr ? std::atoi(value) : 2;
+    }();
+    return mode;
+}
+
+struct GuardStats {
+    std::atomic<u64> dram_macros{};       ///< 3D macros that use the data RAM, on the marker
+    std::atomic<u64> compute_unaffected{}; ///< Compute macros on the marker that do not read it
+    std::atomic<u64> compute_copies{};    ///< ... that copy it into an upload (the QMD's grid)
+    std::atomic<u64> compute_unsafe{};    ///< ... that use it otherwise, or cannot be followed
+    std::atomic<u64> grid_resolves{};     ///< The grid words read back
+    std::atomic<u64> stale_reads{};       ///< Macro reads of the two registers a list draw left
+    std::atomic<u64> stale_draws{};       ///< Array draws that would use them
+    std::atomic<u64> stale_back_macros{}; ///< Macros sent to the back while they are stale
+    std::atomic<u64> draw_resolves{};     ///< The two words read back
+    std::atomic<u64> failed{};            ///< Words that could not be read back
+};
+inline GuardStats g_guard;
+
+/// Reads the grid words back into `ram` (the marker is gone). False if they could not be read.
+template <typename Ram>
+inline bool ResolveGrid(const ListReader& reader, Ram& ram) {
+    std::array<u32, 3> words{};
+    if (!reader.Read(words)) {
+        g_guard.failed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    ram[DramGridX] = words[0];
+    ram[DramGridY] = words[1];
+    ram[DramGridZ] = words[2];
+    g_guard.grid_resolves.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 struct Stats {
     std::atomic<u64> taken{};     ///< Front: lists sent as an address
     std::atomic<u64> refused{};   ///< Front: three-word compute lists of another macro or shape
@@ -150,6 +197,17 @@ inline void MaybeLog() {
                  "List dispatch per 2 s: {} lists taken, {} refused | {} indirect dispatches, {} "
                  "markers without a list",
                  taken, refused, indirect, orphan);
+    }
+    if (GuardMode() != 0) {
+        LOG_INFO(HW_GPU,
+                 "List guard per 2 s: grid: {} 3D macros with data RAM, compute macros {} "
+                 "unaffected / {} copies / {} unsafe, {} read back | draws: {} register reads, {} "
+                 "array draws, {} back macros, {} read back | {} failed",
+                 take(g_guard.dram_macros), take(g_guard.compute_unaffected),
+                 take(g_guard.compute_copies), take(g_guard.compute_unsafe),
+                 take(g_guard.grid_resolves), take(g_guard.stale_reads),
+                 take(g_guard.stale_draws), take(g_guard.stale_back_macros),
+                 take(g_guard.draw_resolves), take(g_guard.failed));
     }
 }
 

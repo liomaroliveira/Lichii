@@ -775,7 +775,13 @@ bool DmaPusher::TakeListDraw(GPUVAddr address, u32 count) {
         return false;
     }
     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
-    if (!maxwell3d->FrontTakeListDraw(system, split, dma_state.method, address)) {
+    const Tegra::Nx2ListDispatch::ListReader reader{
+        address,
+        [](void* self, GPUVAddr list, std::span<u32> words) {
+            return static_cast<DmaPusher*>(self)->ReadListWords(list, words);
+        },
+        this};
+    if (!maxwell3d->FrontTakeListDraw(system, split, dma_state.method, address, reader)) {
         ListDraw::Count(ListDraw::g_stats.refused);
         return false;
     }
@@ -803,14 +809,31 @@ bool DmaPusher::TakeListDispatch(GPUVAddr address, u32 count) {
         return false;
     }
     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
+    const ListDispatch::ListReader reader{
+        address,
+        [](void* self, GPUVAddr list, std::span<u32> words) {
+            return static_cast<DmaPusher*>(self)->ReadListWords(list, words);
+        },
+        this};
     if (!compute->FrontRunsMacros() ||
-        !compute->FrontTakeListDispatch(split, dma_state.method, address)) {
+        !compute->FrontTakeListDispatch(split, dma_state.method, address, reader)) {
         ListDispatch::Count(ListDispatch::g_stats.refused);
         return false;
     }
     ListDispatch::Count(ListDispatch::g_stats.taken);
     dma_state.method_count = 0;
     dma_state.is_last_call = true;
+    return true;
+}
+
+bool DmaPusher::ReadListWords(GPUVAddr address, std::span<u32> words) {
+    if (words.empty() || !memory_manager.GpuToCpuAddress(address)) {
+        return false;
+    }
+    // The work that writes the words is among what the front sent: the back runs it first.
+    VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
+    FlushGpuWrittenCommands(address, words.size_bytes());
+    memory_manager.ReadBlockUnsafe(address, words.data(), words.size_bytes());
     return true;
 }
 

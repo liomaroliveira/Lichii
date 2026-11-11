@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <span>
 #include <vector>
@@ -82,4 +83,40 @@ TEST_CASE("List dispatch marker", "[list_dispatch]") {
     CHECK_FALSE(IsMarker(0, ListDispatch::MarkerY, ListDispatch::MarkerZ));
     // No host dispatches a grid that large, so no game's grid is the marker.
     CHECK(ListDispatch::MarkerX > 0xffffff);
+}
+
+TEST_CASE("List dispatch: the grid words are read back over the marker", "[list_dispatch]") {
+    Tegra::TuringMacroInterpreter::DataRam ram{};
+    CHECK_FALSE(ListDispatch::HasMarker(ram));
+    ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
+    ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
+    CHECK_FALSE(ListDispatch::HasMarker(ram));
+    ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
+    CHECK(ListDispatch::HasMarker(ram));
+
+    // No reader: the marker stays, and the failure is counted.
+    const u64 failed = ListDispatch::g_guard.failed.load();
+    CHECK_FALSE(ListDispatch::ResolveGrid(ListDispatch::ListReader{}, ram));
+    CHECK(ListDispatch::HasMarker(ram));
+    CHECK(ListDispatch::g_guard.failed.load() == failed + 1);
+
+    struct Source {
+        GPUVAddr asked{};
+        std::array<u32, 3> words{60, 270, 1};
+    } source;
+    const ListDispatch::ListReader reader{
+        0x2272dce010,
+        [](void* context, GPUVAddr address, std::span<u32> words) {
+            auto& from = *static_cast<Source*>(context);
+            from.asked = address;
+            std::ranges::copy(from.words, words.begin());
+            return words.size() == from.words.size();
+        },
+        &source};
+    CHECK(ListDispatch::ResolveGrid(reader, ram));
+    CHECK(source.asked == 0x2272dce010);
+    CHECK(ram[ListDispatch::DramGridX] == 60);
+    CHECK(ram[ListDispatch::DramGridY] == 270);
+    CHECK(ram[ListDispatch::DramGridZ] == 1);
+    CHECK_FALSE(ListDispatch::HasMarker(ram));
 }

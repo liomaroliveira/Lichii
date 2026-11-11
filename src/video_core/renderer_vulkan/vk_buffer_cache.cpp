@@ -647,6 +647,7 @@ void BufferCacheRuntime::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset
             std::memcpy(mapped.data() + size_t{i} * LIST_DRAW_SLOT_BYTES, slot.data(),
                         LIST_DRAW_SLOT_BYTES);
         }
+        list_draw_buffer.Flush();
     }
     // The copies and the draws that read them run in the order they are recorded: a slot is
     // free again as soon as the next copy into it is recorded after its draw.

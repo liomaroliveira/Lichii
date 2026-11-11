@@ -23,6 +23,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
+#include "video_core/nx2_list_reader.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {
@@ -267,7 +268,13 @@ public:
     /// GPU-written words at `address`. If the macro only stores a dispatch's grid, the front
     /// stores a marker instead and the dispatch that carries it takes its grid from `address` on
     /// the host GPU. False when the words have to be read.
-    bool FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method, GPUVAddr address);
+    bool FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method, GPUVAddr address,
+                               const Nx2ListDispatch::ListReader& reader);
+    /// List guard (nx2_list_dispatch.h): where the channel keeps the list of the grid the data RAM's
+    /// marker stands for (the 3D engine's, which shares the data RAM).
+    void SetGridList(Nx2ListDispatch::ListReader* list) {
+        grid_list = list;
+    }
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -397,6 +404,7 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+    Nx2ListDispatch::ListReader* grid_list{};
     /// List dispatches, back: where the grid of the dispatches whose QMD carries the
     /// marker is, 0 if no list was taken.
     GPUVAddr list_dispatch_address{};

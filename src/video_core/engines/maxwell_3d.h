@@ -27,6 +27,7 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_reader.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3228,7 +3229,10 @@ public:
     /// List draws (nx2_list_draw.h): the call of macro `method` whose two parameters are the GPU-written
     /// words at `address`. Returns whether the call was sent to the back without reading them.
     bool FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                           GPUVAddr address);
+                           GPUVAddr address, const Nx2ListDispatch::ListReader& reader);
+    /// List guard (nx2_list_dispatch.h): the list of the grid the data RAM's marker stands for, set by the
+    /// compute engine that shares the data RAM (KeplerCompute::FrontTakeListDispatch).
+    Nx2ListDispatch::ListReader grid_list;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3484,6 +3488,13 @@ private:
     bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    /// List guard (nx2_list_dispatch.h): a write of `method` while the two registers a list draw left
+    /// unwritten are stale (FrontState::list_draw_stale).
+    void FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// List guard (nx2_list_dispatch.h): reads the list draw's two words back and writes the registers.
+    void FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& state);
+    /// List guard (nx2_list_dispatch.h): whether the macro at `start` uses the data RAM.
+    bool FrontMacroUsesDataRam(FrontState& state, const MacroEngine& engine, u32 start);
     /// GpuSplit::FoldInstance's flush, `engine` a Maxwell3D.
     static void FlushFoldedInstances(void* engine, u32 count);
     /// Whether the front counts an instance loop's later instances (FrontWrite).
