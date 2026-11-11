@@ -1653,6 +1653,23 @@ bool RasterizerVulkan::Nx2ListDispatchSupported() const {
     return Tegra::Nx2ListDispatch::Mode() != 0;
 }
 
+// List draws and list dispatches: a copy of the list words at their place in the stream, for the
+// front to read back if it needs their values after all.
+void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+        address, count * sizeof(u32), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    if (buffer == nullptr) {
+        return;
+    }
+    buffer_cache_runtime.KeepListWords(keep_id, buffer->Handle(), offset, count);
+}
+
+bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    return buffer_cache_runtime.ReadKeptListWords(keep_id, words);
+}
+
 void RasterizerVulkan::DrawListWords() {
     namespace ListDraw = Tegra::Nx2ListDraw;
     auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -1678,6 +1695,7 @@ void RasterizerVulkan::DrawListWords() {
         if (words[1] != 0) {
             ListDraw::Count(ListDraw::g_stats.read_first);
         }
+        buffer_cache_runtime.KeepListWordsRead(params.list_keep_id, words);
         draw_state.vertex_buffer.count = words[0];
         draw_state.vertex_buffer.first = words[1];
         draw_state.draw_element_count = words[0];
@@ -1691,7 +1709,7 @@ void RasterizerVulkan::DrawListWords() {
         ++trace_indirect;
     }
     buffer_cache.SetDrawIndirect(&params);
-    buffer_cache_runtime.RequestListDrawArgs();
+    buffer_cache_runtime.RequestListDrawArgs(params.list_keep_id);
     bool recorded = false;
     bool mesh = false;
     PrepareDraw(false, [this, &mesh, &recorded] {

@@ -776,9 +776,9 @@ bool DmaPusher::TakeListDraw(GPUVAddr address, u32 count) {
     }
     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
     const Tegra::Nx2ListDispatch::ListReader reader{
-        address,
-        [](void* self, GPUVAddr list, std::span<u32> words) {
-            return static_cast<DmaPusher*>(self)->ReadListWords(list, words);
+        address, Tegra::Nx2ListDispatch::NextKeepId(),
+        [](void* self, GPUVAddr list, u64 keep_id, std::span<u32> words) {
+            return static_cast<DmaPusher*>(self)->ReadListWords(list, keep_id, words);
         },
         this};
     if (!maxwell3d->FrontTakeListDraw(system, split, dma_state.method, address, reader)) {
@@ -801,7 +801,7 @@ bool DmaPusher::TakeListDispatch(GPUVAddr address, u32 count) {
     // The three words are all the parameters of a compute macro call begun in the entry before,
     // on one mapped page.
     if (count != 3 || dma_state.method_count != 3 || command_resume_offset != 0 ||
-        !split.Active() || dma_state.method < MacroRegistersStart ||
+        !split.Active() || !split.FrontMacros() || dma_state.method < MacroRegistersStart ||
         (dma_state.method & 1) != 0 || (address & 0xfff) > 0x1000 - 3 * sizeof(u32) ||
         subchannels[dma_state.subchannel] == nullptr ||
         subchannel_type[dma_state.subchannel] != Engines::EngineTypes::KeplerCompute ||
@@ -810,9 +810,9 @@ bool DmaPusher::TakeListDispatch(GPUVAddr address, u32 count) {
     }
     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
     const ListDispatch::ListReader reader{
-        address,
-        [](void* self, GPUVAddr list, std::span<u32> words) {
-            return static_cast<DmaPusher*>(self)->ReadListWords(list, words);
+        address, ListDispatch::NextKeepId(),
+        [](void* self, GPUVAddr list, u64 keep_id, std::span<u32> words) {
+            return static_cast<DmaPusher*>(self)->ReadListWords(list, keep_id, words);
         },
         this};
     if (!compute->FrontRunsMacros() ||
@@ -826,12 +826,27 @@ bool DmaPusher::TakeListDispatch(GPUVAddr address, u32 count) {
     return true;
 }
 
-bool DmaPusher::ReadListWords(GPUVAddr address, std::span<u32> words) {
-    if (words.empty() || !memory_manager.GpuToCpuAddress(address)) {
+bool DmaPusher::ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words) {
+    if (words.empty()) {
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The copy the back kept at the list's place in the stream: the words as the list had them,
+    // whatever later work wrote there, and whether or not the list is still mapped.
+    if (keep_id != 0 && rasterizer != nullptr) {
+        bool kept = false;
+        split.Run([&] { kept = rasterizer->Nx2ReadKeptListWords(keep_id, words); },
+                  VideoCommon::DrainSite::ListFlush);
+        if (kept) {
+            return true;
+        }
+    }
+    // No copy (the draw was not recorded): the list as it is now.
+    if (!memory_manager.GpuToCpuAddress(address)) {
         return false;
     }
     // The work that writes the words is among what the front sent: the back runs it first.
-    VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
+    split.Drain(VideoCommon::DrainSite::ListFlush);
     FlushGpuWrittenCommands(address, words.size_bytes());
     memory_manager.ReadBlockUnsafe(address, words.data(), words.size_bytes());
     return true;

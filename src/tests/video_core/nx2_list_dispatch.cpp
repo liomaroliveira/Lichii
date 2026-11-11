@@ -86,30 +86,38 @@ TEST_CASE("List dispatch finds the grid wherever a macro stores it", "[list_disp
 
 TEST_CASE("List dispatch marker", "[list_dispatch]") {
     using ListDispatch::IsMarker;
-    CHECK(IsMarker(ListDispatch::MarkerX, ListDispatch::MarkerY, ListDispatch::MarkerZ));
+    const auto marker = ListDispatch::MarkerWords(0x1234);
+    CHECK(IsMarker(marker[0], marker[1], marker[2]));
+    // The x carries the list's keep id, its low 16 bits.
+    CHECK(ListDispatch::MarkerKeepBits(marker[0]) == 0x1234);
+    CHECK(ListDispatch::MarkerKeepBits(ListDispatch::MarkerWords(0x51234)[0]) == 0x1234);
+    CHECK(marker != ListDispatch::MarkerWords(0x1235));
     // The QMD's y and z are 16 bits: what is above them is not the grid.
-    CHECK(IsMarker(ListDispatch::MarkerX, ListDispatch::MarkerY | 0x10000,
-                   ListDispatch::MarkerZ | 0xABCD0000));
+    CHECK(IsMarker(marker[0], ListDispatch::MarkerY | 0x10000, ListDispatch::MarkerZ | 0xABCD0000));
     CHECK_FALSE(IsMarker(1, 1, 1));
-    CHECK_FALSE(IsMarker(ListDispatch::MarkerX, 1, 1));
+    CHECK_FALSE(IsMarker(marker[0], 1, 1));
     CHECK_FALSE(IsMarker(0, ListDispatch::MarkerY, ListDispatch::MarkerZ));
     // No host dispatches a grid that large, so no game's grid is the marker.
-    CHECK(ListDispatch::MarkerX > 0xffffff);
+    CHECK(ListDispatch::MarkerXBase > 0xffffff);
 }
 
 TEST_CASE("List dispatch: the grid words are read back over the marker", "[list_dispatch]") {
     // Cells that are no game's in particular.
     constexpr ListDispatch::GridCells Cells{0x105, 0x40, 0x7};
+    const auto words = ListDispatch::MarkerWords(3);
     Tegra::TuringMacroInterpreter::DataRam ram{};
-    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
-    ram[Cells[0]] = ListDispatch::MarkerX;
-    ram[Cells[1]] = ListDispatch::MarkerY;
-    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
-    ram[Cells[2]] = ListDispatch::MarkerZ;
-    CHECK(ListDispatch::HasMarker(ram, Cells));
+    ListDispatch::GridMarker marker{{}, Cells, words, true};
+    CHECK_FALSE(marker.In(ram));
+    ram[Cells[0]] = words[0];
+    CHECK(marker.In(ram));
+    ram[Cells[1]] = words[1];
+    ram[Cells[2]] = words[2];
+    // A word another list's marker holds is not this one's.
+    ram[Cells[0]] = ListDispatch::MarkerWords(4)[0];
+    CHECK_FALSE(marker.Holds(ram, 0));
+    ram[Cells[0]] = words[0];
 
     // No reader: the marker stays, and the failure is counted.
-    ListDispatch::GridMarker marker{{}, Cells, true};
     CHECK(marker.In(ram));
     const u64 failed = ListDispatch::g_guard.failed.load();
     CHECK_FALSE(ListDispatch::ResolveGrid(marker, ram));
@@ -118,23 +126,42 @@ TEST_CASE("List dispatch: the grid words are read back over the marker", "[list_
 
     struct Source {
         GPUVAddr asked{};
+        u64 keep_id{};
         std::array<u32, 3> words{60, 270, 1};
     } source;
     const ListDispatch::ListReader reader{
-        0x2272dce010,
-        [](void* context, GPUVAddr address, std::span<u32> words) {
+        0x2272dce010, 3,
+        [](void* context, GPUVAddr address, u64 keep_id, std::span<u32> words) {
             auto& from = *static_cast<Source*>(context);
             from.asked = address;
+            from.keep_id = keep_id;
             std::ranges::copy(from.words, words.begin());
             return words.size() == from.words.size();
         },
         &source};
     marker.list = reader;
+    // A macro stored over y since: y keeps its value, x and z get theirs.
+    ram[Cells[1]] = 77;
     CHECK(ListDispatch::ResolveGrid(marker, ram));
     CHECK(source.asked == 0x2272dce010);
+    CHECK(source.keep_id == 3);
     CHECK(ram[Cells[0]] == 60);
-    CHECK(ram[Cells[1]] == 270);
+    CHECK(ram[Cells[1]] == 77);
     CHECK(ram[Cells[2]] == 1);
-    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
     CHECK_FALSE(marker.set);
+    CHECK_FALSE(marker.In(ram));
+}
+
+TEST_CASE("List dispatch: a marker finds its own list", "[list_dispatch]") {
+    ListDispatch::GridMarker marker;
+    for (u64 id = 1; id <= 100; ++id) {
+        marker.Remember({0x1000 * id, id, nullptr, nullptr});
+    }
+    // The last 64 lists are found by the keep id their marker carries.
+    const auto* found = marker.Find(ListDispatch::MarkerWords(90)[0]);
+    REQUIRE(found != nullptr);
+    CHECK(found->address == 0x1000 * 90);
+    // Older ones are gone, not mistaken for a newer one.
+    CHECK(marker.Find(ListDispatch::MarkerWords(20)[0]) == nullptr);
+    CHECK(marker.Find(ListDispatch::MarkerWords(200)[0]) == nullptr);
 }

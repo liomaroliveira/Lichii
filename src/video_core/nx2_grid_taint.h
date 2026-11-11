@@ -46,21 +46,22 @@ struct Result {
 };
 
 /// Runs the macro at `start` of `code` on a copy of `dram`, with `parameters` and register reads
-/// through `read`. Emits are collected, not applied. `grid_register` is the first of three
-/// registers that hold the grid words when they hold the marker (the engine's copy of the QMD's
-/// grid), ~0 for none.
+/// through `read`. Emits are collected, not applied. `cells` are the data RAM words the grid is
+/// stored in and `marked` those of them that hold their marker word (GridMarker::Marked): each
+/// is followed on its own. `grid_register` is the first of three registers that hold the grid
+/// words when they hold a marker (the engine's copy of the QMD's grid), ~0 for none.
 template <typename Read>
 [[nodiscard]] Result DryRun(std::span<const Word> code, Word start,
                             std::span<const Word> parameters, const DataRam& dram,
-                            const Nx2ListDispatch::GridCells& cells, Read read,
+                            const Nx2ListDispatch::GridCells& cells,
+                            const std::array<bool, 3>& marked, Read read,
                             Word grid_register = ~Word{0}) {
     using Decoded = TuringMacroInterpreter::Decoded;
     Result result;
     DataRam ram = dram;
-    // The data RAM words that hold a grid word: the marker's three at first, if they hold it
-    // (words a macro stored there itself are values like any other).
-    const bool marked = Nx2ListDispatch::HasMarker(dram, cells);
-    std::array<bool, 3> grid_cell{marked, marked, marked};
+    // The data RAM words that hold a grid word: each of the marker's three while it holds its
+    // marker (a word a macro stored there itself is a value like any other).
+    std::array<bool, 3> grid_cell = marked;
     const auto cell_index = [&](Word address) -> int {
         for (int i = 0; i < 3; ++i) {
             if (cells[i] == address) {
@@ -292,11 +293,9 @@ template <typename Read>
                 case 22: {
                     const Word address = (x + y) & 0xffff;
                     value = read(address);
-                    constexpr std::array<Word, 3> marker{Nx2ListDispatch::MarkerX,
-                                                         Nx2ListDispatch::MarkerY,
-                                                         Nx2ListDispatch::MarkerZ};
                     if (grid_register != ~Word{0} && address >= grid_register &&
-                        address < grid_register + 3 && value == marker[address - grid_register]) {
+                        address < grid_register + 3 &&
+                        Nx2ListDispatch::IsMarkerWord(address - grid_register, value)) {
                         value_grid = true;
                         result.read_grid = true;
                     }
@@ -450,8 +449,6 @@ template <typename Read>
 /// written to the three registers from `grid_register` (the engine's copy of the QMD's grid).
 [[nodiscard]] inline bool EmitsGridOnly(const Result& result, Word data_method,
                                         Word grid_register = ~Word{0}) {
-    constexpr std::array<Word, 3> marker{Nx2ListDispatch::MarkerX, Nx2ListDispatch::MarkerY,
-                                         Nx2ListDispatch::MarkerZ};
     for (std::size_t i = 0; i < result.emits.size(); ++i) {
         if (!result.emits[i].grid) {
             continue;
@@ -465,7 +462,8 @@ template <typename Read>
             const Emit& emit = result.emits[i + word];
             const Word method = to_registers ? grid_register + static_cast<Word>(word)
                                              : data_method;
-            if (!emit.grid || emit.method != method || emit.value != marker[word]) {
+            if (!emit.grid || emit.method != method ||
+                !Nx2ListDispatch::IsMarkerWord(word, emit.value)) {
                 return false;
             }
         }

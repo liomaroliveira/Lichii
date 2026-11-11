@@ -247,7 +247,7 @@ public:
     bool TakeListDispatch(GPUVAddr address, u32 count);
     /// List guard (nx2_list_dispatch.h): the words at `address`, which a list left on the host GPU, read
     /// back after everything sent so far (a wait for the back and a flush of their pages).
-    bool ReadListWords(GPUVAddr address, std::span<u32> words);
+    bool ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 

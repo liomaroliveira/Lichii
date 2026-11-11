@@ -1757,13 +1757,9 @@ void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState&
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
         fs.list_draw_stale &= ~2U;
         break;
+    // The small index draws (index_buffer32_first and the like) draw at once, from their own
+    // words: the draw.end after them is still an array draw.
     case MAXWELL3D_REG_INDEX(index_buffer.count):
-    case MAXWELL3D_REG_INDEX(index_buffer32_first):
-    case MAXWELL3D_REG_INDEX(index_buffer16_first):
-    case MAXWELL3D_REG_INDEX(index_buffer8_first):
-    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
-    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
-    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
     case MAXWELL3D_REG_INDEX(draw_inline_index):
     case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
     case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
@@ -1832,8 +1828,12 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     fs.in_list_draw = true;
     FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.begin), 0, true, true);
     // Writes no guest memory itself (the draw.end after it notes the draw's writes).
-    split.Defer([this, address] { draw_manager.draw_state.list_draw_address = address; }, 0,
-                VideoCommon::GpuSplit::Writes::Noted);
+    split.Defer(
+        [this, address, keep_id = reader.keep_id] {
+            draw_manager.draw_state.list_draw_address = address;
+            draw_manager.draw_state.list_keep_id = keep_id;
+        },
+        0, VideoCommon::GpuSplit::Writes::Noted);
     FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
     fs.in_list_draw = false;
     // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.

@@ -3080,6 +3080,8 @@ public:
             /// List draws (nx2_list_draw.h): the next draw.end draws the array whose vertex count and
             /// first vertex are the two words at this address (Maxwell3D::FrontTakeListDraw).
             GPUVAddr list_draw_address{};
+            /// Its keep id: the rasterizer keeps a copy of the words for the front.
+            u64 list_keep_id{};
         };
         struct DrawTextureState {
             f32 dst_x0;
@@ -3103,8 +3105,9 @@ public:
             size_t max_draw_counts;
             size_t stride;
             /// List draws (nx2_list_draw.h): indirect_start_address holds a vertex count and a first
-            /// vertex, not a draw command.
+            /// vertex, not a draw command; list_keep_id is the id their copy is kept as.
             bool list_words{};
+            u64 list_keep_id{};
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);

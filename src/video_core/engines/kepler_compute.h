@@ -406,9 +406,13 @@ private:
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
     Nx2ListDispatch::GridMarker* grid_marker{};
-    /// List dispatches, back: where the grid of the dispatches whose QMD carries the
-    /// marker is, 0 if no list was taken.
-    GPUVAddr list_dispatch_address{};
+    /// List dispatches, back: the lists taken last, by keep id (the low bits of a marker's x
+    /// carry it), and where each one's grid is.
+    struct ListDispatchEntry {
+        u64 keep_id{};
+        GPUVAddr address{};
+    };
+    std::array<ListDispatchEntry, 1024> list_dispatches{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

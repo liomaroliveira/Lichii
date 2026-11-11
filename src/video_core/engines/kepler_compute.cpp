@@ -583,15 +583,18 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     } list_grid{indirect_compute};
     if (Nx2ListDispatch::IsMarker(qmd[12], qmd[13], qmd[14])) {
-        if (list_dispatch_address == 0) {
+        // The list this QMD's marker stands for: its own, whatever lists were taken since.
+        const u32 bits = Nx2ListDispatch::MarkerKeepBits(qmd[12]);
+        const auto& entry = list_dispatches[bits % list_dispatches.size()];
+        if (entry.keep_id == 0 || (entry.keep_id & 0xFFFF) != bits) {
             Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.orphan);
-            LOG_ERROR(HW_GPU, "List dispatch: a QMD carries the grid marker and no list was taken");
+            LOG_ERROR(HW_GPU, "List dispatch: a QMD carries the grid marker of no list taken");
             return true;
         }
         launch_description.grid_dim_x.Assign(1);
         launch_description.grid_dim_y.Assign(1);
         launch_description.grid_dim_z.Assign(1);
-        indirect_compute = list_dispatch_address;
+        indirect_compute = entry.address;
         list_grid.active = true;
         Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.indirect);
     }
@@ -1716,19 +1719,30 @@ bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 meth
         macro.native_interpreter.active_dram = native_data_ram;
     }
     auto& data_ram = *macro.native_interpreter.active_dram;
-    // A marker another macro left elsewhere in the data RAM gets its real words first: one
-    // marker at a time.
-    if (grid_marker->In(data_ram) && grid_marker->cells != *known->cells) {
-        ListDispatch::ResolveGrid(*grid_marker, data_ram);
-    }
     const auto& cells = *known->cells;
-    data_ram[cells[0]] = ListDispatch::MarkerX;
-    data_ram[cells[1]] = ListDispatch::MarkerY;
-    data_ram[cells[2]] = ListDispatch::MarkerZ;
-    *grid_marker = {reader, cells, true};
-    // Writes no guest memory itself.
-    split.Defer([this, address] { list_dispatch_address = address; }, 0,
-                VideoCommon::GpuSplit::Writes::Noted);
+    // A marker left in other words of the data RAM gets its real words first: one marker at a
+    // time. If they cannot be read, the list is not taken (the marker stays followed).
+    if (grid_marker->In(data_ram) && grid_marker->cells != cells &&
+        !ListDispatch::ResolveGrid(*grid_marker, data_ram)) {
+        return false;
+    }
+    const auto words = ListDispatch::MarkerWords(reader.keep_id);
+    for (size_t i = 0; i < 3; ++i) {
+        data_ram[cells[i]] = words[i];
+    }
+    grid_marker->list = reader;
+    grid_marker->cells = cells;
+    grid_marker->words = words;
+    grid_marker->set = true;
+    grid_marker->Remember(reader);
+    // At the list's place in the stream: where its grid is, and a copy of its words for the
+    // front to read back (DmaPusher::ReadListWords). Writes no guest memory itself.
+    split.Defer(
+        [this, address, keep_id = reader.keep_id] {
+            list_dispatches[keep_id % list_dispatches.size()] = {keep_id, address};
+            rasterizer->Nx2KeepListWords(keep_id, address, 3);
+        },
+        0, VideoCommon::GpuSplit::Writes::Noted);
     return true;
 }
 
@@ -1776,12 +1790,11 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     // once a macro copied it there.
     constexpr u32 grid_register = 0xc8 + 12;
     const bool marker_in_registers =
-        Nx2ListDispatch::IsMarker(fs.registers[grid_register], fs.registers[grid_register + 1],
-                                  fs.registers[grid_register + 2]) &&
-        fs.registers[grid_register + 1] == Nx2ListDispatch::MarkerY &&
-        fs.registers[grid_register + 2] == Nx2ListDispatch::MarkerZ;
+        Nx2ListDispatch::IsMarkerWord(0, fs.registers[grid_register]) &&
+        Nx2ListDispatch::IsMarkerWord(1, fs.registers[grid_register + 1]) &&
+        Nx2ListDispatch::IsMarkerWord(2, fs.registers[grid_register + 2]);
     if (const int guard = Nx2ListDispatch::GuardMode();
-        guard != 0 && grid_marker != nullptr && grid_marker->set &&
+        guard != 0 && grid_marker != nullptr &&
         (marker_in_registers || grid_marker->In(*macro.native_interpreter.active_dram)))
         [[unlikely]] {
         namespace ListDispatch = Nx2ListDispatch;
@@ -1794,7 +1807,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (!stores_grid) {
             const auto result = Nx2GridTaint::DryRun(
                 std::span<const u32>{macro.native_code}, start, fs.parameters,
-                *macro.native_interpreter.active_dram, grid_marker->cells, read, grid_register);
+                *macro.native_interpreter.active_dram, grid_marker->cells,
+                grid_marker->Marked(*macro.native_interpreter.active_dram), read, grid_register);
             constexpr u32 data_upload = KEPLER_COMPUTE_REG_INDEX(data_upload);
             if (!Nx2GridTaint::MayRunOnMarker(result, data_upload, grid_register)) {
                 ListDispatch::Count(ListDispatch::g_guard.compute_unsafe);
@@ -1817,25 +1831,24 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                              fs.parameters.size(), result.emits.size(), grid_emits);
                 }
                 if (guard == 2) {
-                    // The real words, wherever the marker is: the data RAM, the registers.
-                    std::array<u32, 3> words{};
-                    if (!grid_marker->list.Read(words)) {
-                        ListDispatch::Count(ListDispatch::g_guard.failed);
-                    } else {
-                        auto& data_ram = *macro.native_interpreter.active_dram;
-                        if (grid_marker->In(data_ram)) {
-                            for (size_t i = 0; i < 3; ++i) {
-                                data_ram[grid_marker->cells[i]] = words[i];
-                            }
-                        }
-                        grid_marker->set = false;
-                        if (marker_in_registers) {
+                    // The real words, wherever a marker is: the data RAM words that still hold
+                    // theirs, and the registers from the list their marker stands for.
+                    auto& data_ram = *macro.native_interpreter.active_dram;
+                    if (grid_marker->In(data_ram)) {
+                        ListDispatch::ResolveGrid(*grid_marker, data_ram);
+                    }
+                    if (marker_in_registers) {
+                        std::array<u32, 3> words{};
+                        const auto* list = grid_marker->Find(fs.registers[grid_register]);
+                        if (list == nullptr || !list->Read(words)) {
+                            ListDispatch::Count(ListDispatch::g_guard.failed);
+                        } else {
                             for (u32 word = 0; word < 3; ++word) {
                                 FrontApply(fs, grid_register + word, words[word]);
                                 split.MacroWrite(this, grid_register + word, words[word]);
                             }
+                            ListDispatch::Count(ListDispatch::g_guard.grid_resolves);
                         }
-                        ListDispatch::Count(ListDispatch::g_guard.grid_resolves);
                     }
                 }
             } else {

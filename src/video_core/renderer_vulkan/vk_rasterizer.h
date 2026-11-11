@@ -97,6 +97,8 @@ public:
     void DrawIndirect() override;
     [[nodiscard]] bool Nx2ListDrawSupported() const override;
     [[nodiscard]] bool Nx2ListDispatchSupported() const override;
+    void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) override;
+    [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;

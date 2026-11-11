@@ -36,19 +36,29 @@ constexpr u32 DataUpload = 0x6d;
 // Where the game's store macro puts the grid (ListDispatch::StoreGridCells finds it).
 constexpr ListDispatch::GridCells GameCells{0x20, 0x21, 0x22};
 
+// The marker of the list kept as 5.
+constexpr std::array<u32, 3> Marker = ListDispatch::MarkerWords(5);
+
 GridTaint::DataRam MarkerRam(const ListDispatch::GridCells& cells = GameCells) {
     GridTaint::DataRam ram{};
     for (u32 word = 0; word < ram.size(); ++word) {
         ram[word] = 0x1000 + word;
     }
-    ram[cells[0]] = ListDispatch::MarkerX;
-    ram[cells[1]] = ListDispatch::MarkerY;
-    ram[cells[2]] = ListDispatch::MarkerZ;
+    for (size_t i = 0; i < 3; ++i) {
+        ram[cells[i]] = Marker[i];
+    }
     return ram;
 }
 
+// Which of `cells` hold their marker word in `ram` (GridMarker::Marked).
+std::array<bool, 3> Marked(const GridTaint::DataRam& ram,
+                           const ListDispatch::GridCells& cells = GameCells) {
+    return ListDispatch::GridMarker{{}, cells, Marker, true}.Marked(ram);
+}
+
 GridTaint::Result Run(std::span<const u32> code, u32 start, std::span<const u32> parameters) {
-    return GridTaint::DryRun(code, start, parameters, MarkerRam(), GameCells,
+    const auto ram = MarkerRam();
+    return GridTaint::DryRun(code, start, parameters, ram, GameCells, Marked(ram),
                              [](u32) { return 0U; });
 }
 
@@ -140,9 +150,10 @@ TEST_CASE("Grid taint: the game's QMD upload only copies the grid", "[grid_taint
     }
     // The QMD's words 12 to 14 are the grid.
     REQUIRE(data.size() == 20);
-    CHECK(data[12] == ListDispatch::MarkerX);
-    CHECK(data[13] == ListDispatch::MarkerY);
-    CHECK(data[14] == ListDispatch::MarkerZ);
+    CHECK(data[12] == Marker[0]);
+    CHECK(data[13] == Marker[1]);
+    CHECK(data[14] == Marker[2]);
+    CHECK(ListDispatch::MarkerKeepBits(data[12]) == 5);
     CHECK(std::ranges::count(grid, true) == 3);
     CHECK((grid[12] && grid[13] && grid[14]));
     CHECK(GridTaint::EmitsGridOnly(result, DataUpload));
@@ -170,7 +181,7 @@ TEST_CASE("Grid taint: a moved grid word emitted elsewhere is safe but no grid u
     CHECK(result.read_grid);
     REQUIRE(result.emits.size() == 1);
     CHECK(result.emits[0].method == 0x44);
-    CHECK(result.emits[0].value == ListDispatch::MarkerX);
+    CHECK(result.emits[0].value == Marker[0]);
     CHECK(result.emits[0].grid);
     CHECK_FALSE(GridTaint::MayRunOnMarker(result, DataUpload));
 }
@@ -271,7 +282,8 @@ TEST_CASE("Grid taint: the grid copied to the QMD's registers is a grid copy", "
 TEST_CASE("Grid taint: a grid register read back is a grid word", "[grid_taint]") {
     constexpr u32 GridRegister = 0xc8 + 12;
     const auto registers = [](u32 address) {
-        return address == GridRegister ? ListDispatch::MarkerX : 0U;
+        // The marker of another list than the data RAM's.
+        return address == GridRegister ? ListDispatch::MarkerWords(9)[0] : 0U;
     };
     const auto run = [&](const Instruction& second) {
         std::vector<u32> code;
@@ -281,7 +293,8 @@ TEST_CASE("Grid taint: a grid register read back is a grid word", "[grid_taint]"
         last.end = true;
         Append(code, last);
         Append(code, {});
-        return GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells, registers, GridRegister);
+        return GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells, Marked(MarkerRam()),
+                                 registers, GridRegister);
     };
     // Emitted as it is, elsewhere: followed, and not a grid copy.
     const auto moved = run({.lane0 = {.a = 0, .imm = 0x44, .method = 5, .emit = 1}});
@@ -298,8 +311,8 @@ TEST_CASE("Grid taint: a grid register read back is a grid word", "[grid_taint]"
     Append(code, {.lane0 = {.op = 22, .dst = 0, .a = Imm, .imm = GridRegister + 1}});
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 4}, .end = true});
     Append(code, {});
-    const auto plain =
-        GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells, registers, GridRegister);
+    const auto plain = GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells,
+                                         Marked(MarkerRam()), registers, GridRegister);
     CHECK(plain.completed);
     CHECK(plain.safe);
     CHECK_FALSE(plain.read_grid);
@@ -316,8 +329,9 @@ TEST_CASE("Grid taint: a grid the game stored itself is a plain value", "[grid_t
     for (u32 word = 0; word < 16; ++word) {
         parameters.push_back(0xA000 + word);
     }
-    const auto result =
-        GridTaint::DryRun(GameCode, UploadQmd, parameters, ram, GameCells, [](u32) { return 0U; });
+    CHECK(Marked(ram) == std::array<bool, 3>{});
+    const auto result = GridTaint::DryRun(GameCode, UploadQmd, parameters, ram, GameCells,
+                                          Marked(ram), [](u32) { return 0U; });
     REQUIRE(result.completed);
     CHECK(result.safe);
     CHECK_FALSE(result.read_grid);
@@ -328,7 +342,8 @@ TEST_CASE("Grid taint: a grid the game stored itself is a plain value", "[grid_t
     Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = GameCells[0]}});
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1}, .end = true});
     Append(code, {});
-    const auto added = GridTaint::DryRun(code, 0, {}, ram, GameCells, [](u32) { return 0U; });
+    const auto added =
+        GridTaint::DryRun(code, 0, {}, ram, GameCells, Marked(ram), [](u32) { return 0U; });
     CHECK(added.completed);
     CHECK(added.safe);
 }
@@ -341,7 +356,9 @@ TEST_CASE("Grid taint: the marker is followed wherever it is stored", "[grid_tai
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1}, .end = true});
     Append(code, {});
     const auto at = [&](const ListDispatch::GridCells& marked) {
-        return GridTaint::DryRun(code, 0, {}, MarkerRam(marked), Cells, [](u32) { return 0U; });
+        const auto ram = MarkerRam(marked);
+        return GridTaint::DryRun(code, 0, {}, ram, Cells, Marked(ram, Cells),
+                                 [](u32) { return 0U; });
     };
     const auto marked = at(Cells);
     CHECK(marked.read_grid);
@@ -350,4 +367,62 @@ TEST_CASE("Grid taint: the marker is followed wherever it is stored", "[grid_tai
     const auto other = at(GameCells);
     CHECK_FALSE(other.read_grid);
     CHECK(other.safe);
+}
+
+TEST_CASE("Grid taint: each grid word is followed on its own", "[grid_taint]") {
+    // A macro stored a value of its own over y: x and z still hold their marker, y is plain.
+    auto ram = MarkerRam();
+    ram[GameCells[1]] = 77;
+    const auto marked = Marked(ram);
+    CHECK(marked == std::array<bool, 3>{true, false, true});
+    const auto add_one = [&](u32 cell) {
+        std::vector<u32> code;
+        Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = cell}});
+        Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1}, .end = true});
+        Append(code, {});
+        return GridTaint::DryRun(code, 0, {}, ram, GameCells, marked, [](u32) { return 0U; });
+    };
+    // y + 1 is the game's business.
+    const auto y = add_one(GameCells[1]);
+    CHECK(y.safe);
+    CHECK_FALSE(y.read_grid);
+    // x + 1 and z + 1 are still computed from the grid.
+    CHECK_FALSE(add_one(GameCells[0]).safe);
+    CHECK_FALSE(add_one(GameCells[2]).safe);
+}
+
+TEST_CASE("List dispatch: a macro that computes a grid word is no grid store", "[grid_taint]") {
+    // x, y and z loaded; x + (y & 1) stored as x: equal to x for every even y, so samples can
+    // miss it. The store macro is proven for every value: refused.
+    const auto macro = [](bool computes) {
+        std::vector<u32> code;
+        Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 28, .b = 24},
+                      .lane1 = {.op = 0, .dst = 2, .a = 29, .b = 24}});
+        Append(code, {.lane0 = {.op = computes ? 12U : 0U, .dst = 3, .a = 2, .b = Imm, .imm = 1},
+                      .lane1 = {.op = 0, .dst = 4, .a = 28, .b = 24}});
+        if (computes) {
+            Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 1, .b = 3}});
+        }
+        Append(code, {.lane0 = {.op = DataWrite, .a = Imm, .b = 1, .imm = 0x30},
+                      .lane1 = {.op = DataWrite, .a = Imm, .b = 2, .imm = 0x31}});
+        Append(code, {.lane0 = {.op = DataWrite, .a = Imm, .b = 4, .imm = 0x32}, .end = true});
+        Append(code, {});
+        return ListDispatch::StoreGridCells(code, 0);
+    };
+    CHECK(macro(false) == ListDispatch::GridCells{0x30, 0x31, 0x32});
+    CHECK_FALSE(macro(true).has_value());
+}
+
+TEST_CASE("Grid taint: the marker of any list is a grid upload", "[grid_taint]") {
+    // The words a grid upload must carry are a marker's, whichever list it stands for.
+    for (const u64 keep_id : {u64{1}, u64{0xFFFF}, u64{0x12345}}) {
+        const auto words = ListDispatch::MarkerWords(keep_id);
+        CHECK(ListDispatch::IsMarkerWord(0, words[0]));
+        CHECK(ListDispatch::IsMarkerWord(1, words[1]));
+        CHECK(ListDispatch::IsMarkerWord(2, words[2]));
+        CHECK(ListDispatch::MarkerKeepBits(words[0]) == (keep_id & 0xFFFF));
+    }
+    // y and z in each other's place, or x without the marker's high bits, are not.
+    CHECK_FALSE(ListDispatch::IsMarkerWord(1, ListDispatch::MarkerZ));
+    CHECK_FALSE(ListDispatch::IsMarkerWord(0, 0x1234));
 }
