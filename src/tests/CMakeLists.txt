@@ -35,6 +35,7 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
+    video_core/padded_square.cpp
     audio_core/batch_decoder.cpp
     audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
