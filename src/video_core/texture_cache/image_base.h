@@ -134,6 +134,10 @@ struct ImageBase {
     /// At least the newest modification_tick among aliased_images (raised when an alias's tick is
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
+    /// modification_tick of the latest GPU write that covered the whole image (a clear).
+    u64 full_write_tick = 0;
+    /// Last frame the image was prepared for use in (TextureCache::PrepareImage), 0 before.
+    u64 last_use_frame = 0;
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

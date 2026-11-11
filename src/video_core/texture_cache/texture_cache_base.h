@@ -48,6 +48,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
+#include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -471,6 +472,15 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
+    void DeleteSupersededImages();
+
+    /// Whether the clear being made writes all of an image, bound at gpu_addr as a render target.
+    [[nodiscard]] bool ClearOverwritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Records the render targets the current clear writes whole (ImageBase::full_write_tick).
+    void NoteWholeClears();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -753,6 +763,13 @@ private:
 
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
+
+    // Superseded images (DeleteSupersededImages)
+    std::vector<ImageId> superseded_ids;
+    u64 superseded_activity_frame{}; ///< Last frame a bad overlap appeared or a clear wrote whole
+    u64 superseded_clean_deletes{};
+    u64 superseded_rewritten_deletes{};
+    u64 superseded_unproven{}; ///< Candidates kept for lack of proof, per scan
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;
