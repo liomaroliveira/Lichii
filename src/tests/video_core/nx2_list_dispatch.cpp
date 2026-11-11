@@ -30,11 +30,15 @@ constexpr std::array<u32, 51> GameCode{
 };
 constexpr u32 StoreGrid = 0;
 constexpr u32 UploadQmd = 2;
+// Where the game's macro stores the grid: found by running it, used here to check the result.
+constexpr ListDispatch::GridCells GameCells{0x20, 0x21, 0x22};
 
 } // namespace
 
 TEST_CASE("List dispatch recognizes the macro that stores a grid", "[list_dispatch]") {
-    CHECK(ListDispatch::IsStoreGridMacro(GameCode, StoreGrid));
+    const auto cells = ListDispatch::StoreGridCells(GameCode, StoreGrid);
+    REQUIRE(cells.has_value());
+    CHECK(*cells == GameCells);
 }
 
 TEST_CASE("List dispatch stores what the macro stores", "[list_dispatch]") {
@@ -44,32 +48,40 @@ TEST_CASE("List dispatch stores what the macro stores", "[list_dispatch]") {
         GameCode, StoreGrid, parameters, [](u32) { return 0U; }, [](u32, u32) { return true; });
     REQUIRE(result.success);
     CHECK(result.consumed == 3);
-    CHECK(interpreter.dram[ListDispatch::DramGridX] == 60);
-    CHECK(interpreter.dram[ListDispatch::DramGridY] == 270);
-    CHECK(interpreter.dram[ListDispatch::DramGridZ] == 1);
+    CHECK(interpreter.dram[GameCells[0]] == 60);
+    CHECK(interpreter.dram[GameCells[1]] == 270);
+    CHECK(interpreter.dram[GameCells[2]] == 1);
 }
 
 TEST_CASE("List dispatch refuses other macros", "[list_dispatch]") {
     // Reads the grid back and writes methods.
-    CHECK_FALSE(ListDispatch::IsStoreGridMacro(GameCode, UploadQmd));
+    using ListDispatch::StoreGridCells;
+    CHECK_FALSE(StoreGridCells(GameCode, UploadQmd));
     // The second half of the macro alone: one word stored.
-    CHECK_FALSE(ListDispatch::IsStoreGridMacro(GameCode, StoreGrid + 1));
+    CHECK_FALSE(StoreGridCells(GameCode, StoreGrid + 1));
     // Code that ends before the macro does.
-    CHECK_FALSE(ListDispatch::IsStoreGridMacro(std::span<const u32>{GameCode}.first(3), StoreGrid));
-    CHECK_FALSE(ListDispatch::IsStoreGridMacro(std::span<const u32>{}, StoreGrid));
+    CHECK_FALSE(StoreGridCells(std::span<const u32>{GameCode}.first(3), StoreGrid));
+    CHECK_FALSE(StoreGridCells(std::span<const u32>{}, StoreGrid));
     // Past the code.
-    CHECK_FALSE(ListDispatch::IsStoreGridMacro(GameCode, 17));
+    CHECK_FALSE(StoreGridCells(GameCode, 17));
 }
 
-TEST_CASE("List dispatch refuses a macro that stores the grid elsewhere", "[list_dispatch]") {
+TEST_CASE("List dispatch finds the grid wherever a macro stores it", "[list_dispatch]") {
     // The immediate of the first store is the data RAM address (0x20 in the game's macro).
     std::vector<u32> code(GameCode.begin(), GameCode.end());
-    const auto stores = [&code] { return ListDispatch::IsStoreGridMacro(code, StoreGrid); };
-    REQUIRE(stores());
+    const auto cells = [&code] { return ListDispatch::StoreGridCells(code, StoreGrid); };
+    REQUIRE(cells() == GameCells);
     // Lane 0's immediate is bits 30 to 45 of the instruction: its low two bits end word 2
-    // (the instruction's first 32 bits), the rest starts word 1.
+    // (the instruction's first 32 bits), the rest starts word 1. Moved to 0x24, x is stored
+    // elsewhere: the same macro for another layout.
+    code[1] ^= 0x00000001U; // 0x20 -> 0x24
+    const auto moved = cells();
+    REQUIRE(moved.has_value());
+    CHECK(*moved == ListDispatch::GridCells{0x24, 0x21, 0x22});
+    // x stored over y: two parameters to one word, no grid.
+    code[1] ^= 0x00000001U;
     code[2] ^= 0x40000000U; // 0x20 -> 0x21
-    CHECK_FALSE(stores());
+    CHECK_FALSE(cells());
 }
 
 TEST_CASE("List dispatch marker", "[list_dispatch]") {
@@ -86,18 +98,22 @@ TEST_CASE("List dispatch marker", "[list_dispatch]") {
 }
 
 TEST_CASE("List dispatch: the grid words are read back over the marker", "[list_dispatch]") {
+    // Cells that are no game's in particular.
+    constexpr ListDispatch::GridCells Cells{0x105, 0x40, 0x7};
     Tegra::TuringMacroInterpreter::DataRam ram{};
-    CHECK_FALSE(ListDispatch::HasMarker(ram));
-    ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
-    ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
-    CHECK_FALSE(ListDispatch::HasMarker(ram));
-    ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
-    CHECK(ListDispatch::HasMarker(ram));
+    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
+    ram[Cells[0]] = ListDispatch::MarkerX;
+    ram[Cells[1]] = ListDispatch::MarkerY;
+    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
+    ram[Cells[2]] = ListDispatch::MarkerZ;
+    CHECK(ListDispatch::HasMarker(ram, Cells));
 
     // No reader: the marker stays, and the failure is counted.
+    ListDispatch::GridMarker marker{{}, Cells, true};
+    CHECK(marker.In(ram));
     const u64 failed = ListDispatch::g_guard.failed.load();
-    CHECK_FALSE(ListDispatch::ResolveGrid(ListDispatch::ListReader{}, ram));
-    CHECK(ListDispatch::HasMarker(ram));
+    CHECK_FALSE(ListDispatch::ResolveGrid(marker, ram));
+    CHECK(marker.In(ram));
     CHECK(ListDispatch::g_guard.failed.load() == failed + 1);
 
     struct Source {
@@ -113,10 +129,12 @@ TEST_CASE("List dispatch: the grid words are read back over the marker", "[list_
             return words.size() == from.words.size();
         },
         &source};
-    CHECK(ListDispatch::ResolveGrid(reader, ram));
+    marker.list = reader;
+    CHECK(ListDispatch::ResolveGrid(marker, ram));
     CHECK(source.asked == 0x2272dce010);
-    CHECK(ram[ListDispatch::DramGridX] == 60);
-    CHECK(ram[ListDispatch::DramGridY] == 270);
-    CHECK(ram[ListDispatch::DramGridZ] == 1);
-    CHECK_FALSE(ListDispatch::HasMarker(ram));
+    CHECK(ram[Cells[0]] == 60);
+    CHECK(ram[Cells[1]] == 270);
+    CHECK(ram[Cells[2]] == 1);
+    CHECK_FALSE(ListDispatch::HasMarker(ram, Cells));
+    CHECK_FALSE(marker.set);
 }

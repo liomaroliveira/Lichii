@@ -23,6 +23,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
+#include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_reader.h"
 #include "video_core/textures/texture.h"
 
@@ -272,8 +273,8 @@ public:
                                const Nx2ListDispatch::ListReader& reader);
     /// List guard (nx2_list_dispatch.h): where the channel keeps the list of the grid the data RAM's
     /// marker stands for (the 3D engine's, which shares the data RAM).
-    void SetGridList(Nx2ListDispatch::ListReader* list) {
-        grid_list = list;
+    void SetGridMarker(Nx2ListDispatch::GridMarker* marker) {
+        grid_marker = marker;
     }
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
@@ -404,7 +405,7 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
-    Nx2ListDispatch::ListReader* grid_list{};
+    Nx2ListDispatch::GridMarker* grid_marker{};
     /// List dispatches, back: where the grid of the dispatches whose QMD carries the
     /// marker is, 0 if no list was taken.
     GPUVAddr list_dispatch_address{};

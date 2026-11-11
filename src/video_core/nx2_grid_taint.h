@@ -51,18 +51,27 @@ struct Result {
 /// grid), ~0 for none.
 template <typename Read>
 [[nodiscard]] Result DryRun(std::span<const Word> code, Word start,
-                            std::span<const Word> parameters, const DataRam& dram, Read read,
+                            std::span<const Word> parameters, const DataRam& dram,
+                            const Nx2ListDispatch::GridCells& cells, Read read,
                             Word grid_register = ~Word{0}) {
     using Decoded = TuringMacroInterpreter::Decoded;
     Result result;
     DataRam ram = dram;
-    // The data RAM words that hold a grid word: the three at first, if they hold the marker
-    // (words the game's own macro stored there are values like any other).
-    const bool marked = Nx2ListDispatch::HasMarker(dram);
+    // The data RAM words that hold a grid word: the marker's three at first, if they hold it
+    // (words a macro stored there itself are values like any other).
+    const bool marked = Nx2ListDispatch::HasMarker(dram, cells);
     std::array<bool, 3> grid_cell{marked, marked, marked};
+    const auto cell_index = [&](Word address) -> int {
+        for (int i = 0; i < 3; ++i) {
+            if (cells[i] == address) {
+                return i;
+            }
+        }
+        return -1;
+    };
     const auto cell_is_grid = [&](Word address) {
-        return address >= Nx2ListDispatch::DramGridX && address <= Nx2ListDispatch::DramGridZ &&
-               grid_cell[address - Nx2ListDispatch::DramGridX];
+        const int index = cell_index(address);
+        return index >= 0 && grid_cell[index];
     };
     std::array<Word, 24> regs{};
     std::array<bool, 24> reg_grid{};
@@ -341,9 +350,9 @@ template <typename Read>
                         break;
                     }
                     ram[x] = y;
-                    if (x >= Nx2ListDispatch::DramGridX && x <= Nx2ListDispatch::DramGridZ) {
+                    if (const int index = cell_index(x); index >= 0) {
                         // A value of the macro's own replaces the grid word.
-                        grid_cell[x - Nx2ListDispatch::DramGridX] = false;
+                        grid_cell[index] = false;
                     }
                     break;
                 default:

@@ -33,19 +33,23 @@ constexpr u32 StoreGrid = 0;
 constexpr u32 UploadQmd = 2;
 constexpr u32 DataUpload = 0x6d;
 
-GridTaint::DataRam MarkerRam() {
+// Where the game's store macro puts the grid (ListDispatch::StoreGridCells finds it).
+constexpr ListDispatch::GridCells GameCells{0x20, 0x21, 0x22};
+
+GridTaint::DataRam MarkerRam(const ListDispatch::GridCells& cells = GameCells) {
     GridTaint::DataRam ram{};
     for (u32 word = 0; word < ram.size(); ++word) {
         ram[word] = 0x1000 + word;
     }
-    ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
-    ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
-    ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
+    ram[cells[0]] = ListDispatch::MarkerX;
+    ram[cells[1]] = ListDispatch::MarkerY;
+    ram[cells[2]] = ListDispatch::MarkerZ;
     return ram;
 }
 
 GridTaint::Result Run(std::span<const u32> code, u32 start, std::span<const u32> parameters) {
-    return GridTaint::DryRun(code, start, parameters, MarkerRam(), [](u32) { return 0U; });
+    return GridTaint::DryRun(code, start, parameters, MarkerRam(), GameCells,
+                             [](u32) { return 0U; });
 }
 
 // One macro instruction, as TuringMacroInterpreter::Decode reads its 96 bits.
@@ -102,7 +106,7 @@ constexpr u32 DataWrite = 31;
 // r0 = the grid's x, then `second` with the macro's END, then an empty instruction.
 std::vector<u32> AfterGridRead(const Instruction& second) {
     std::vector<u32> code;
-    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = ListDispatch::DramGridX}});
+    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = GameCells[0]}});
     Instruction last = second;
     last.end = true;
     Append(code, last);
@@ -215,8 +219,8 @@ TEST_CASE("Grid taint: a parameter that happens to be zero is no move", "[grid_t
 TEST_CASE("Grid taint: a macro's own value replaces the grid word", "[grid_taint]") {
     // The macro stores 5 at the grid's x, then reads it back and adds 1.
     std::vector<u32> code;
-    Append(code, {.lane0 = {.op = DataWrite, .a = Imm, .b = 28, .imm = ListDispatch::DramGridX}});
-    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = ListDispatch::DramGridX}});
+    Append(code, {.lane0 = {.op = DataWrite, .a = Imm, .b = 28, .imm = GameCells[0]}});
+    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = GameCells[0]}});
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1, .method = 5, .emit = 1},
                   .end = true});
     Append(code, {});
@@ -245,9 +249,9 @@ TEST_CASE("Grid taint: the grid copied to the QMD's registers is a grid copy", "
     constexpr u32 GridRegister = 0xc8 + 12;
     // r0, r1, r2 = the grid; then x, y, z to the three registers (the method counts up).
     std::vector<u32> code;
-    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = ListDispatch::DramGridX},
-                  .lane1 = {.op = DataRead, .dst = 1, .a = Imm, .imm = ListDispatch::DramGridY}});
-    Append(code, {.lane0 = {.op = DataRead, .dst = 2, .a = Imm, .imm = ListDispatch::DramGridZ},
+    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = GameCells[0]},
+                  .lane1 = {.op = DataRead, .dst = 1, .a = Imm, .imm = GameCells[1]}});
+    Append(code, {.lane0 = {.op = DataRead, .dst = 2, .a = Imm, .imm = GameCells[2]},
                   .lane1 = {.imm = 0x1000 | GridRegister, .method = 6}});
     Append(code, {.lane0 = {.a = 0, .emit = 1}, .lane1 = {.a = 1, .emit = 2}});
     Append(code, {.lane0 = {.a = 2, .emit = 1}, .end = true});
@@ -277,7 +281,7 @@ TEST_CASE("Grid taint: a grid register read back is a grid word", "[grid_taint]"
         last.end = true;
         Append(code, last);
         Append(code, {});
-        return GridTaint::DryRun(code, 0, {}, MarkerRam(), registers, GridRegister);
+        return GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells, registers, GridRegister);
     };
     // Emitted as it is, elsewhere: followed, and not a grid copy.
     const auto moved = run({.lane0 = {.a = 0, .imm = 0x44, .method = 5, .emit = 1}});
@@ -294,7 +298,8 @@ TEST_CASE("Grid taint: a grid register read back is a grid word", "[grid_taint]"
     Append(code, {.lane0 = {.op = 22, .dst = 0, .a = Imm, .imm = GridRegister + 1}});
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 4}, .end = true});
     Append(code, {});
-    const auto plain = GridTaint::DryRun(code, 0, {}, MarkerRam(), registers, GridRegister);
+    const auto plain =
+        GridTaint::DryRun(code, 0, {}, MarkerRam(), GameCells, registers, GridRegister);
     CHECK(plain.completed);
     CHECK(plain.safe);
     CHECK_FALSE(plain.read_grid);
@@ -304,15 +309,15 @@ TEST_CASE("Grid taint: a grid the game stored itself is a plain value", "[grid_t
     // The same data RAM without the marker: the upload macro's grid words are values like any
     // other, whatever is done with them.
     auto ram = MarkerRam();
-    ram[ListDispatch::DramGridX] = 160;
-    ram[ListDispatch::DramGridY] = 90;
-    ram[ListDispatch::DramGridZ] = 1;
+    ram[GameCells[0]] = 160;
+    ram[GameCells[1]] = 90;
+    ram[GameCells[2]] = 1;
     std::vector<u32> parameters{(0x50U << 16) | (1U << 8) | 3U, 0x21, 0x145a9800};
     for (u32 word = 0; word < 16; ++word) {
         parameters.push_back(0xA000 + word);
     }
     const auto result =
-        GridTaint::DryRun(GameCode, UploadQmd, parameters, ram, [](u32) { return 0U; });
+        GridTaint::DryRun(GameCode, UploadQmd, parameters, ram, GameCells, [](u32) { return 0U; });
     REQUIRE(result.completed);
     CHECK(result.safe);
     CHECK_FALSE(result.read_grid);
@@ -320,10 +325,29 @@ TEST_CASE("Grid taint: a grid the game stored itself is a plain value", "[grid_t
     CHECK(GridTaint::MayRunOnMarker(result, DataUpload));
     // And arithmetic on them is the game's business.
     std::vector<u32> code;
-    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = ListDispatch::DramGridX}});
+    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = GameCells[0]}});
     Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1}, .end = true});
     Append(code, {});
-    const auto added = GridTaint::DryRun(code, 0, {}, ram, [](u32) { return 0U; });
+    const auto added = GridTaint::DryRun(code, 0, {}, ram, GameCells, [](u32) { return 0U; });
     CHECK(added.completed);
     CHECK(added.safe);
+}
+
+TEST_CASE("Grid taint: the marker is followed wherever it is stored", "[grid_taint]") {
+    // The same reads at cells no game in particular uses.
+    constexpr ListDispatch::GridCells Cells{0x105, 0x40, 0x7};
+    std::vector<u32> code;
+    Append(code, {.lane0 = {.op = DataRead, .dst = 0, .a = Imm, .imm = Cells[0]}});
+    Append(code, {.lane0 = {.op = 0, .dst = 1, .a = 0, .b = Imm, .imm = 1}, .end = true});
+    Append(code, {});
+    const auto at = [&](const ListDispatch::GridCells& marked) {
+        return GridTaint::DryRun(code, 0, {}, MarkerRam(marked), Cells, [](u32) { return 0U; });
+    };
+    const auto marked = at(Cells);
+    CHECK(marked.read_grid);
+    CHECK_FALSE(marked.safe);
+    // The same code with the marker elsewhere reads a plain value.
+    const auto other = at(GameCells);
+    CHECK_FALSE(other.read_grid);
+    CHECK(other.safe);
 }

@@ -27,6 +27,7 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_reader.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -3232,7 +3233,7 @@ public:
                            GPUVAddr address, const Nx2ListDispatch::ListReader& reader);
     /// List guard (nx2_list_dispatch.h): the list of the grid the data RAM's marker stands for, set by the
     /// compute engine that shares the data RAM (KeplerCompute::FrontTakeListDispatch).
-    Nx2ListDispatch::ListReader grid_list;
+    Nx2ListDispatch::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;

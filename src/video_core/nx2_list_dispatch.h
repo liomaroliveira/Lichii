@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <cstdlib>
 #include <span>
 #include <utility>
@@ -42,10 +43,8 @@ namespace Tegra::Nx2ListDispatch {
     return mode;
 }
 
-// Where the macro stores the grid in the macro data RAM.
-inline constexpr u32 DramGridX = 0x20;
-inline constexpr u32 DramGridY = 0x21;
-inline constexpr u32 DramGridZ = 0x22;
+/// The data RAM words a macro stores a grid in, x, y and z: read from its code (StoreGridCells).
+using GridCells = std::array<u32, 3>;
 
 // The grid no dispatch has (above every host's maximum group count on x, y and z each fit the
 // QMD's 16 bits): the front stores it for a grid it did not read.
@@ -58,9 +57,10 @@ inline constexpr u32 MarkerZ = 0x7E57;
     return x == MarkerX && (y & 0xffff) == MarkerY && (z & 0xffff) == MarkerZ;
 }
 
-/// Whether the macro at `start` of `code` does nothing but store its three parameters in the data
-/// RAM at DramGridX, DramGridY and DramGridZ, whatever they are.
-[[nodiscard]] inline bool IsStoreGridMacro(std::span<const u32> code, u32 start) {
+/// If the macro at `start` of `code` does nothing but store its three parameters in three data RAM
+/// words, whatever the parameters are: those words, in parameter order. Which words is the
+/// macro's own business; they are found by running it.
+[[nodiscard]] inline std::optional<GridCells> StoreGridCells(std::span<const u32> code, u32 start) {
     // One path whatever the parameters are: no branch, loop, predicate, register or data RAM
     // read up to the instruction after the END.
     constexpr u32 DataRamWrite = 31;
@@ -68,24 +68,26 @@ inline constexpr u32 MarkerZ = 0x7E57;
     bool ended = false;
     for (u32 pc = start;; ++pc) {
         if (pc >= instructions || pc - start > 8) {
-            return false;
+            return std::nullopt;
         }
         const auto decoded =
             TuringMacroInterpreter::Decode({code[pc * 3 + 2], code[pc * 3 + 1], code[pc * 3]});
         const auto allowed = [](u32 op) { return (op < 22 && op != 7) || op == DataRamWrite; };
         if (decoded.pred_mode != 0 || !allowed(decoded.op[0]) || !allowed(decoded.op[1])) {
-            return false;
+            return std::nullopt;
         }
         if (ended) {
             break;
         }
         ended = decoded.end;
     }
-    // What it stores, for parameters that between them have every bit set and clear.
+    // What it stores, for parameters that between them have every bit set and clear. The words
+    // it changes must be three, the same each time, each holding one parameter as it is.
     constexpr std::array<std::array<u32, 3>, 3> samples{{
         {0xFFFFFFFFU, 0U, 0x55555555U},
         {0U, 0xFFFFFFFFU, 0xAAAAAAAAU},
         {0x12345678U, 0x9ABCDEF0U, 0x0FEDCBA9U}}};
+    std::optional<GridCells> cells;
     for (const auto& sample : samples) {
         TuringMacroInterpreter probe;
         constexpr u32 Untouched = 0xDEAD0000;
@@ -101,26 +103,49 @@ inline constexpr u32 MarkerZ = 0x7E57;
                 return true;
             });
         if (!result.success || result.consumed != 3 || emitted) {
-            return false;
+            return std::nullopt;
         }
+        GridCells found{~0U, ~0U, ~0U};
+        u32 changed = 0;
         for (u32 word = 0; word < probe.dram.size(); ++word) {
-            const u32 expected = word == DramGridX   ? sample[0]
-                                 : word == DramGridY ? sample[1]
-                                 : word == DramGridZ ? sample[2]
-                                                     : Untouched + word;
-            if (probe.dram[word] != expected) {
-                return false;
+            if (probe.dram[word] == Untouched + word) {
+                continue;
             }
+            ++changed;
+            const auto it = std::ranges::find(sample, probe.dram[word]);
+            if (it == sample.end() || found[it - sample.begin()] != ~0U) {
+                return std::nullopt;
+            }
+            found[it - sample.begin()] = word;
         }
+        if (changed != 3 || (cells && *cells != found)) {
+            return std::nullopt;
+        }
+        cells = found;
     }
-    return true;
+    return cells;
 }
 
-/// Whether the three grid words of the data RAM `ram` hold the marker.
+/// Whether the words `cells` of the data RAM `ram` hold the marker.
 template <typename Ram>
-[[nodiscard]] inline bool HasMarker(const Ram& ram) {
-    return ram[DramGridX] == MarkerX && ram[DramGridY] == MarkerY && ram[DramGridZ] == MarkerZ;
+[[nodiscard]] inline bool HasMarker(const Ram& ram, const GridCells& cells) {
+    return ram[cells[0]] == MarkerX && ram[cells[1]] == MarkerY && ram[cells[2]] == MarkerZ;
 }
+
+/// The grid a channel left on the host GPU: the list its words are in, and the data RAM words
+/// that hold the marker in their place. Shared by the channel's 3D and compute engines, which
+/// share the data RAM.
+struct GridMarker {
+    ListReader list;
+    GridCells cells{};
+    bool set{};
+
+    /// Whether `ram` still holds this marker.
+    template <typename Ram>
+    [[nodiscard]] bool In(const Ram& ram) const {
+        return set && HasMarker(ram, cells);
+    }
+};
 
 /// EDEN_NX2_LIST_GUARD, read once: 2 (the default) = the words a list draw or a list dispatch
 /// left on the host GPU are read back before anything can use their values, 1 = what could use
@@ -147,17 +172,19 @@ struct GuardStats {
 };
 inline GuardStats g_guard;
 
-/// Reads the grid words back into `ram` (the marker is gone). False if they could not be read.
+/// Reads the grid words back into the marker's words of `ram` (the marker is gone). False if they
+/// could not be read.
 template <typename Ram>
-inline bool ResolveGrid(const ListReader& reader, Ram& ram) {
+inline bool ResolveGrid(GridMarker& marker, Ram& ram) {
     std::array<u32, 3> words{};
-    if (!reader.Read(words)) {
+    if (!marker.list.Read(words)) {
         g_guard.failed.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    ram[DramGridX] = words[0];
-    ram[DramGridY] = words[1];
-    ram[DramGridZ] = words[2];
+    for (size_t i = 0; i < 3; ++i) {
+        ram[marker.cells[i]] = words[i];
+    }
+    marker.set = false;
     g_guard.grid_resolves.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

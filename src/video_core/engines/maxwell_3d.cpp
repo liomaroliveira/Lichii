@@ -1644,12 +1644,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     VideoCommon::Nx2Profile::CountMethod(method, false);
     // List guard (nx2_list_dispatch.h): the data RAM holds the marker of a grid the front did not read
     // (the compute engine shares it). A 3D macro that uses the data RAM gets the real words.
-    if (Nx2ListDispatch::HasMarker(native_data_ram)) [[unlikely]] {
+    if (grid_marker.In(native_data_ram)) [[unlikely]] {
         if (const int guard = Nx2ListDispatch::GuardMode();
             guard != 0 && FrontMacroUsesDataRam(fs, engine, start)) {
             Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.dram_macros);
             if (guard == 2) {
-                Nx2ListDispatch::ResolveGrid(grid_list, native_data_ram);
+                Nx2ListDispatch::ResolveGrid(grid_marker, native_data_ram);
             }
         }
     }
