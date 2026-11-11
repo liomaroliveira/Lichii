@@ -8,6 +8,7 @@
 
 #include "common/algorithm.h"
 #include "common/assert.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -94,6 +95,7 @@ void State::ProcessData(const u32* data, size_t num_data) {
 }
 
 void State::ProcessData(std::span<const u8> read_buffer) {
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InlineUploads, 1);
     const GPUVAddr address{regs.dest.Address()};
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
