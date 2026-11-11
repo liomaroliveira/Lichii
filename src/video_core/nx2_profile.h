@@ -224,7 +224,7 @@ struct ThreadData {
     std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 12> counters{}; ///< See Counter
+    std::array<u64, 17> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     /// GPU waits by the zone they happened in (Other: outside every zone)
@@ -443,6 +443,12 @@ enum class Counter : u32 {
     LatePublishes,
     ResnapshotWords, ///< TEST: command list words copied again at resumes
     EarlyPublishes,  ///< TEST: publishes to a back waiting for work, before publish_every
+    // TEST (E04.T3): guest memory the method stage reads, and engines that write guest memory
+    StageAQueryReads,  ///< Render enable conditions read from guest memory
+    StageAMacroReads,  ///< Macro parameters read from guest memory (ProcessMacro segments)
+    StageACbReadbacks, ///< Constant buffer words read back by CallConstBufferWords
+    DmaLaunches,       ///< MaxwellDMA::Launch
+    InlineUploads,     ///< Upload::State::ProcessData (inline to memory)
 };
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
@@ -590,6 +596,17 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
                             static_cast<double>(data.counters[9]) * 1e9 / window,
                             static_cast<double>(data.counters[11]) * 1e9 / window,
                             static_cast<double>(data.counters[10]) * 1e9 / window);
+    }
+    if (data.counters[12] + data.counters[13] + data.counters[14] + data.counters[15] +
+            data.counters[16] != 0) {
+        // TEST (E04.T3): what a method stage running ahead of the draws would have to wait for.
+        line += fmt::format(" | stage A guest reads: query {:.0f}/s, macro params {:.0f}/s, cb "
+                            "readbacks {:.0f}/s | DMA launches {:.0f}/s | inline uploads {:.0f}/s",
+                            static_cast<double>(data.counters[12]) * 1e9 / window,
+                            static_cast<double>(data.counters[13]) * 1e9 / window,
+                            static_cast<double>(data.counters[14]) * 1e9 / window,
+                            static_cast<double>(data.counters[15]) * 1e9 / window,
+                            static_cast<double>(data.counters[16]) * 1e9 / window);
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {

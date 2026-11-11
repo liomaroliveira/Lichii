@@ -278,6 +278,7 @@ void Maxwell3D::RefreshParametersImpl() {
             current_index += segment.second;
             continue;
         }
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageAMacroReads, 1);
         memory_manager.ReadBlock(segment.first, &macro_params[current_index],
                                  sizeof(u32) * segment.second);
         current_index += segment.second;
@@ -730,6 +731,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         std::array<u32, 64> written;
         const bool mapped = memory_manager.IsFullyMappedRange(address + offset, bytes);
         if (mapped) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageACbReadbacks, 1);
             memory_manager.ReadBlockUnsafe(address + offset, written.data(), bytes);
         }
         if (regs.const_buffer.offset != offset + bytes ||
@@ -995,12 +997,14 @@ void Maxwell3D::ProcessQueryCondition() {
             break;
         }
         case Regs::RenderEnable::Mode::Conditional: {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageAQueryReads, 1);
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             operands_read = true;
             execute_on = cmp.initial_sequence != 0U && cmp.initial_mode != 0U;
             break;
         }
         case Regs::RenderEnable::Mode::IfEqual: {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageAQueryReads, 1);
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             operands_read = true;
             execute_on = cmp.initial_sequence == cmp.current_sequence &&
@@ -1008,6 +1012,7 @@ void Maxwell3D::ProcessQueryCondition() {
             break;
         }
         case Regs::RenderEnable::Mode::IfNotEqual: {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageAQueryReads, 1);
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
             operands_read = true;
             execute_on = cmp.initial_sequence != cmp.current_sequence ||
