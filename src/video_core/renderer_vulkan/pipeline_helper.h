@@ -8,12 +8,14 @@
 
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -392,11 +394,22 @@ public:
     std::array<f32, 4> words{};
 };
 
+/// One image descriptor after the cache lookups: what the option C (E04.T1) could hand over.
+struct ResolvedImageDescriptor {
+    ImageView* image_view;
+    Sampler* sampler; ///< nullptr: a storage image
+};
+
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    // TEST (E04.T1): the cache lookups stay here; the zone "descriptor fill" times the rest
+    // (Vulkan handles from resolved views and samplers, and the queue writes).
+    thread_local std::vector<ResolvedImageDescriptor> resolved;
+    resolved.clear();
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -407,14 +420,8 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
-            VkImageView vk_image_view{image_view.Handle(desc.type)};
-            if (vk_image_view == VK_NULL_HANDLE) {
-                const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
-                if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
-            }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            resolved.push_back({&image_view, &sampler});
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
@@ -424,16 +431,33 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
             ImageView& image_view{texture_cache.GetImageView((views++)->id)};
-            const VkImageView vk_image_view{
-                image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
                 texture_cache.MarkModification(image_view.image_id);
             }
-            guest_descriptor_queue.AddImage(vk_image_view);
+            resolved.push_back({&image_view, nullptr});
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
         rescaling.PushImage(is_rescaled);
+    }
+    const Profile::Scope scope{Profile::Zone::DescriptorFill};
+    const ResolvedImageDescriptor* it{resolved.data()};
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index, ++it) {
+            VkImageView vk_image_view{it->image_view->Handle(desc.type)};
+            if (vk_image_view == VK_NULL_HANDLE) {
+                const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
+                if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+            }
+            guest_descriptor_queue.AddSampledImage(
+                vk_image_view, it->sampler->HandleFor(*it->image_view, desc.is_depth));
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index, ++it) {
+            guest_descriptor_queue.AddImage(
+                it->image_view->StorageView(desc.type, desc.format, desc.is_byte_addressed));
+        }
     }
 }
 

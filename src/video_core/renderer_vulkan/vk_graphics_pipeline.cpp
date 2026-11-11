@@ -1261,6 +1261,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const auto [first, count] = kept_image_ranges[stage];
             if (count != 0) {
+                const Profile::Scope fill_scope{Profile::Zone::DescriptorFill};
                 guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
             }
         } else {
