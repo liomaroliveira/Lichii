@@ -490,6 +490,11 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    void RetireStaleTargets();
+    void CollectStaleReferences();
+    bool StaleTargetReferenced(ImageId image_id) const;
+    void MarkStaleTransfer(ImageBase& image);
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -510,7 +515,8 @@ private:
 
     /// Find or create an image from the given parameters
     [[nodiscard]] ImageId FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                            RelaxedOptions options = RelaxedOptions{});
+                                            RelaxedOptions options = RelaxedOptions{},
+                                            bool render_target = false);
 
     /// Find an image from the given parameters
     [[nodiscard]] ImageId FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
@@ -518,11 +524,12 @@ private:
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                      RelaxedOptions options);
+                                      RelaxedOptions options, bool render_target = false);
 
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache
-    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr);
+    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr,
+                                     bool render_target);
 
     [[nodiscard]] ImageId FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr);
 
@@ -675,6 +682,7 @@ private:
     /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
     void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
     StalePages stale_pages;
+    ::Common::unordered_set<ImageId> stale_references;
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all

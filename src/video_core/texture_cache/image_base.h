@@ -60,6 +60,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    RenderTargetOrigin = 1 << 24, ///< Created for a render-target binding.
+    ContentsDefined = 1 << 25,    ///< Initialized by an upload, whole-image copy or zero clear.
+    PendingTransfer = 1 << 26,    ///< transfer_tick identifies the last recorded transfer.
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -116,6 +119,7 @@ struct ImageBase {
     /// CpuModified. Empty while CpuModified means all of it that can hold data.
     std::vector<std::pair<u64, u64>> dirty_ranges;
     u64 scale_tick = 0;
+    u64 transfer_tick = 0;
     bool has_scaled = false;
 
     /// The channel and GPU address space whose page table RegisterImage put the image in.
