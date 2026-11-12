@@ -421,15 +421,27 @@ void EmitX64::ClearCache() {
     PerfMapClear();
 }
 
-void EmitX64::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& locations) {
-    code.EnableWriting();
+void EmitX64::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& locations,
+                                    std::vector<IR::LocationDescriptor>* invalidated_out,
+                                    bool enable_writing) {
+    if (locations.empty()) {
+        return;
+    }
+    if (enable_writing) {
+        code.EnableWriting();
+    }
     for (const auto& descriptor : locations) {
         if (auto const it = block_descriptors.find(descriptor); it != block_descriptors.end()) {
             Unpatch(descriptor);
             block_descriptors.erase(it);
+            if (invalidated_out) {
+                invalidated_out->push_back(descriptor);
+            }
         }
     }
-    code.DisableWriting();
+    if (enable_writing) {
+        code.DisableWriting();
+    }
 }
 
 }  // namespace Dynarmic::Backend::X64

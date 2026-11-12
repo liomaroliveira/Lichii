@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -108,8 +109,8 @@ struct SharedCodeCache final {
         if (is_shared) {
             lk.lock();
         }
-        if (emitter.DrainPendingFastmemRecompiles()) {
-            cache_epoch.fetch_add(1, std::memory_order_release);
+        if (auto invalidated = emitter.DrainPendingFastmemRecompiles(); !invalidated.empty()) {
+            RecordInvalidatedLocked(invalidated);
             if (is_shared) {
                 HaltAllCoresLocked();
             }
@@ -138,11 +139,20 @@ struct SharedCodeCache final {
         return emitter.Emit(local_ir_block).entrypoint;
     }
 
+    void RecordInvalidatedLocked(const std::vector<IR::LocationDescriptor>& locs) {
+        for (const auto& loc : locs) {
+            ++epoch_seq;
+            invalidation_ring[epoch_seq & (INVALIDATION_RING_SIZE - 1)] = {epoch_seq, loc.Value()};
+        }
+        cache_epoch.store(epoch_seq, std::memory_order_release);
+    }
+
     void ClearAllUnderLock() {
         block_of_code.ClearCache();
         emitter.ClearCache();
         pending_full_clear = false;
-        cache_epoch.fetch_add(1, std::memory_order_release);
+        clear_all_seq = ++epoch_seq;
+        cache_epoch.store(epoch_seq, std::memory_order_release);
     }
 
     void InvalidateSharedRange(u64 start_address, size_t length) {
@@ -150,9 +160,10 @@ struct SharedCodeCache final {
         boost::icl::interval_set<u64> ranges;
         const auto end_address = static_cast<u64>(start_address + length - 1);
         ranges.add(boost::icl::discrete_interval<u64>::closed(start_address, end_address));
-        emitter.InvalidateCacheRanges(ranges);
-        cache_epoch.fetch_add(1, std::memory_order_release);
-        HaltAllCoresLocked();
+        if (auto invalidated = emitter.InvalidateCacheRanges(ranges); !invalidated.empty()) {
+            RecordInvalidatedLocked(invalidated);
+            HaltAllCoresLocked();
+        }
     }
 
     void RequestSharedClear() {
@@ -191,6 +202,13 @@ struct SharedCodeCache final {
         }
     }
 
+    static constexpr size_t INVALIDATION_RING_SIZE = 4096;
+    static constexpr u64 MAX_INCREMENTAL_SYNC = 256;
+    struct InvalidationRecord {
+        u64 seq = 0;
+        u64 loc = 0;
+    };
+
     A64JitState dummy_state{};
     const UserConfig conf;
     const bool is_shared;
@@ -199,7 +217,10 @@ struct SharedCodeCache final {
     IR::Block ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};
     Optimization::PolyfillOptions polyfill_options;
     std::shared_mutex cache_mutex;
-    std::atomic<u64> cache_epoch{1};
+    std::atomic<u64> cache_epoch{0};
+    u64 epoch_seq = 0;
+    u64 clear_all_seq = 0;
+    std::array<InvalidationRecord, INVALIDATION_RING_SIZE> invalidation_ring{};
     std::atomic<u32> active_runs{0};
     bool pending_full_clear = false;
     std::vector<volatile u32*> cores_halt;
@@ -407,14 +428,38 @@ private:
     }
 
     void SyncEpoch() {
-        const u64 epoch = cache->cache_epoch.load(std::memory_order_acquire);
-        if (local_epoch != epoch) {
-            jit_state.ResetRSB();
-            if (!fast_dispatch_table.empty()) {
-                std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), A64EmitX64::FastDispatchEntry{});
-            }
-            local_epoch = epoch;
+        if (!cache->is_shared) {
+            return;
         }
+        const u64 epoch = cache->cache_epoch.load(std::memory_order_acquire);
+        if (local_epoch == epoch) {
+            return;
+        }
+        std::shared_lock slk{cache->cache_mutex};
+        const u64 cur_seq = cache->epoch_seq;
+        if (local_epoch == cur_seq) {
+            return;
+        }
+        jit_state.ResetRSB();
+        if (!fast_dispatch_table.empty()) {
+            const bool full_wipe = local_epoch < cache->clear_all_seq ||
+                                   (cur_seq - local_epoch) > SharedCodeCache::MAX_INCREMENTAL_SYNC;
+            if (full_wipe) {
+                std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), A64EmitX64::FastDispatchEntry{});
+            } else if (cache->emitter.shared_fast_dispatch_lookup) {
+                auto* table = fast_dispatch_table.data();
+                for (u64 s = local_epoch + 1; s <= cur_seq; ++s) {
+                    const auto& rec = cache->invalidation_ring[s & (SharedCodeCache::INVALIDATION_RING_SIZE - 1)];
+                    if (rec.seq == s) {
+                        auto& entry = (*cache->emitter.shared_fast_dispatch_lookup)(rec.loc, table);
+                        if (entry.location_descriptor == rec.loc) {
+                            entry = {};
+                        }
+                    }
+                }
+            }
+        }
+        local_epoch = cur_seq;
     }
 
     static CodePtr GetCurrentBlockThunk(void* thisptr) {
