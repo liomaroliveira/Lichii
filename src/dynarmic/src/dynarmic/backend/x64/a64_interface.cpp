@@ -155,6 +155,19 @@ struct SharedCodeCache final {
         return WarmKey{0, pc, fpcr};
     }
 
+    static void SortWarmEntries(std::vector<JitWarmEntry>& entries) {
+        // Keep blocks from the same module/function contiguous in BlockOfCode to preserve L1i/iTLB locality.
+        std::sort(entries.begin(), entries.end(), [](const JitWarmEntry& a, const JitWarmEntry& b) {
+            if (a.module_id != b.module_id) {
+                return a.module_id < b.module_id;
+            }
+            if (a.pc_or_offset != b.pc_or_offset) {
+                return a.pc_or_offset < b.pc_or_offset;
+            }
+            return a.fpcr < b.fpcr;
+        });
+    }
+
     void ConfigurePrewarm(std::string path,
                           std::function<std::optional<u32>(u64)> read_code,
                           std::function<std::vector<SharedWarmModule>()> get_modules) {
@@ -195,6 +208,7 @@ struct SharedCodeCache final {
             }
             warm_enabled.store(true, std::memory_order_release);
         }
+        SortWarmEntries(loaded);
         LOG_INFO(Core, "Nx2JitWarm init loaded={} path={}", loaded.size(), warm_path);
         prewarm_thread = std::thread([this, entries = std::move(loaded)]() mutable { PrewarmWorker(std::move(entries)); });
     }
@@ -237,6 +251,7 @@ struct SharedCodeCache final {
                     for (const auto& [k, op0] : warm_disk_map) {
                         buf.push_back(JitWarmEntry{k.module_id, k.pc_or_offset, k.fpcr, op0});
                     }
+                    SortWarmEntries(buf);
                     if (!buf.empty()) {
                         out.write(reinterpret_cast<const char*>(buf.data()),
                                   static_cast<std::streamsize>(buf.size() * sizeof(JitWarmEntry)));
