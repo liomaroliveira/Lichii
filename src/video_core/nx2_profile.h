@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "common/common_types.h"
@@ -221,7 +222,7 @@ struct ThreadData {
     std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 17> counters{}; ///< See Counter
+    std::array<u64, 22> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     /// GPU waits by the zone they happened in (Other: outside every zone)
@@ -429,7 +430,25 @@ enum class Counter : u32 {
     StageACbReadbacks, ///< Constant buffer words read back by CallConstBufferWords
     DmaLaunches,       ///< MaxwellDMA::Launch
     InlineUploads,     ///< Upload::State::ProcessData (inline to memory)
+    // TEST (E04.T3 reopen): MME DMA reads by who last wrote the 32-byte blocks they read
+    DmaReadsFromStageA, ///< Only blocks stamped by the method stage (StampQueryResult)
+    DmaReadsFromStageB, ///< Some block released through rasterizer->Query (the draw stage)
+    DmaReadsOther,      ///< Neither (shaders, DMA engine or CPU wrote them)
+    DmaReadsFromDmaEngine, ///< Of DmaReadsOther: on a page a MaxwellDMA launch wrote
+    DmaReadsFromCbUpload,  ///< Some block last written by a constant buffer upload
 };
+
+/// TEST (E04.T3 reopen): guest pages (4 KiB) MaxwellDMA launches wrote.
+inline std::unordered_set<u64>& DmaEnginePages() {
+    static std::unordered_set<u64> pages;
+    return pages;
+}
+
+/// TEST (E04.T3 reopen): who last wrote each 32-byte guest block (1: stage A, 2: stage B).
+inline std::unordered_map<u64, u8>& QueryWriters() {
+    static std::unordered_map<u64, u8> writers;
+    return writers;
+}
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
 /// same-value writes among them; MME DMA reads by the macro that made them. The most frequent
@@ -587,6 +606,15 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
                             static_cast<double>(data.counters[14]) * 1e9 / window,
                             static_cast<double>(data.counters[15]) * 1e9 / window,
                             static_cast<double>(data.counters[16]) * 1e9 / window);
+    }
+    if (data.counters[17] + data.counters[18] + data.counters[19] + data.counters[21] != 0) {
+        line += fmt::format(" | MME DMA reads written by stage A {:.0f}/s, by stage B {:.0f}/s, "
+                            "other {:.0f}/s (on DMA engine pages {:.0f}/s), by cb uploads {:.0f}/s",
+                            static_cast<double>(data.counters[17]) * 1e9 / window,
+                            static_cast<double>(data.counters[18]) * 1e9 / window,
+                            static_cast<double>(data.counters[19]) * 1e9 / window,
+                            static_cast<double>(data.counters[20]) * 1e9 / window,
+                            static_cast<double>(data.counters[21]) * 1e9 / window);
     }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
