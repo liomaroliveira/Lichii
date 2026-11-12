@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
@@ -479,6 +480,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                 const auto warm_path = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "jit_warm" /
                                        fmt::format("{:016X}.bin", program_id);
                 Core::Memory::Memory* mem = &m_cb->m_memory;
+                Kernel::KProcess* proc = m_cb->m_process;
                 auto prewarm_read = [mem, last_page = u64(~0ULL),
                                      page_buf = std::vector<u32>(Core::Memory::YUZU_PAGESIZE / sizeof(u32))](
                                         u64 vaddr) mutable -> std::optional<u32> {
@@ -497,7 +499,43 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                     }
                     return page_buf[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
                 };
-                Dynarmic::A64::ConfigureSharedPrewarm(m_shared_cache, warm_path.string(), std::move(prewarm_read));
+                auto get_modules = [proc, mem]() -> std::vector<Dynarmic::A64::SharedWarmModule> {
+                    std::vector<Dynarmic::A64::SharedWarmModule> mods;
+                    auto& pt = proc->GetPageTable();
+                    VAddr cur_addr = 0;
+                    while (true) {
+                        Kernel::KMemoryInfo mem_info{};
+                        Kernel::Svc::PageInfo page_info{};
+                        if (pt.QueryInfo(std::addressof(mem_info), std::addressof(page_info), cur_addr).IsError()) {
+                            break;
+                        }
+                        const auto svc_info = mem_info.GetSvcMemoryInfo();
+                        if (svc_info.permission == Kernel::Svc::MemoryPermission::ReadExecute &&
+                            (svc_info.state == Kernel::Svc::MemoryState::Code ||
+                             svc_info.state == Kernel::Svc::MemoryState::AliasCode) &&
+                            svc_info.size >= 64) {
+                            std::array<u8, 256> hdr_bytes{};
+                            const size_t sample_sz = std::min<size_t>(hdr_bytes.size(), svc_info.size);
+                            if (mem->IsValidVirtualAddressRange(svc_info.base_address, sample_sz)) {
+                                mem->ReadBlockUnsafe(svc_info.base_address, hdr_bytes.data(), sample_sz);
+                                u64 h = 14695981039346656037ULL ^ svc_info.size;
+                                for (size_t i = 0; i < sample_sz; ++i) {
+                                    h ^= hdr_bytes[i];
+                                    h *= 1099511628211ULL;
+                                }
+                                mods.push_back(Dynarmic::A64::SharedWarmModule{h | 1ULL, svc_info.base_address, svc_info.size});
+                            }
+                        }
+                        const uintptr_t next_address = svc_info.base_address + svc_info.size;
+                        if (next_address <= cur_addr) {
+                            break;
+                        }
+                        cur_addr = next_address;
+                    }
+                    return mods;
+                };
+                Dynarmic::A64::ConfigureSharedPrewarm(m_shared_cache, warm_path.string(), std::move(prewarm_read),
+                                                      std::move(get_modules));
             }
         }
         config.shared_cache = m_shared_cache;
