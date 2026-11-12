@@ -3333,8 +3333,8 @@ private:
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
-        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            VideoCommon::BackSplit::NoteRegisterWrite(method);
+        if (VideoCommon::BackSplit::Enabled() && regs.reg_array[method] != argument) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(method, argument);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

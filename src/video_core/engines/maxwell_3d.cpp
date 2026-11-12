@@ -968,10 +968,10 @@ void Maxwell3D::ProcessQueryGet() {
             VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
         }
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             const u64 meta = (static_cast<u64>(static_cast<u32>(flags)) << 32) | (u64{subreport} << 16) |
                              static_cast<u64>(query_type);
-            VideoCommon::BackSplit::EmitQuery(regs.reg_array.data(), sequence_address, payload, meta);
+            VideoCommon::BackSplit::EmitQuery(sequence_address, payload, meta);
         }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
@@ -985,10 +985,10 @@ void Maxwell3D::ProcessQueryGet() {
             VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
         }
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             const u64 meta = (static_cast<u64>(static_cast<u32>(flags)) << 32) | (u64{subreport} << 16) |
                              static_cast<u64>(query_type);
-            VideoCommon::BackSplit::EmitQuery(regs.reg_array.data(), sequence_address, payload, meta);
+            VideoCommon::BackSplit::EmitQuery(sequence_address, payload, meta);
         }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
