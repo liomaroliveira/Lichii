@@ -15,6 +15,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -142,6 +143,11 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 
 void MaxwellDMA::Launch() {
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaLaunches, 1);
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        const u64 meta = u64{regs.line_length_in} | (u64{regs.line_count} << 32);
+        VideoCommon::BackSplit::EmitLaunchDma(regs.offset_in, regs.offset_out, meta);
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         const GPUVAddr out = regs.offset_out;
         const u64 bytes = std::min<u64>(

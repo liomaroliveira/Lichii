@@ -11,6 +11,8 @@
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_back_split.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 
@@ -93,6 +95,10 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
     if (maxwell3d.ShouldExecute()) {
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitClear(maxwell3d.regs.reg_array.data(), layer_count);
+        }
         maxwell3d.rasterizer->Clear(layer_count);
     }
 }
@@ -309,6 +315,10 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_y1 = (f32(maxwell3d.regs.draw_texture.dy_dv) / 4294967296.f) * dst_height + draw_texture_state.src_y0;
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        VideoCommon::BackSplit::EmitDrawTexture(maxwell3d.regs.reg_array.data());
+    }
     maxwell3d.rasterizer->DrawTexture();
 }
 
@@ -343,6 +353,10 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitDraw(maxwell3d.regs.reg_array.data(), draw_indexed, false, instance_count);
+        }
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
         TraceSuppressedDraw(maxwell3d, false);
@@ -354,6 +368,10 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitDraw(maxwell3d.regs.reg_array.data(), indirect_state.is_indexed != 0, true, 1);
+        }
         maxwell3d.rasterizer->DrawIndirect();
     } else {
         TraceSuppressedDraw(maxwell3d, true);

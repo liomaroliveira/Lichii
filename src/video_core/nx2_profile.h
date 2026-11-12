@@ -92,6 +92,7 @@ enum class Zone : u32 {
     PresentWait,          ///< Present waits for the Vulkan worker or a free presentation frame
     QueueSubmit,          ///< vkQueueSubmit
     DescriptorFill, ///< TEST (E04.T1): image descriptors written from resolved views and samplers
+    BackSplitRing,  ///< TEST (E04.T5): Stage A serialization into BackSplit ring
     Count,
 };
 
@@ -110,7 +111,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "graphics pipeline miss",
     "compute pipeline miss", "pipeline wait", "shader capture", "texture cache", "GPU wait",
     "present", "worker idle",
-    "present wait", "queue submit", "descriptor fill",
+    "present wait", "queue submit", "descriptor fill", "back split ring",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
