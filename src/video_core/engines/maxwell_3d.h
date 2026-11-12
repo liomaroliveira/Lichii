@@ -83,6 +83,14 @@ public:
     /// (ChannelState::Payload::maxwell_3d_b), also its identity on the A->B ring. Null without
     /// the split, and on the shadow itself.
     u32* split_shadow{};
+    /// E04.T6 step 3: the shadow engine itself (same lifetime as split_shadow).
+    Maxwell3D* split_engine{};
+
+    /// E04.T6 step 3, stage A after a register check: sends this engine's constant buffer
+    /// bindings and root tables for GPUBackB to compare with the shadow's.
+    void SplitSendStateCheck();
+    void SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer);
+    void SplitSendRootLoad(u32 table, u32 index, u32 value);
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {

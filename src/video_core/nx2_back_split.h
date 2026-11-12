@@ -224,14 +224,16 @@ public:
 
     /// Stage A, on each draw: every (mask + 1) draws, sends the drawing engine's registers for
     /// GPUBackB to compare with its shadow.
-    void MaybeCheck(const void* engine, const u32* regs) {
+    /// Returns whether it sent a check (the caller then sends the engine's other state).
+    bool MaybeCheck(const void* engine, const u32* regs) {
         if ((++a_draws & g_check_mask) != 0) [[likely]] {
-            return;
+            return false;
         }
         if (engine != a_engine) {
             BindEngine(engine, regs);
         }
         PushSnapshot(engine, regs, SnapshotCheck);
+        return true;
     }
 
     void PushCbUpload(u64 gpu_addr, const u32* data, u32 count) {
@@ -360,13 +362,17 @@ public:
                  static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec);
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit shadow: engines {}, checks {}, diverged checks {}, diverged regs {} "
-                 "(total since boot: checks {}, diverged checks {})",
+                 "(total since boot: checks {}, diverged checks {}); state checks {}, diverged "
+                 "state {} (total {})",
                  b_engines.load(std::memory_order_relaxed),
                  b_checks.exchange(0, std::memory_order_relaxed),
                  b_bad_checks.exchange(0, std::memory_order_relaxed),
                  b_bad_regs.exchange(0, std::memory_order_relaxed),
                  b_checks_total.load(std::memory_order_relaxed),
-                 b_bad_checks_total.load(std::memory_order_relaxed));
+                 b_bad_checks_total.load(std::memory_order_relaxed),
+                 b_state_checks.exchange(0, std::memory_order_relaxed),
+                 b_bad_state.exchange(0, std::memory_order_relaxed),
+                 b_bad_state_total.load(std::memory_order_relaxed));
         stat_async = 0;
         stat_drains = 0;
         if (report_hook != nullptr) {
@@ -383,6 +389,12 @@ public:
 
     /// Extra lines for the report (the rasterizer proxy's per-call counts).
     void (*report_hook)(double seconds){};
+    /// Step 3: checks of the shadow's constant buffer bindings and root tables (Maxwell3D),
+    /// written by its tasks on GPUBackB.
+    std::atomic<u64> b_state_checks{0};
+    std::atomic<u64> b_bad_state{0};
+    std::atomic<u64> b_bad_state_total{0};
+    u32 b_state_report_lines = 0;
 
 private:
     void StartSlow() {
@@ -675,8 +687,13 @@ inline void EmitReg(const void* engine, const u32* regs, u32 method, u32 argumen
 }
 
 /// Stage A, at each draw of `engine` (E04.T6 step 2 shadow check).
-inline void CheckRegs(const void* engine, const u32* regs) {
-    g_state.MaybeCheck(engine, regs);
+inline bool CheckRegs(const void* engine, const u32* regs) {
+    return g_state.MaybeCheck(engine, regs);
+}
+
+/// Stage A: has GPUBackB run fn(payload) in ring order without waiting (`bytes` copied).
+inline void EmitTask(RingState::AsyncFn fn, const void* data, size_t bytes) {
+    g_state.PushTask(fn, data, bytes);
 }
 
 inline void EmitCbUpload(u64 gpu_addr, const u32* data, u32 count) {

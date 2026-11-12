@@ -467,6 +467,9 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         if (root_tables.offset < 256 && root_tables.offset % 4 == 0) {
             root_tables.tables[root_tables.selected][root_tables.offset / 4] = argument;
             root_tables.loaded = true;
+            if (split_engine != nullptr) [[unlikely]] {
+                SplitSendRootLoad(root_tables.selected, root_tables.offset / 4, argument);
+            }
         }
         root_tables.offset += 4;
         return;
@@ -1130,6 +1133,10 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (split_engine != nullptr) [[unlikely]] {
+        // Before the rasterizer's bind task, in ring order with it.
+        SplitSendCbBind(stage_index, bind_data.shader_slot, buffer);
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -1139,6 +1146,121 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     const GPUVAddr gpu_addr = regs.const_buffer.Address();
     const u32 size = regs.const_buffer.size;
     rasterizer->BindGraphicsUniformBuffer(stage_index, bind_data.shader_slot, gpu_addr, size);
+}
+
+namespace {
+// E04.T6 step 3: GPUBackB's copy of the state the caches read besides the registers.
+struct SplitCbBindPacket {
+    Maxwell3D* shadow;
+    GPUVAddr address;
+    u32 size;
+    u16 stage;
+    u8 slot;
+    u8 enabled;
+};
+struct SplitRootLoadPacket {
+    Maxwell3D* shadow;
+    u32 table;
+    u32 index;
+    u32 value;
+};
+struct SplitStateCheckPacket {
+    Maxwell3D* shadow;
+    std::array<std::array<ConstBufferInfo, Maxwell3D::Regs::MaxConstBuffers>,
+               Maxwell3D::Regs::MaxShaderStage>
+        const_buffers;
+    std::array<std::array<u32, 64>, 8> tables;
+    bool loaded;
+};
+
+void SplitApplyCbBind(const u64* payload) {
+    SplitCbBindPacket packet;
+    std::memcpy(&packet, payload, sizeof(packet));
+    auto& buffer = packet.shadow->state.shader_stages[packet.stage].const_buffers[packet.slot];
+    buffer.address = packet.address;
+    buffer.size = packet.size;
+    buffer.enabled = packet.enabled != 0;
+}
+
+void SplitApplyRootLoad(const u64* payload) {
+    SplitRootLoadPacket packet;
+    std::memcpy(&packet, payload, sizeof(packet));
+    packet.shadow->root_tables.tables[packet.table][packet.index] = packet.value;
+    packet.shadow->root_tables.loaded = true;
+}
+
+void SplitApplyStateCheck(const u64* payload) {
+    auto packet = std::make_unique<SplitStateCheckPacket>();
+    std::memcpy(packet.get(), payload, sizeof(SplitStateCheckPacket));
+    Maxwell3D& shadow = *packet->shadow;
+    auto& ring = VideoCommon::BackSplit::g_state;
+    ring.b_state_checks.fetch_add(1, std::memory_order_relaxed);
+    u32 bad = 0;
+    for (size_t stage = 0; stage < packet->const_buffers.size(); ++stage) {
+        for (size_t slot = 0; slot < packet->const_buffers[stage].size(); ++slot) {
+            const ConstBufferInfo& a = packet->const_buffers[stage][slot];
+            ConstBufferInfo& b = shadow.state.shader_stages[stage].const_buffers[slot];
+            if (a.address == b.address && a.size == b.size && a.enabled == b.enabled) {
+                continue;
+            }
+            ++bad;
+            if (ring.b_state_report_lines < 64) {
+                ++ring.b_state_report_lines;
+                LOG_WARNING(HW_GPU,
+                            "Nx2BackSplit state diverged: const buffer stage {} slot {} "
+                            "A={:#x}/{:#x}/{} B={:#x}/{:#x}/{}",
+                            stage, slot, a.address, a.size, a.enabled, b.address, b.size,
+                            b.enabled);
+            }
+            b = a;
+        }
+    }
+    if (packet->tables != shadow.root_tables.tables || packet->loaded != shadow.root_tables.loaded) {
+        ++bad;
+        if (ring.b_state_report_lines < 64) {
+            ++ring.b_state_report_lines;
+            LOG_WARNING(HW_GPU, "Nx2BackSplit state diverged: root tables (loaded A={} B={})",
+                        packet->loaded, shadow.root_tables.loaded);
+        }
+        shadow.root_tables.tables = packet->tables;
+        shadow.root_tables.loaded = packet->loaded;
+    }
+    if (bad != 0) [[unlikely]] {
+        ring.b_bad_state.fetch_add(1, std::memory_order_relaxed);
+        ring.b_bad_state_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+} // Anonymous namespace
+
+void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer) {
+    const SplitCbBindPacket packet{
+        .shadow = split_engine,
+        .address = buffer.address,
+        .size = buffer.size,
+        .stage = static_cast<u16>(stage),
+        .slot = static_cast<u8>(slot),
+        .enabled = static_cast<u8>(buffer.enabled ? 1 : 0),
+    };
+    VideoCommon::BackSplit::EmitTask(&SplitApplyCbBind, &packet, sizeof(packet));
+}
+
+void Maxwell3D::SplitSendRootLoad(u32 table, u32 index, u32 value) {
+    const SplitRootLoadPacket packet{split_engine, table, index, value};
+    VideoCommon::BackSplit::EmitTask(&SplitApplyRootLoad, &packet, sizeof(packet));
+}
+
+void Maxwell3D::SplitSendStateCheck() {
+    if (split_engine == nullptr) {
+        return;
+    }
+    auto packet = std::make_unique<SplitStateCheckPacket>();
+    packet->shadow = split_engine;
+    for (size_t stage = 0; stage < packet->const_buffers.size(); ++stage) {
+        packet->const_buffers[stage] = state.shader_stages[stage].const_buffers;
+    }
+    packet->tables = root_tables.tables;
+    packet->loaded = root_tables.loaded;
+    VideoCommon::BackSplit::EmitTask(&SplitApplyStateCheck, packet.get(), sizeof(*packet));
 }
 
 void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {

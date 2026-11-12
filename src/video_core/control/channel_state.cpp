@@ -93,6 +93,7 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
             shadow.SetNativeTuringMacroMode(true);
         }
         payload->maxwell_3d.split_shadow = shadow.regs.reg_array.data();
+        payload->maxwell_3d.split_engine = &shadow;
     }
     initialized = true;
 }
