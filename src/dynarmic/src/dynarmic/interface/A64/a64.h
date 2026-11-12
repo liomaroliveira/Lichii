@@ -21,6 +21,9 @@
 namespace Dynarmic {
 namespace A64 {
 
+/// Creates a code cache that can be shared across multiple A64::Jit instances of the same process.
+std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf);
+
 class Jit final {
 public:
     explicit Jit(UserConfig conf);
@@ -127,6 +130,7 @@ public:
     std::string Disassemble() const;
 
 private:
+    friend std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

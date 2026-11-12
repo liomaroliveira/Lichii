@@ -117,6 +117,7 @@ private:
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
+    std::shared_ptr<Dynarmic::A64::SharedCodeCache> m_shared_cache{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
 

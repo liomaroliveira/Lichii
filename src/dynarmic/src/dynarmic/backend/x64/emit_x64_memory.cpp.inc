@@ -48,19 +48,25 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
     info.recompile = recompile ? 1 : 0;
     // Code is emitted in address order; only a block's deferred fallbacks can come after a later
     // access of the same block.
+    while (fastmem_lock.test_and_set(std::memory_order_acquire)) {
+    }
     auto it = fastmem_patch_info.end();
     if (!fastmem_patch_info.empty() && fastmem_patch_info.back().rip >= info.rip) {
         it = std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), info.rip,
                               [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; });
         if (it != fastmem_patch_info.end() && it->rip == info.rip) {
+            fastmem_lock.clear(std::memory_order_release);
             return;
         }
     }
     fastmem_patch_info.insert(it, info);
+    fastmem_lock.clear(std::memory_order_release);
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     const u64 base = std::bit_cast<u64>(code.getCode());
+    while (fastmem_lock.test_and_set(std::memory_order_acquire)) {
+    }
     const auto iter = rip_ >= base && rip_ - base <= UINT32_MAX
                         ? std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), u32(rip_ - base),
                                            [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; })
@@ -72,11 +78,21 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         };
         if (iter->recompile) {
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
+            if (IsSharedMode()) {
+                pending_fastmem_recompiles.push_back(marker);
+                has_pending_fastmem_recompiles.store(true, std::memory_order_release);
+                fastmem_lock.clear(std::memory_order_release);
+                return result;
+            }
+            fastmem_lock.clear(std::memory_order_release);
             do_not_fastmem.insert(marker);
             InvalidateBasicBlocks({std::get<0>(marker)});
+            return result;
         }
+        fastmem_lock.clear(std::memory_order_release);
         return result;
     }
+    fastmem_lock.clear(std::memory_order_release);
     fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n"
         "Segfault wasn't at a fastmem patch location!\n", rip_);
     UNREACHABLE(); //("iter != fastmem_patch_info.end()");
@@ -99,7 +115,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             ctx.reg_alloc.HostCall(code, inst, {}, args[1]);
             code.mov(code.ABI_PARAM3.cvt32(), bitsize / CHAR_BIT);
             if (ordered) code.mfence();
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            EmitCallback<callback>().EmitCall(code);
             code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
         }
         EmitCheckMemoryAbort(ctx, inst);
@@ -177,7 +193,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             // { this, vaddr, value, size }
             ctx.reg_alloc.HostCall(code, nullptr, {}, args[1], args[2]);
             code.mov(code.ABI_PARAM4.cvt32(), bitsize / CHAR_BIT);
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            EmitCallback<callback>().EmitCall(code);
         }
         if (ordered) code.mfence();
         EmitCheckMemoryAbort(ctx, inst);
@@ -245,6 +261,25 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(code, inst, {}, args[1]);
 
         code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
+        if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+            if (IsSharedMode()) {
+                code.mov(code.ABI_PARAM1, code.ABI_JIT_PTR);
+                if (ordered) {
+                    code.mfence();
+                }
+                code.CallLambda([](void* raw_js, Axx::VAddr vaddr) -> T {
+                    auto* js = static_cast<A64JitState*>(raw_js);
+                    auto* mon = static_cast<ExclusiveMonitor*>(js->global_monitor);
+                    auto* cb = static_cast<Axx::UserCallbacks*>(js->callbacks);
+                    return mon->ReadAndMark<T>(js->processor_id, vaddr, [&]() -> T {
+                        return (cb->*callback)(vaddr, bitsize / CHAR_BIT);
+                    });
+                });
+                code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
+                EmitCheckMemoryAbort(ctx, inst);
+                return;
+            }
+        }
         code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
         if (ordered) {
             code.mfence();
@@ -262,6 +297,29 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(code, nullptr);
 
         code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
+        if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+            if (IsSharedMode()) {
+                code.mov(code.ABI_PARAM1, code.ABI_JIT_PTR);
+                ctx.reg_alloc.AllocStackSpace(code, 16 + ABI_SHADOW_SPACE);
+                code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
+                if (ordered) {
+                    code.mfence();
+                }
+                code.CallLambda([](void* raw_js, Axx::VAddr vaddr, Vector& ret) {
+                    auto* js = static_cast<A64JitState*>(raw_js);
+                    auto* mon = static_cast<ExclusiveMonitor*>(js->global_monitor);
+                    auto* cb = static_cast<Axx::UserCallbacks*>(js->callbacks);
+                    ret = mon->ReadAndMark<Vector>(js->processor_id, vaddr, [&]() -> Vector {
+                        return (cb->*callback)(vaddr);
+                    });
+                });
+                code.movups(result, xword[rsp + ABI_SHADOW_SPACE]);
+                ctx.reg_alloc.ReleaseStackSpace(code, 16 + ABI_SHADOW_SPACE);
+                ctx.reg_alloc.DefineValue(code, inst, result);
+                EmitCheckMemoryAbort(ctx, inst);
+                return;
+            }
+        }
         code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
         ctx.reg_alloc.AllocStackSpace(code, 16 + ABI_SHADOW_SPACE);
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
@@ -305,6 +363,44 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.je(end);
     code.xor_(tmp.cvt32(), tmp.cvt32());
     code.xchg(tmp.cvt8(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        if (IsSharedMode()) {
+            code.mov(code.ABI_PARAM1, code.ABI_JIT_PTR);
+            if constexpr (bitsize != 128) {
+                using T = mcl::unsigned_integer_of_size<bitsize>;
+                code.CallLambda([](void* raw_js, Axx::VAddr vaddr, T value) -> u32 {
+                    auto* js = static_cast<A64JitState*>(raw_js);
+                    auto* mon = static_cast<ExclusiveMonitor*>(js->global_monitor);
+                    auto* cb = static_cast<Axx::UserCallbacks*>(js->callbacks);
+                    return mon->DoExclusiveOperation<T>(js->processor_id, vaddr, [&](T expected) -> bool {
+                        return (cb->*callback)(vaddr, value, expected);
+                    }) ? 0 : 1;
+                });
+                if (ordered) {
+                    code.mfence();
+                }
+            } else {
+                ctx.reg_alloc.AllocStackSpace(code, 16 + ABI_SHADOW_SPACE);
+                code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
+                code.movaps(xword[code.ABI_PARAM3], xmm1);
+                code.CallLambda([](void* raw_js, Axx::VAddr vaddr, Vector& value) -> u32 {
+                    auto* js = static_cast<A64JitState*>(raw_js);
+                    auto* mon = static_cast<ExclusiveMonitor*>(js->global_monitor);
+                    auto* cb = static_cast<Axx::UserCallbacks*>(js->callbacks);
+                    return mon->DoExclusiveOperation<Vector>(js->processor_id, vaddr, [&](Vector expected) -> bool {
+                        return (cb->*callback)(vaddr, value, expected);
+                    }) ? 0 : 1;
+                });
+                if (ordered) {
+                    code.mfence();
+                }
+                ctx.reg_alloc.ReleaseStackSpace(code, 16 + ABI_SHADOW_SPACE);
+            }
+            code.L(end);
+            EmitCheckMemoryAbort(ctx, inst);
+            return;
+        }
+    }
     code.mov(code.ABI_PARAM1, u64(&conf));
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
@@ -364,7 +460,15 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        if (IsSharedMode()) {
+            code.mov(tmp, qword[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_address_ptr)]);
+        } else {
+            code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+        }
+    } else {
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    }
     code.mov(qword[tmp], vaddr);
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
@@ -391,7 +495,15 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        if (IsSharedMode()) {
+            code.mov(tmp, qword[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_value_ptr)]);
+        } else {
+            code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+        }
+    } else {
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    }
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
 
     EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
@@ -443,14 +555,34 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     code.movzx(tmp.cvt32(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
     code.test(tmp.cvt8(), tmp.cvt8());
     code.je(*end, code.T_NEAR);
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        if (IsSharedMode()) {
+            code.mov(tmp, qword[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_address_ptr)]);
+        } else {
+            code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+        }
+    } else {
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    }
     code.cmp(qword[tmp], vaddr);
     code.jne(*end, code.T_NEAR);
 
-    EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax, IsSharedMode(), offsetof(A64JitState, exclusive_address_ptr));
+    } else {
+        EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
+    }
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    if constexpr (std::is_same_v<AxxJitState, A64JitState>) {
+        if (IsSharedMode()) {
+            code.mov(tmp, qword[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_value_ptr)]);
+        } else {
+            code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+        }
+    } else {
+        code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    }
 
     if constexpr (bitsize == 128) {
         code.mov(rax, qword[tmp + 0]);
