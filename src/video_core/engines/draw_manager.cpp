@@ -96,8 +96,8 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-            VideoCommon::BackSplit::EmitClear(maxwell3d.regs.reg_array.data(), layer_count);
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitClear(layer_count);
         }
         maxwell3d.rasterizer->Clear(layer_count);
     }
@@ -316,8 +316,8 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
     if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-        VideoCommon::BackSplit::EmitDrawTexture(maxwell3d.regs.reg_array.data());
+        const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        VideoCommon::BackSplit::EmitDrawTexture();
     }
     maxwell3d.rasterizer->DrawTexture();
 }
@@ -355,7 +355,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-            VideoCommon::BackSplit::EmitDraw(maxwell3d.regs.reg_array.data(), draw_indexed, false, instance_count);
+            VideoCommon::BackSplit::EmitDraw(draw_indexed, false, instance_count);
         }
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
@@ -369,8 +369,8 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-            VideoCommon::BackSplit::EmitDraw(maxwell3d.regs.reg_array.data(), indirect_state.is_indexed != 0, true, 1);
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitDraw(indirect_state.is_indexed != 0, true, 1);
         }
         maxwell3d.rasterizer->DrawIndirect();
     } else {
