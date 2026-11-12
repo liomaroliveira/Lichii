@@ -18,13 +18,14 @@
 
 namespace VideoCommon::BackSplit {
 
+inline bool g_enabled = [] {
+    const char* value = std::getenv("EDEN_NX2_BACK_SPLIT");
+    return value != nullptr && value[0] == '1';
+}();
+
 /// Enables the Stage A -> Stage B SPSC prototype ring (E04.T5+).
 inline bool Enabled() noexcept {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_BACK_SPLIT");
-        return value != nullptr && value[0] == '1';
-    }();
-    return enabled;
+    return g_enabled;
 }
 
 enum class Kind : u8 {
@@ -43,7 +44,8 @@ constexpr size_t RegCount = 0xE00;
 constexpr size_t MaskWords = RegCount / 64;
 constexpr size_t RingWords = size_t{1} << 20; // 8 MiB SPSC ring
 constexpr size_t RingMask = RingWords - 1;
-constexpr u64 PublishBatchWords = 64;
+constexpr u64 PublishBatchWords = 4096;
+constexpr u32 CbCoalesceCap = 256;
 
 inline constexpr u64 MakeHeader(Kind kind, u32 aux = 0) noexcept {
     return static_cast<u64>(kind) | (u64{aux} << 8);
@@ -112,14 +114,22 @@ public:
         started.store(false, std::memory_order_release);
     }
 
-    void NoteRegisterWrite(u32 method, u32 argument) noexcept {
-        if (method < RegCount && shadow_regs[method] != argument) {
+    void NoteRegisterWrite(u32 method) noexcept {
+        if (method < RegCount) {
             dirty_mask[method >> 6] |= 1ULL << (method & 63U);
         }
     }
 
+    void FlushPendingCb() {
+        if (pending_cb_count == 0) {
+            return;
+        }
+        EmitCbPacket(pending_cb_addr, pending_cb_words.data(), pending_cb_count);
+        pending_cb_count = 0;
+        pending_cb_addr = 0;
+    }
+
     void FlushRegDeltas(const u32* reg_array) {
-        std::array<u64, RegCount> deltas;
         u32 count = 0;
         for (size_t w = 0; w < MaskWords; ++w) {
             u64 bits = dirty_mask[w];
@@ -135,7 +145,7 @@ public:
                 const u32 val = reg_array[reg];
                 if (shadow_regs[reg] != val) {
                     shadow_regs[reg] = val;
-                    deltas[count++] = (u64{val} << 32) | u64{reg};
+                    scratch_deltas[count++] = (u64{val} << 32) | u64{reg};
                 }
             }
         }
@@ -145,7 +155,7 @@ public:
         const size_t words = 1 + count;
         u64* dst = Reserve(words);
         dst[0] = MakeHeader(Kind::RegDeltas, count);
-        std::memcpy(dst + 1, deltas.data(), count * sizeof(u64));
+        std::memcpy(dst + 1, scratch_deltas.data(), count * sizeof(u64));
         Commit(words);
         ++stat_packets;
         stat_delta_regs += count;
@@ -156,22 +166,27 @@ public:
             return;
         }
         EnsureStarted();
-        const size_t words = 2 + (static_cast<size_t>(count) + 1) / 2;
-        if (words >= RingWords / 4) {
+        stat_cb_words += count;
+        const u64 expected_next = pending_cb_addr + u64{pending_cb_count} * sizeof(u32);
+        if (pending_cb_count > 0 && gpu_addr == expected_next &&
+            pending_cb_count + count <= CbCoalesceCap) {
+            std::memcpy(&pending_cb_words[pending_cb_count], data, static_cast<size_t>(count) * sizeof(u32));
+            pending_cb_count += count;
             return;
         }
-        u64* dst = Reserve(words);
-        dst[0] = MakeHeader(Kind::CbUpload, count);
-        dst[1] = gpu_addr;
-        dst[words - 1] = 0;
-        std::memcpy(dst + 2, data, static_cast<size_t>(count) * sizeof(u32));
-        Commit(words);
-        ++stat_packets;
-        stat_cb_words += count;
+        FlushPendingCb();
+        if (count <= CbCoalesceCap) {
+            pending_cb_addr = gpu_addr;
+            pending_cb_count = count;
+            std::memcpy(pending_cb_words.data(), data, static_cast<size_t>(count) * sizeof(u32));
+            return;
+        }
+        EmitCbPacket(gpu_addr, data, count);
     }
 
     void PushDraw(const u32* reg_array, bool draw_indexed, bool indirect, u32 instance_count) {
         EnsureStarted();
+        FlushPendingCb();
         FlushRegDeltas(reg_array);
         u64* dst = Reserve(2);
         const u32 flags = (draw_indexed ? 1U : 0U) | (indirect ? 2U : 0U);
@@ -183,6 +198,7 @@ public:
 
     void PushDrawTexture(const u32* reg_array) {
         EnsureStarted();
+        FlushPendingCb();
         FlushRegDeltas(reg_array);
         u64* dst = Reserve(1);
         dst[0] = MakeHeader(Kind::DrawTexture, 0);
@@ -192,6 +208,7 @@ public:
 
     void PushClear(const u32* reg_array, u32 layer_count) {
         EnsureStarted();
+        FlushPendingCb();
         FlushRegDeltas(reg_array);
         u64* dst = Reserve(1);
         dst[0] = MakeHeader(Kind::Clear, layer_count);
@@ -201,6 +218,7 @@ public:
 
     void PushLaunchDma(u64 src_addr, u64 dst_addr, u64 byte_size_and_flags) {
         EnsureStarted();
+        FlushPendingCb();
         u64* dst = Reserve(4);
         dst[0] = MakeHeader(Kind::LaunchDma, 0);
         dst[1] = src_addr;
@@ -215,6 +233,7 @@ public:
             return;
         }
         EnsureStarted();
+        FlushPendingCb();
         const size_t clamped = std::min<size_t>(bytes, (RingWords / 4) * sizeof(u64));
         const size_t payload_words = (clamped + sizeof(u64) - 1) / sizeof(u64);
         const size_t words = 2 + payload_words;
@@ -229,6 +248,7 @@ public:
 
     void PushQuery(const u32* reg_array, u64 gpu_addr, u64 payload, u64 meta) {
         EnsureStarted();
+        FlushPendingCb();
         FlushRegDeltas(reg_array);
         u64* dst = Reserve(4);
         dst[0] = MakeHeader(Kind::Query, 0);
@@ -266,6 +286,20 @@ public:
     }
 
 private:
+    void EmitCbPacket(u64 gpu_addr, const u32* data, u32 count) {
+        const size_t words = 2 + (static_cast<size_t>(count) + 1) / 2;
+        if (words >= RingWords / 4) {
+            return;
+        }
+        u64* dst = Reserve(words);
+        dst[0] = MakeHeader(Kind::CbUpload, count);
+        dst[1] = gpu_addr;
+        dst[words - 1] = 0;
+        std::memcpy(dst + 2, data, static_cast<size_t>(count) * sizeof(u32));
+        Commit(words);
+        ++stat_packets;
+    }
+
     static u64 NowNs() noexcept {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch())
@@ -397,6 +431,10 @@ private:
     std::unique_ptr<u64[]> ring;
     std::array<u32, RegCount> shadow_regs{};
     std::array<u64, MaskWords> dirty_mask{};
+    std::array<u64, RegCount> scratch_deltas{};
+    std::array<u32, CbCoalesceCap> pending_cb_words{};
+    u64 pending_cb_addr = 0;
+    u32 pending_cb_count = 0;
 
     u64 write_position = 0;
     u64 published_local = 0;
@@ -418,46 +456,43 @@ private:
     std::jthread consumer;
 };
 
-inline RingState& Global() {
-    static RingState instance;
-    return instance;
-}
+inline RingState g_state;
 
-inline void NoteRegisterWrite(u32 method, u32 argument) noexcept {
-    Global().NoteRegisterWrite(method, argument);
+inline void NoteRegisterWrite(u32 method) noexcept {
+    g_state.NoteRegisterWrite(method);
 }
 
 inline void EmitCbUpload(u64 gpu_addr, const u32* data, u32 count) {
-    Global().PushCbUpload(gpu_addr, data, count);
+    g_state.PushCbUpload(gpu_addr, data, count);
 }
 
 inline void EmitDraw(const u32* reg_array, bool draw_indexed, bool indirect, u32 instance_count) {
-    Global().PushDraw(reg_array, draw_indexed, indirect, instance_count);
+    g_state.PushDraw(reg_array, draw_indexed, indirect, instance_count);
 }
 
 inline void EmitDrawTexture(const u32* reg_array) {
-    Global().PushDrawTexture(reg_array);
+    g_state.PushDrawTexture(reg_array);
 }
 
 inline void EmitClear(const u32* reg_array, u32 layer_count) {
-    Global().PushClear(reg_array, layer_count);
+    g_state.PushClear(reg_array, layer_count);
 }
 
 inline void EmitLaunchDma(u64 src_addr, u64 dst_addr, u64 byte_size_and_flags) {
-    Global().PushLaunchDma(src_addr, dst_addr, byte_size_and_flags);
+    g_state.PushLaunchDma(src_addr, dst_addr, byte_size_and_flags);
 }
 
 inline void EmitInlineUpload(u64 dst_addr, const void* data, size_t bytes) {
-    Global().PushInlineUpload(dst_addr, data, bytes);
+    g_state.PushInlineUpload(dst_addr, data, bytes);
 }
 
 inline void EmitQuery(const u32* reg_array, u64 gpu_addr, u64 payload, u64 meta) {
-    Global().PushQuery(reg_array, gpu_addr, payload, meta);
+    g_state.PushQuery(reg_array, gpu_addr, payload, meta);
 }
 
 inline void MaybeReport() {
     if (Enabled()) [[unlikely]] {
-        Global().MaybeReport();
+        g_state.MaybeReport();
     }
 }
 

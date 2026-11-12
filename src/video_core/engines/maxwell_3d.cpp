@@ -762,7 +762,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
         VideoCommon::BackSplit::EmitCbUpload(address + offset, values.data(), count);
     }
     // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
@@ -1193,7 +1193,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             VideoCommon::BackSplit::EmitCbUpload(address, start_base, static_cast<u32>(write_size / sizeof(u32)));
         }
         const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
