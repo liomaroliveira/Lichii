@@ -89,7 +89,9 @@ public:
     virtual void ClearCache();
 
     /// Invalidates a selection of basic blocks.
-    void InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& locations);
+    void InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& locations,
+                               std::vector<IR::LocationDescriptor>* invalidated_out = nullptr,
+                               bool enable_writing = true);
 
 //protected:
     // Microinstruction emitters
