@@ -160,7 +160,7 @@ public:
     void RunOnB(TaskFn fn, void* arg) {
         EnsureStarted();
         PublishNow();
-        async_pending = false;
+        drained_position = write_position;
         task_fn = fn;
         task_arg = arg;
         const u64 seq = ++task_posted;
@@ -197,12 +197,12 @@ public:
         }
         Commit(words);
         ++stat_async;
-        async_pending = true;
     }
 
-    /// Stage A: waits until GPUBackB ran every task sent without waiting.
+    /// Stage A: waits until GPUBackB consumed everything sent since the last wait: tasks sent
+    /// without waiting and register deltas (a Call closure on stage A reads B's shadow).
     void DrainAsync() {
-        if (async_pending) {
+        if (write_position != drained_position) {
             ++stat_drains;
             RunOnB([](void*) {}, nullptr);
         }
@@ -636,7 +636,7 @@ private:
     u64 stat_run_sleeps = 0;
     u64 stat_async = 0;
     u64 stat_drains = 0;
-    bool async_pending = false;
+    u64 drained_position = 0; ///< write_position at the last RunOnB
     // Stage A: the engine the deltas belong to, the engines GPUBackB has a shadow of, draws.
     const void* a_engine{};
     std::vector<const void*> a_known;
