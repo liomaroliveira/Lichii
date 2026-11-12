@@ -108,16 +108,56 @@ struct SharedCodeCache final {
 
     struct JitWarmHeader {
         u32 magic = 0x574A324E;  // 'N2JW'
-        u32 version = 1;
+        u32 version = 2;
         u64 count = 0;
     };
     struct JitWarmEntry {
-        u64 desc = 0;
+        u64 module_id = 0;
+        u64 pc_or_offset = 0;
+        u32 fpcr = 0;
         u32 opcode0 = 0;
-        u32 reserved = 0;
+    };
+    struct WarmKey {
+        u64 module_id = 0;
+        u64 pc_or_offset = 0;
+        u32 fpcr = 0;
+        bool operator==(const WarmKey&) const noexcept = default;
+    };
+    struct WarmKeyHash {
+        size_t operator()(const WarmKey& k) const noexcept {
+            u64 h = k.module_id ^ (k.pc_or_offset * 0x9E3779B97F4A7C15ULL);
+            h ^= u64(k.fpcr) * 0xBF58476D1CE4E5B9ULL;
+            return static_cast<size_t>(h ^ (h >> 32));
+        }
     };
 
-    void ConfigurePrewarm(std::string path, std::function<std::optional<u32>(u64)> read_code) {
+    static std::optional<u64> ResolveRuntimePC(const JitWarmEntry& e,
+                                               const std::unordered_map<u64, SharedWarmModule>& mod_map) {
+        if (e.module_id == 0) {
+            return e.pc_or_offset;
+        }
+        const auto it = mod_map.find(e.module_id);
+        if (it == mod_map.end() || e.pc_or_offset >= it->second.size) {
+            return std::nullopt;
+        }
+        return it->second.base + e.pc_or_offset;
+    }
+
+    static WarmKey NormalizeDesc(u64 desc_u64, const std::vector<SharedWarmModule>& mods) {
+        const A64::LocationDescriptor arch_desc{IR::LocationDescriptor{desc_u64}};
+        const u64 pc = arch_desc.PC();
+        const u32 fpcr = arch_desc.FPCR().Value();
+        for (const auto& m : mods) {
+            if (pc >= m.base && (pc - m.base) < m.size) {
+                return WarmKey{m.id, pc - m.base, fpcr};
+            }
+        }
+        return WarmKey{0, pc, fpcr};
+    }
+
+    void ConfigurePrewarm(std::string path,
+                          std::function<std::optional<u32>(u64)> read_code,
+                          std::function<std::vector<SharedWarmModule>()> get_modules) {
         static const bool warm_on = [] {
             const char* v = std::getenv("EDEN_NX2_JIT_WARM");
             return v == nullptr || *v != '0';
@@ -133,22 +173,25 @@ struct SharedCodeCache final {
             }
             warm_path = std::move(path);
             prewarm_read_code = std::move(read_code);
+            prewarm_get_modules = std::move(get_modules);
             std::ifstream in{warm_path, std::ios::binary};
             if (in.is_open()) {
                 JitWarmHeader hdr{};
                 in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-                if (in.good() && hdr.magic == 0x574A324E && hdr.version == 1 && hdr.count <= 8'000'000ULL) {
+                if (in.good() && hdr.magic == 0x574A324E && hdr.version == 2 && hdr.count <= 8'000'000ULL) {
                     loaded.resize(hdr.count);
                     if (hdr.count > 0) {
-                        in.read(reinterpret_cast<char*>(loaded.data()), static_cast<std::streamsize>(hdr.count * sizeof(JitWarmEntry)));
+                        in.read(reinterpret_cast<char*>(loaded.data()),
+                                static_cast<std::streamsize>(hdr.count * sizeof(JitWarmEntry)));
                         if (!in.good()) {
                             loaded.clear();
                         }
                     }
                 }
             }
+            warm_disk_map.reserve(loaded.size());
             for (const auto& e : loaded) {
-                warm_known[e.desc] = e.opcode0;
+                warm_disk_map[WarmKey{e.module_id, e.pc_or_offset, e.fpcr}] = e.opcode0;
             }
             warm_enabled.store(true, std::memory_order_release);
         }
@@ -163,49 +206,68 @@ struct SharedCodeCache final {
         if (prewarm_thread.joinable()) {
             prewarm_thread.join();
         }
+        std::vector<SharedWarmModule> mods;
+        if (prewarm_get_modules) {
+            mods = prewarm_get_modules();
+        }
         std::lock_guard lk{warm_mutex};
-        prewarm_read_code = nullptr;
-        if (warm_dirty && !warm_path.empty()) {
-            std::error_code ec;
-            const std::filesystem::path target{warm_path};
-            std::filesystem::create_directories(target.parent_path(), ec);
-            const std::string tmp_path = warm_path + ".tmp";
-            std::ofstream out{tmp_path, std::ios::binary | std::ios::trunc};
-            if (out.is_open()) {
-                JitWarmHeader hdr{};
-                hdr.count = warm_known.size();
-                out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-                std::vector<JitWarmEntry> buf;
-                buf.reserve(warm_known.size());
-                for (const auto& [desc, op0] : warm_known) {
-                    buf.push_back(JitWarmEntry{desc, op0, 0});
+        if (warm_enabled.load(std::memory_order_acquire) && !warm_runtime_new.empty() && !warm_path.empty()) {
+            size_t added = 0;
+            for (const auto& [desc_u64, op0] : warm_runtime_new) {
+                const WarmKey key = NormalizeDesc(desc_u64, mods);
+                auto [it, inserted] = warm_disk_map.emplace(key, op0);
+                if (inserted || it->second != op0) {
+                    it->second = op0;
+                    ++added;
                 }
-                if (!buf.empty()) {
-                    out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size() * sizeof(JitWarmEntry)));
-                }
-                out.close();
-                if (out.good()) {
-                    std::filesystem::rename(tmp_path, target, ec);
-                    if (!ec) {
-                        LOG_INFO(Core, "Nx2JitWarm saved={} path={}", buf.size(), warm_path);
+            }
+            warm_runtime_new.clear();
+            if (added > 0) {
+                std::error_code ec;
+                const std::filesystem::path target{warm_path};
+                std::filesystem::create_directories(target.parent_path(), ec);
+                const std::string tmp_path = warm_path + ".tmp";
+                std::ofstream out{tmp_path, std::ios::binary | std::ios::trunc};
+                if (out.is_open()) {
+                    JitWarmHeader hdr{};
+                    hdr.count = warm_disk_map.size();
+                    out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+                    std::vector<JitWarmEntry> buf;
+                    buf.reserve(warm_disk_map.size());
+                    for (const auto& [k, op0] : warm_disk_map) {
+                        buf.push_back(JitWarmEntry{k.module_id, k.pc_or_offset, k.fpcr, op0});
+                    }
+                    if (!buf.empty()) {
+                        out.write(reinterpret_cast<const char*>(buf.data()),
+                                  static_cast<std::streamsize>(buf.size() * sizeof(JitWarmEntry)));
+                    }
+                    out.close();
+                    if (out.good()) {
+                        std::filesystem::rename(tmp_path, target, ec);
+                        if (!ec) {
+                            LOG_INFO(Core, "Nx2JitWarm saved={} new={} mods={} path={}", buf.size(), added, mods.size(), warm_path);
+                        }
                     }
                 }
             }
-            warm_dirty = false;
         }
+        prewarm_read_code = nullptr;
+        prewarm_get_modules = nullptr;
     }
 
     void RecordWarmEntry(u64 desc, u32 op0) {
         std::lock_guard lk{warm_mutex};
-        auto [it, inserted] = warm_known.emplace(desc, op0);
-        if (inserted || it->second != op0) {
-            it->second = op0;
-            warm_dirty = true;
-        }
+        warm_runtime_new.emplace(desc, op0);
     }
 
     void RunPrewarmPass(const std::vector<JitWarmEntry>& entries, std::vector<JitWarmEntry>& deferred_out, int pass_num) {
         const s64 pass_start_ns = SteadyNowNs();
+        const auto mods = prewarm_get_modules ? prewarm_get_modules() : std::vector<SharedWarmModule>{};
+        std::unordered_map<u64, SharedWarmModule> mod_map;
+        mod_map.reserve(mods.size());
+        for (const auto& m : mods) {
+            mod_map.emplace(m.id, m);
+        }
         size_t hits = 0;
         size_t compiled = 0;
         size_t deferred_cnt = 0;
@@ -219,11 +281,14 @@ struct SharedCodeCache final {
                     break;
                 }
             }
-            const IR::LocationDescriptor desc{entry.desc};
-            const A64::LocationDescriptor arch_desc{desc};
-            if (arch_desc.SingleStepping()) {
+            const auto runtime_pc = ResolveRuntimePC(entry, mod_map);
+            if (!runtime_pc) {
+                deferred_out.push_back(entry);
+                ++deferred_cnt;
                 continue;
             }
+            const A64::LocationDescriptor arch_desc{*runtime_pc, FP::FPCR{entry.fpcr}, false};
+            const IR::LocationDescriptor desc{arch_desc};
             {
                 std::shared_lock slk{cache_mutex};
                 if (emitter.GetBasicBlock(desc)) {
@@ -234,7 +299,7 @@ struct SharedCodeCache final {
                     break;
                 }
             }
-            const auto word = prewarm_read_code ? prewarm_read_code(arch_desc.PC()) : std::nullopt;
+            const auto word = prewarm_read_code ? prewarm_read_code(*runtime_pc) : std::nullopt;
             if (!word || *word != entry.opcode0) {
                 deferred_out.push_back(entry);
                 ++deferred_cnt;
@@ -257,8 +322,8 @@ struct SharedCodeCache final {
             ++compiled;
         }
         const double ms = (SteadyNowNs() - pass_start_ns) / 1e6;
-        LOG_INFO(Core, "Nx2JitWarm pass={} total={} compiled={} hit={} deferred={} ms={:.1f}",
-                 pass_num, entries.size(), compiled, hits, deferred_cnt, ms);
+        LOG_INFO(Core, "Nx2JitWarm pass={} mods={} total={} compiled={} hit={} deferred={} ms={:.1f}",
+                 pass_num, mods.size(), entries.size(), compiled, hits, deferred_cnt, ms);
     }
 
     void PrewarmWorker(std::vector<JitWarmEntry> entries) {
@@ -487,8 +552,9 @@ struct SharedCodeCache final {
     std::atomic<s64> last_miss_ns{0};
     std::string warm_path;
     std::function<std::optional<u32>(u64)> prewarm_read_code;
-    std::unordered_map<u64, u32> warm_known;
-    bool warm_dirty = false;
+    std::function<std::vector<SharedWarmModule>()> prewarm_get_modules;
+    std::unordered_map<WarmKey, u32, WarmKeyHash> warm_disk_map;
+    std::unordered_map<u64, u32> warm_runtime_new;
     std::thread prewarm_thread;
 };
 
@@ -807,9 +873,10 @@ std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf) {
 
 void ConfigureSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache,
                             std::string cache_path,
-                            std::function<std::optional<u32>(u64)> read_code) {
+                            std::function<std::optional<u32>(u64)> read_code,
+                            std::function<std::vector<SharedWarmModule>()> get_modules) {
     if (cache) {
-        cache->ConfigurePrewarm(std::move(cache_path), std::move(read_code));
+        cache->ConfigurePrewarm(std::move(cache_path), std::move(read_code), std::move(get_modules));
     }
 }
 

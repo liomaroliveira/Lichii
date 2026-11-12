@@ -24,10 +24,16 @@ namespace Dynarmic {
 namespace A64 {
 
 /// Creates a code cache that can be shared across multiple A64::Jit instances of the same process.
+struct SharedWarmModule {
+    std::uint64_t id = 0;
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;
+};
 std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf);
 void ConfigureSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache,
                             std::string cache_path,
-                            std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code);
+                            std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code,
+                            std::function<std::vector<SharedWarmModule>()> get_modules);
 void ShutdownSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache);
 
 class Jit final {
