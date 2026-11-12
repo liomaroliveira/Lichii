@@ -527,7 +527,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                             }
                         }
                         const uintptr_t next_address = svc_info.base_address + svc_info.size;
-                        if (next_address <= cur_addr || !pt.Contains(next_address)) {
+                        if (next_address <= cur_addr || !pt.Contains(next_address, 1)) {
                             break;
                         }
                         cur_addr = next_address;
