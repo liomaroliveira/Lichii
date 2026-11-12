@@ -70,6 +70,14 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// E04.T6: sends a register the engine wrote without ProcessDirtyRegisters (an increment, a
+    /// macro's direct write) to GPUBackB's shadow (EDEN_NX2_BACK_SPLIT=1).
+    void NoteDirectWrite(u32 method) {
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(this, regs.reg_array.data(), method, regs.reg_array[method]);
+        }
+    }
+
     /// Register structure of the Maxwell3D engine.
     struct Regs {
         static constexpr std::size_t NUM_REGS = 0xE00;

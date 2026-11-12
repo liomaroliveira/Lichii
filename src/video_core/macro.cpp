@@ -1598,8 +1598,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         return;
     }
-    const auto execute_variant = [&system, &maxwell3d, &parameters,
-                                  method](AnyCachedMacro& cached) {
+    const auto execute_variant_raw = [&system, &maxwell3d, &parameters,
+                                      method](AnyCachedMacro& cached) {
         if (std::holds_alternative<MacroInterpreterImpl>(cached) ||
             std::holds_alternative<std::unique_ptr<DynamicCachedMacro>>(cached) ||
             Settings::values.disable_macro_hle) {
@@ -1636,6 +1636,21 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             return program->get()->Execute(system, maxwell3d, parameters, method);
 
         UNREACHABLE();
+    };
+    // E04.T6: HLE programs write registers directly; with the split, the ones they changed go to
+    // GPUBackB's shadow afterwards (a value set and restored inside one program is not seen).
+    const auto execute_variant = [&](AnyCachedMacro& cached) {
+        if (!VideoCommon::BackSplit::Enabled()) [[likely]] {
+            return execute_variant_raw(cached);
+        }
+        const auto before = maxwell3d.regs.reg_array;
+        execute_variant_raw(cached);
+        const auto& after = maxwell3d.regs.reg_array;
+        for (u32 reg = 0; reg < Maxwell3D::Regs::NUM_REGS; ++reg) {
+            if (after[reg] != before[reg]) {
+                maxwell3d.NoteDirectWrite(reg);
+            }
+        }
     };
     // HLE programs write registers directly, without the 3D engine's fast draw breaks.
     namespace FastDraw = VideoCommon::Nx2FastDraw;

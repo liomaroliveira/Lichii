@@ -485,6 +485,7 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     case MAXWELL3D_REG_INDEX(load_mme.start_address):
         if (front_macros) {
             ++regs.load_mme.start_address_ptr;
+            NoteDirectWrite(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr));
             return;
         }
         return ProcessMacroBind(argument);
@@ -780,6 +781,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         }
     }
     regs.const_buffer.offset += static_cast<u32>(bytes);
+    NoteDirectWrite(MAXWELL3D_REG_INDEX(const_buffer.offset));
 }
 
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
@@ -904,11 +906,13 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
 
 void Maxwell3D::ProcessMacroUpload(u32 data) {
     GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr++, data);
+    NoteDirectWrite(MAXWELL3D_REG_INDEX(load_mme.instruction_ptr));
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
     const auto positions = GetNativeMacroPositions();
     const u32 index = regs.load_mme.start_address_ptr++;
+    NoteDirectWrite(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr));
     if (index < positions.size()) {
         positions[index] = data;
     }
@@ -920,6 +924,7 @@ void Maxwell3D::ProcessFirmwareCall4() {
     // Firmware call 4 is a blob that changes some registers depending on its parameters.
     // These registers don't affect emulation and so are stubbed by setting 0xd00 to 1.
     regs.shadow_scratch[0] = 1;
+    NoteDirectWrite(MAXWELL3D_REG_INDEX(shadow_scratch));
 }
 
 void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_query) {
@@ -1220,6 +1225,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
     // Increment the current buffer position.
     regs.const_buffer.offset += static_cast<u32>(copy_size);
+    NoteDirectWrite(MAXWELL3D_REG_INDEX(const_buffer.offset));
 }
 
 void Maxwell3D::ProcessCBData(u32 value) {
