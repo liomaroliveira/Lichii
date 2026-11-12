@@ -3330,7 +3330,7 @@ private:
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            VideoCommon::BackSplit::NoteRegisterWrite(method, argument);
+            VideoCommon::BackSplit::NoteRegisterWrite(method);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

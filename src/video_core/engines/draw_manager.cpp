@@ -354,7 +354,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             VideoCommon::BackSplit::EmitDraw(maxwell3d.regs.reg_array.data(), draw_indexed, false, instance_count);
         }
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
