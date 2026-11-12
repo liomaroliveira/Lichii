@@ -9,15 +9,18 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <set>
 #include <tuple>
+#include <vector>
 
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a32_jitstate.h"
+#include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
@@ -127,7 +130,17 @@ public:
     void EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) override;
     void EmitPatchMovRcx(CodePtr target_code_ptr = nullptr) override;
 
+    bool IsSharedMode() const noexcept { return false; }
+
+    template<auto mfp>
+    ArgCallback EmitCallback() const {
+        return Devirtualize<mfp>(conf.callbacks);
+    }
+
     const A32::UserConfig conf;
+    std::atomic_flag fastmem_lock = ATOMIC_FLAG_INIT;
+    std::atomic<bool> has_pending_fastmem_recompiles{false};
+    std::vector<DoNotFastmemMarker> pending_fastmem_recompiles;
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u32> block_ranges;
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;

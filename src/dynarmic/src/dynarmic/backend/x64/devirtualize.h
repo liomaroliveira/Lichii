@@ -86,5 +86,25 @@ ArgCallback Devirtualize(mcl::class_type<decltype(mfp)>* this_) {
 #endif
 }
 
+template<auto mfp>
+ArgCallback DevirtualizeFromJitState(mcl::class_type<decltype(mfp)>* this_, size_t state_offset) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__MINGW64__)
+    struct MemberFunctionPointer {
+        u64 ptr;
+        u64 adj;
+    } mfp_struct = std::bit_cast<MemberFunctionPointer>(mfp);
+    static_assert(sizeof(MemberFunctionPointer) == sizeof(mfp));
+    u64 fn_ptr = mfp_struct.ptr;
+    if (mfp_struct.ptr & 1) {
+        u64 vtable = impl::bit_cast_pointee<u64>(reinterpret_cast<u64>(this_) + mfp_struct.adj);
+        fn_ptr = impl::bit_cast_pointee<u64>(vtable + fn_ptr - 1);
+    }
+    return ArgCallback::FromJitState(fn_ptr, state_offset);
+#else
+    (void)state_offset;
+    return Devirtualize<mfp>(this_);
+#endif
+}
+
 }  // namespace Backend::X64
 }  // namespace Dynarmic

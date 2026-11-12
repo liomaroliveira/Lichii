@@ -131,6 +131,8 @@ struct UserCallbacks {
     virtual std::uint64_t GetCNTPCT() = 0;
 };
 
+struct SharedCodeCache;
+
 struct UserConfig {
     /// Fastmem Pointer
     /// This should point to the beginning of a 2^page_table_address_space_bits bytes
@@ -220,6 +222,9 @@ struct UserConfig {
 
     /// Processor ID
     std::uint8_t processor_id = 0;
+
+    /// Optional shared code cache across cores of the same process (x64 backend).
+    std::shared_ptr<SharedCodeCache> shared_cache = nullptr;
 
     /// This enables unsafe optimizations that reduce emulation accuracy in favour of speed.
     /// For safety, in order to enable unsafe optimizations you have to set BOTH this flag

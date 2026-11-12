@@ -50,8 +50,12 @@ private:
 class ArgCallback final : public Callback {
 public:
     template<typename Function>
-    ArgCallback(Function fn, u64 arg)
-            : fn(reinterpret_cast<void (*)()>(fn)), arg(arg) {}
+    ArgCallback(Function fn, u64 arg, bool from_jit_state = false)
+            : fn(reinterpret_cast<void (*)()>(fn)), arg(arg), from_jit_state(from_jit_state) {}
+
+    static ArgCallback FromJitState(u64 fn_ptr, size_t state_offset) {
+        return ArgCallback{reinterpret_cast<void (*)()>(fn_ptr), state_offset, true};
+    }
 
     using Callback::EmitCall;
 
@@ -61,6 +65,7 @@ public:
 private:
     void (*fn)();
     u64 arg;
+    bool from_jit_state = false;
 };
 
 }  // namespace Dynarmic::Backend::X64

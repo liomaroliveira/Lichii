@@ -56,6 +56,17 @@ struct A64JitState {
     std::array<u64, RSB_SIZE> rsb_location_descriptors;
     std::array<u64, RSB_SIZE> rsb_codeptrs;
 
+    // Per-core runtime state accessed via R15 so shared JIT code stays core-independent
+    void* callbacks = nullptr;
+    const u64* tpidrro_el0 = nullptr;
+    u64* tpidr_el0 = nullptr;
+    void* jit_impl = nullptr;
+    void* global_monitor = nullptr;
+    void* exclusive_address_ptr = nullptr;
+    void* exclusive_value_ptr = nullptr;
+    void* fast_dispatch_table = nullptr;
+    u64 processor_id = 0;
+
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);
     }
