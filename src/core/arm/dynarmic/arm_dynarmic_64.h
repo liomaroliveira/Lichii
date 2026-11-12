@@ -102,6 +102,7 @@ public:
     void SignalInterrupt(Kernel::KThread* thread) override;
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
+    void PrepareForShutdown() override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;

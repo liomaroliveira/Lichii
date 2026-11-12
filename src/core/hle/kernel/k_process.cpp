@@ -133,6 +133,12 @@ void KProcess::Finalize(KernelCore& kernel) {
     // Get the used memory size.
     const size_t used_memory_size = this->GetUsedNonSystemUserPhysicalMemorySize(kernel);
 
+    for (auto& interface : m_arm_interfaces) {
+        if (interface) {
+            interface->PrepareForShutdown();
+        }
+    }
+
     // Finalize the page table.
     m_page_table.Finalize();
 

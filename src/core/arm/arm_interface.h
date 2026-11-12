@@ -100,6 +100,7 @@ public:
     // Debug functionality.
     virtual const Kernel::DebugWatchpoint* HaltedWatchpoint() const = 0;
     virtual void RewindBreakpointInstruction() = 0;
+    virtual void PrepareForShutdown() {}
 
 protected:
     const Kernel::DebugWatchpoint* MatchingWatchpoint(
