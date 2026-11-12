@@ -222,8 +222,10 @@ void A64EmitX64::ClearCache() {
     fastmem_lock.clear(std::memory_order_release);
 }
 
-void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+std::vector<IR::LocationDescriptor> A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+    std::vector<IR::LocationDescriptor> invalidated;
+    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges), &invalidated, !shared_mode);
+    return invalidated;
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
@@ -232,9 +234,10 @@ void A64EmitX64::ClearFastDispatchTable() {
     }
 }
 
-bool A64EmitX64::DrainPendingFastmemRecompiles() {
+std::vector<IR::LocationDescriptor> A64EmitX64::DrainPendingFastmemRecompiles() {
+    std::vector<IR::LocationDescriptor> invalidated;
     if (!has_pending_fastmem_recompiles.load(std::memory_order_acquire)) {
-        return false;
+        return invalidated;
     }
     std::vector<DoNotFastmemMarker> markers;
     while (fastmem_lock.test_and_set(std::memory_order_acquire)) {
@@ -243,15 +246,15 @@ bool A64EmitX64::DrainPendingFastmemRecompiles() {
     has_pending_fastmem_recompiles.store(false, std::memory_order_release);
     fastmem_lock.clear(std::memory_order_release);
     if (markers.empty()) {
-        return false;
+        return invalidated;
     }
     ::Common::unordered_set<IR::LocationDescriptor> to_invalidate;
     for (const auto& m : markers) {
         do_not_fastmem.insert(m);
         to_invalidate.insert(std::get<0>(m));
     }
-    InvalidateBasicBlocks(to_invalidate);
-    return true;
+    InvalidateBasicBlocks(to_invalidate, &invalidated, !shared_mode);
+    return invalidated;
 }
 
 void A64EmitX64::GenTerminalHandlers() {
@@ -326,11 +329,46 @@ void A64EmitX64::GenTerminalHandlers() {
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+
+        code.align();
+        shared_fast_dispatch_lookup = code.getCurr<FastDispatchEntry& (*)(u64, FastDispatchEntry*)>();
+        if (code.HasHostFeature(HostFeature::SSE42)) {
+            code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
+        }
+        code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
+        code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
+        code.ret();
+        PerfMapRegister(shared_fast_dispatch_lookup, code.getCurr(), "a64_shared_fast_dispatch_lookup");
     }
 }
 
 void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+        return;
+    }
+    if (shared_mode) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        ASSERT(args[0].IsImmediate());
+        const IR::LocationDescriptor target{args[0].GetImmediateU64()};
+
+        ctx.reg_alloc.ScratchGpr(code, HostLoc::RCX);
+        const Xbyak::Reg64 loc_desc_reg = ctx.reg_alloc.ScratchGpr(code);
+        const Xbyak::Reg64 index_reg = ctx.reg_alloc.ScratchGpr(code);
+
+        auto* slot = AllocSharedPatchSlot(target);
+        slot->stub = code.GetReturnFromRunCodeAddress();
+        const auto next_bb = GetBasicBlock(target);
+        slot->target.store(next_bb ? next_bb->entrypoint : slot->stub, std::memory_order_relaxed);
+
+        code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+        code.mov(loc_desc_reg, target.Value());
+        code.mov(rcx, u64(&slot->target));
+        code.mov(rcx, qword[rcx]);
+        code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + offsetof(A64JitState, rsb_location_descriptors)], loc_desc_reg);
+        code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + offsetof(A64JitState, rsb_codeptrs)], rcx);
+        code.add(index_reg.cvt32(), 1);
+        code.and_(index_reg.cvt32(), u32(A64JitState::RSB_PTR_MASK));
+        code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], index_reg.cvt32());
         return;
     }
 

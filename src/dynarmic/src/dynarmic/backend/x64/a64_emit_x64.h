@@ -57,8 +57,8 @@ public:
 
     void ClearCache() override;
 
-    void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
-    bool DrainPendingFastmemRecompiles();
+    std::vector<IR::LocationDescriptor> InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+    std::vector<IR::LocationDescriptor> DrainPendingFastmemRecompiles();
     bool HasPendingFastmemRecompiles() const noexcept { return has_pending_fastmem_recompiles.load(std::memory_order_acquire); }
     bool IsSharedMode() const noexcept { return shared_mode; }
 
@@ -165,6 +165,7 @@ public:
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+    FastDispatchEntry& (*shared_fast_dispatch_lookup)(u64, FastDispatchEntry*) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
     void (*memory_write_128)() = nullptr;
