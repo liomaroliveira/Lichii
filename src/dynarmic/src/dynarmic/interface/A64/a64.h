@@ -11,7 +11,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,10 @@ namespace A64 {
 
 /// Creates a code cache that can be shared across multiple A64::Jit instances of the same process.
 std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf);
+void ConfigureSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache,
+                            std::string cache_path,
+                            std::function<std::optional<std::uint32_t>(std::uint64_t)> read_code);
+void ShutdownSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache);
 
 class Jit final {
 public:
