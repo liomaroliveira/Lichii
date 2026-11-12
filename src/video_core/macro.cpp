@@ -1438,6 +1438,24 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
                     if (VideoCommon::Nx2Profile::Enabled()) {
                         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+                        u8 writer = 0;
+                        const auto& writers = VideoCommon::Nx2Profile::QueryWriters();
+                        for (GPUVAddr block = source >> 5; block <= (source + read_bytes - 1) >> 5; ++block) {
+                            if (const auto it = writers.find(block); it != writers.end()) {
+                                writer = std::max(writer, it->second);
+                            }
+                        }
+                        VideoCommon::Nx2Profile::Add(
+                            writer == 3   ? VideoCommon::Nx2Profile::Counter::DmaReadsFromCbUpload
+                            : writer == 1 ? VideoCommon::Nx2Profile::Counter::DmaReadsFromStageA
+                            : writer == 2 ? VideoCommon::Nx2Profile::Counter::DmaReadsFromStageB
+                                          : VideoCommon::Nx2Profile::Counter::DmaReadsOther,
+                            1);
+                        if (writer == 0 &&
+                            (VideoCommon::Nx2Profile::DmaEnginePages().contains(source >> 12) ||
+                             VideoCommon::Nx2Profile::DmaEnginePages().contains((source + read_bytes - 1) >> 12))) {
+                            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsFromDmaEngine, 1);
+                        }
                         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
                             if (const auto device = memory.GpuToCpuAddress(page)) {
                                 VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);

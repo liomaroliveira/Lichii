@@ -768,6 +768,13 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
                                                       values.data(), bytes)) {
         memory_manager.WriteWordsCached(address + offset, values.data(), count);
     }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        // TEST (E04.T3 reopen): constant buffer uploads tagged 3 (stage B in the T2 design).
+        const GPUVAddr first = address + offset;
+        for (GPUVAddr block = first >> 5; block <= (first + count * 4 - 1) >> 5; ++block) {
+            VideoCommon::Nx2Profile::QueryWriters()[block] = 3;
+        }
+    }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
@@ -919,6 +926,9 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
     } else {
         memory_manager.Write<u32>(sequence_address, static_cast<u32>(payload));
     }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 1;
+    }
     if (const u64 trace = VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::Write)) {
         LOG_INFO(HW_GPU,
                  "DKB_QUERY write n={} path=stamp as={} gpu={:#x} bytes={} value={:#x}",
@@ -950,6 +960,9 @@ void Maxwell3D::ProcessQueryGet() {
         if (regs.report_semaphore.query.short_query != 0) {
             flags |= VideoCommon::QueryPropertiesFlags::IsAFence;
         }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
+        }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
@@ -958,6 +971,9 @@ void Maxwell3D::ProcessQueryGet() {
         UNIMPLEMENTED_MSG("Unimplemented query operation ACQUIRE");
         break;
     case Regs::ReportSemaphore::Operation::ReportOnly:
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
+        }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Trap:
@@ -1165,6 +1181,11 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
         if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address, start_base,
                                                           write_size)) {
             memory_manager.WriteBlockCached(address, start_base, write_size);
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            for (GPUVAddr block = address >> 5; block <= (address + write_size - 1) >> 5; ++block) {
+                VideoCommon::Nx2Profile::QueryWriters()[block] = 3;
+            }
         }
     }
     if (write_size != copy_size) {

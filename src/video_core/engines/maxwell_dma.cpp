@@ -142,6 +142,16 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 
 void MaxwellDMA::Launch() {
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaLaunches, 1);
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        const GPUVAddr out = regs.offset_out;
+        const u64 bytes = std::min<u64>(
+            regs.launch_dma.multi_line_enable ? static_cast<u64>(static_cast<u32>(regs.pitch_out)) * regs.line_count
+                                              : u64{regs.line_length_in},
+            u64{64} << 20);
+        for (GPUVAddr page = out >> 12; page <= (out + std::max<u64>(bytes, 1) - 1) >> 12; ++page) {
+            VideoCommon::Nx2Profile::DmaEnginePages().insert(page);
+        }
+    }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {
