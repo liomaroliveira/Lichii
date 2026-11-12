@@ -44,6 +44,9 @@ public:
     void CreateAndInsertByFrontendAppletParameters(std::unique_ptr<Process> process,
                                                    const FrontendAppletParameters& params);
     void RequestExit();
+    /// At shutdown: releases the process AM never took (the boot closed before AM started), while
+    /// the kernel that owns it still runs. The next boot would otherwise free it into its own.
+    void DropPendingProcess();
     void OperationModeChanged();
 
 public:

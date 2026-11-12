@@ -612,6 +612,7 @@ struct System::Impl {
             service_manager->Close();
         }
         kernel.CloseServices();
+        applet_manager.DropPendingProcess();
         kernel.ShutdownCores();
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.

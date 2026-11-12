@@ -240,6 +240,19 @@ void AppletManager::CreateAndInsertByFrontendAppletParameters(
     m_cv.notify_all();
 }
 
+void AppletManager::DropPendingProcess() {
+    std::unique_ptr<Process> process;
+    {
+        // Not waited for: AM holds the lock while it takes the process, so it is gone then.
+        std::unique_lock lk{m_lock, std::try_to_lock};
+        if (!lk.owns_lock() || !m_pending_process) {
+            return;
+        }
+        process = std::move(m_pending_process);
+    }
+    LOG_INFO(Service_AM, "Releasing the application process AM never started");
+}
+
 void AppletManager::RequestExit() {
     std::scoped_lock lk{m_lock};
     if (m_window_system) {
