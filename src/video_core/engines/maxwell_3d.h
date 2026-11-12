@@ -91,6 +91,10 @@ public:
     void SplitSendStateCheck();
     void SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer);
     void SplitSendRootLoad(u32 table, u32 index, u32 value);
+    /// E04.T6 step 3, stage A before a draw: the draw state, engine hint and HLE replacement
+    /// table the rasterizer reads, for GPUBackB's shadow.
+    void SplitSendDraw();
+    void SplitSendDrawTexture();
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {

@@ -1173,6 +1173,63 @@ struct SplitStateCheckPacket {
     bool loaded;
 };
 
+constexpr size_t SplitMaxReplacements = 8;
+struct SplitDrawPacket {
+    Maxwell3D* shadow;
+    Maxwell3D::Regs::PrimitiveTopology topology;
+    Maxwell3D::DrawManager::DrawMode draw_mode;
+    u32 draw_element_count;
+    u32 base_index;
+    Maxwell3D::Regs::VertexBuffer vertex_buffer;
+    Maxwell3D::Regs::IndexBuffer index_buffer;
+    u32 base_instance;
+    u32 instance_count;
+    u32 drawn_instances;
+    Maxwell3D::DrawManager::IndirectParams indirect;
+    Maxwell3D::EngineHint engine_state;
+    u32 replacements;
+    std::array<std::pair<u64, Maxwell3D::HLEReplacementAttributeType>, SplitMaxReplacements>
+        replace;
+    u32 inline_bytes;
+    bool draw_indexed;
+    // Followed by inline_bytes of inline_index_draw_indexes.
+};
+std::atomic<u64> g_split_replace_overflow{0};
+
+void SplitApplyDraw(const u64* payload) {
+    SplitDrawPacket packet;
+    std::memcpy(&packet, payload, sizeof(packet));
+    Maxwell3D& shadow = *packet.shadow;
+    auto& state = shadow.draw_manager.draw_state;
+    state.topology = packet.topology;
+    state.draw_mode = packet.draw_mode;
+    state.draw_indexed = packet.draw_indexed;
+    state.draw_element_count = packet.draw_element_count;
+    state.base_index = packet.base_index;
+    state.vertex_buffer = packet.vertex_buffer;
+    state.index_buffer = packet.index_buffer;
+    state.base_instance = packet.base_instance;
+    state.instance_count = packet.instance_count;
+    state.drawn_instances = packet.drawn_instances;
+    const auto* bytes = reinterpret_cast<const u8*>(payload) + sizeof(SplitDrawPacket);
+    state.inline_index_draw_indexes.assign(bytes, bytes + packet.inline_bytes);
+    shadow.draw_manager.indirect_state = packet.indirect;
+    shadow.engine_state = packet.engine_state;
+    if (packet.replacements != 0 || !shadow.replace_table.empty()) [[unlikely]] {
+        shadow.replace_table.clear();
+        for (u32 i = 0; i < packet.replacements; ++i) {
+            shadow.replace_table.emplace(packet.replace[i].first, packet.replace[i].second);
+        }
+    }
+}
+
+void SplitApplyDrawTexture(const u64* payload) {
+    Maxwell3D* shadow;
+    std::memcpy(&shadow, payload, sizeof(shadow));
+    std::memcpy(&shadow->draw_manager.draw_texture_state, payload + 1,
+                sizeof(Maxwell3D::DrawManager::DrawTextureState));
+}
+
 void SplitApplyCbBind(const u64* payload) {
     SplitCbBindPacket packet;
     std::memcpy(&packet, payload, sizeof(packet));
@@ -1247,6 +1304,59 @@ void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& b
 void Maxwell3D::SplitSendRootLoad(u32 table, u32 index, u32 value) {
     const SplitRootLoadPacket packet{split_engine, table, index, value};
     VideoCommon::BackSplit::EmitTask(&SplitApplyRootLoad, &packet, sizeof(packet));
+}
+
+void Maxwell3D::SplitSendDraw() {
+    if (split_engine == nullptr) {
+        return;
+    }
+    const auto& state = draw_manager.draw_state;
+    SplitDrawPacket packet{};
+    packet.shadow = split_engine;
+    packet.topology = state.topology;
+    packet.draw_mode = state.draw_mode;
+    packet.draw_indexed = state.draw_indexed;
+    packet.draw_element_count = state.draw_element_count;
+    packet.base_index = state.base_index;
+    packet.vertex_buffer = state.vertex_buffer;
+    packet.index_buffer = state.index_buffer;
+    packet.base_instance = state.base_instance;
+    packet.instance_count = state.instance_count;
+    packet.drawn_instances = state.drawn_instances;
+    packet.indirect = draw_manager.indirect_state;
+    packet.engine_state = engine_state;
+    for (const auto& [key, type] : replace_table) {
+        if (packet.replacements == SplitMaxReplacements) {
+            if (g_split_replace_overflow.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_ERROR(HW_GPU, "Nx2BackSplit: more than {} HLE replacements, the shadow drops some",
+                          SplitMaxReplacements);
+            }
+            break;
+        }
+        packet.replace[packet.replacements++] = {key, type};
+    }
+    const auto& indexes = state.inline_index_draw_indexes;
+    packet.inline_bytes = static_cast<u32>(indexes.size());
+    if (indexes.empty()) [[likely]] {
+        VideoCommon::BackSplit::EmitTask(&SplitApplyDraw, &packet, sizeof(packet));
+        return;
+    }
+    // Rare (inline index draws): the ring holds 8 MiB; GPUBackB waits for none of it.
+    ASSERT(indexes.size() < (VideoCommon::BackSplit::RingWords * sizeof(u64)) / 4);
+    std::vector<u8> data(sizeof(packet) + indexes.size());
+    std::memcpy(data.data(), &packet, sizeof(packet));
+    std::memcpy(data.data() + sizeof(packet), indexes.data(), indexes.size());
+    VideoCommon::BackSplit::EmitTask(&SplitApplyDraw, data.data(), data.size());
+}
+
+void Maxwell3D::SplitSendDrawTexture() {
+    if (split_engine == nullptr) {
+        return;
+    }
+    std::array<u64, 1 + (sizeof(DrawManager::DrawTextureState) + 7) / 8> data{};
+    std::memcpy(&data[0], &split_engine, sizeof(split_engine));
+    std::memcpy(&data[1], &draw_manager.draw_texture_state, sizeof(DrawManager::DrawTextureState));
+    VideoCommon::BackSplit::EmitTask(&SplitApplyDrawTexture, data.data(), sizeof(data));
 }
 
 void Maxwell3D::SplitSendStateCheck() {
