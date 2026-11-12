@@ -3,12 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 #include <thread>
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -67,12 +70,35 @@ enum class Kind : u8 {
     Query = 8,
     /// E04.T6: a call GPUBackB runs in ring order, without stage A waiting (aux = payload words).
     Task = 9,
+    /// E04.T6 step 2: the Maxwell3D whose register deltas follow (aux 0, word 1 = engine).
+    Bind = 10,
+    /// E04.T6 step 2: an engine's whole register file (word 1 = engine, aux = SnapshotInit or
+    /// SnapshotCheck). Init seeds GPUBackB's shadow; Check compares it with the shadow.
+    Snapshot = 11,
 };
+
+constexpr u32 SnapshotInit = 0;
+constexpr u32 SnapshotCheck = 1;
 
 constexpr size_t RegCount = 0xE00;
 constexpr size_t RingWords = size_t{1} << 20; // 8 MiB SPSC ring
 constexpr size_t RingMask = RingWords - 1;
 constexpr u64 PublishBatchWords = 4096;
+constexpr size_t SnapshotWords = 2 + RegCount / 2;
+
+/// Draws between two shadow checks (EDEN_NX2_BACK_SPLIT_CHECK; 0 = no checks). Power of two.
+inline u32 g_check_mask = [] {
+    const char* value = std::getenv("EDEN_NX2_BACK_SPLIT_CHECK");
+    u32 every = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 256U;
+    if (every == 0) {
+        return ~0U;
+    }
+    u32 pow2 = 1;
+    while (pow2 < every) {
+        pow2 <<= 1;
+    }
+    return pow2 - 1;
+}();
 
 inline constexpr u64 MakeHeader(Kind kind, u32 aux = 0) noexcept {
     return (static_cast<u64>(kind) << 12) | (u64{aux} << 16);
@@ -105,6 +131,10 @@ inline constexpr size_t PacketWords(u64 word0) noexcept {
         return 4;
     case Kind::Task:
         return 2 + static_cast<size_t>(aux);
+    case Kind::Bind:
+        return 2;
+    case Kind::Snapshot:
+        return SnapshotWords;
     }
     return 1;
 }
@@ -178,14 +208,30 @@ public:
         }
     }
 
-    void PushReg(u32 method, u32 argument) {
+    /// `engine` is the Maxwell3D writing, `regs` its register file before this write.
+    void PushReg(const void* engine, const u32* regs, u32 method, u32 argument) {
         if (method >= RegCount) [[unlikely]] {
             return;
+        }
+        if (engine != a_engine) [[unlikely]] {
+            BindEngine(engine, regs);
         }
         u64* dst = Reserve(1);
         dst[0] = (u64{argument} << 32) | u64{method};
         Commit(1);
         ++stat_delta_regs;
+    }
+
+    /// Stage A, on each draw: every (mask + 1) draws, sends the drawing engine's registers for
+    /// GPUBackB to compare with its shadow.
+    void MaybeCheck(const void* engine, const u32* regs) {
+        if ((++a_draws & g_check_mask) != 0) [[likely]] {
+            return;
+        }
+        if (engine != a_engine) {
+            BindEngine(engine, regs);
+        }
+        PushSnapshot(engine, regs, SnapshotCheck);
     }
 
     void PushCbUpload(u64 gpu_addr, const u32* data, u32 count) {
@@ -265,6 +311,29 @@ public:
         ++stat_packets;
     }
 
+    void BindEngine(const void* engine, const u32* regs) {
+        a_engine = engine;
+        for (const void* known : a_known) {
+            if (known == engine) {
+                u64* dst = Reserve(2);
+                dst[0] = MakeHeader(Kind::Bind, 0);
+                dst[1] = reinterpret_cast<u64>(engine);
+                Commit(2);
+                return;
+            }
+        }
+        a_known.push_back(engine);
+        PushSnapshot(engine, regs, SnapshotInit);
+    }
+
+    void PushSnapshot(const void* engine, const u32* regs, u32 kind) {
+        u64* dst = Reserve(SnapshotWords);
+        dst[0] = MakeHeader(Kind::Snapshot, kind);
+        dst[1] = reinterpret_cast<u64>(engine);
+        std::memcpy(dst + 2, regs, RegCount * sizeof(u32));
+        Commit(SnapshotWords);
+    }
+
     void MaybeReport() {
         const u64 now = NowNs();
         if (last_report_ns == 0) {
@@ -289,6 +358,15 @@ public:
                  static_cast<double>(g_calls.exchange(0, std::memory_order_relaxed)) / sec,
                  static_cast<double>(g_deferred.exchange(0, std::memory_order_relaxed)) / sec,
                  static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec);
+        LOG_INFO(HW_GPU,
+                 "Nx2BackSplit shadow: engines {}, checks {}, diverged checks {}, diverged regs {} "
+                 "(total since boot: checks {}, diverged checks {})",
+                 b_engines.load(std::memory_order_relaxed),
+                 b_checks.exchange(0, std::memory_order_relaxed),
+                 b_bad_checks.exchange(0, std::memory_order_relaxed),
+                 b_bad_regs.exchange(0, std::memory_order_relaxed),
+                 b_checks_total.load(std::memory_order_relaxed),
+                 b_bad_checks_total.load(std::memory_order_relaxed));
         stat_async = 0;
         stat_drains = 0;
         if (report_hook != nullptr) {
@@ -454,8 +532,22 @@ private:
                 const size_t words = PacketWords(word0);
                 if (words == 0) {
                     read_pos += RingWords - index;
+                } else if ((word0 & 0xf000U) == 0) {
+                    // RegDelta: bits 0..11 register, 32..63 value.
+                    if (b_regs != nullptr) [[likely]] {
+                        b_regs[word0 & 0xfffU] = static_cast<u32>(word0 >> 32);
+                    }
+                    read_pos += 1;
                 } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Task)) {
                     reinterpret_cast<AsyncFn>(ring[index + 1])(&ring[index + 2]);
+                    read_pos += words;
+                } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Bind)) {
+                    b_regs = ShadowOf(reinterpret_cast<const void*>(ring[index + 1]));
+                    read_pos += words;
+                } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Snapshot)) {
+                    OnSnapshot(reinterpret_cast<const void*>(ring[index + 1]),
+                               static_cast<u32>(word0 >> 16),
+                               reinterpret_cast<const u32*>(&ring[index + 2]));
                     read_pos += words;
                 } else {
                     for (size_t i = 0; i < words; ++i) {
@@ -483,6 +575,49 @@ private:
         consumer_sink.store(sink, std::memory_order_relaxed);
     }
 
+    /// GPUBackB: the shadow register file of `engine`, created on first use.
+    u32* ShadowOf(const void* engine) {
+        auto& slot = b_shadows[engine];
+        if (!slot) {
+            slot = std::make_unique<u32[]>(RegCount);
+            b_engines.store(b_shadows.size(), std::memory_order_relaxed);
+        }
+        return slot.get();
+    }
+
+    /// GPUBackB: seeds (init) or checks (check) the shadow of `engine` against stage A's
+    /// registers; a check logs each register's first divergence and then takes A's values.
+    void OnSnapshot(const void* engine, u32 kind, const u32* a_regs) {
+        u32* const shadow = ShadowOf(engine);
+        b_regs = shadow;
+        if (kind == SnapshotCheck) {
+            b_checks.fetch_add(1, std::memory_order_relaxed);
+            b_checks_total.fetch_add(1, std::memory_order_relaxed);
+            if (std::memcmp(shadow, a_regs, RegCount * sizeof(u32)) != 0) [[unlikely]] {
+                u32 bad = 0;
+                for (u32 reg = 0; reg < RegCount; ++reg) {
+                    if (shadow[reg] == a_regs[reg]) {
+                        continue;
+                    }
+                    ++bad;
+                    if (!b_reported[reg] && b_report_lines < 128) {
+                        b_reported[reg] = true;
+                        ++b_report_lines;
+                        LOG_WARNING(HW_GPU,
+                                    "Nx2BackSplit shadow diverged: check {}, engine {}, reg {:#x} "
+                                    "A={:#x} B={:#x}",
+                                    b_checks_total.load(std::memory_order_relaxed), engine, reg,
+                                    a_regs[reg], shadow[reg]);
+                    }
+                }
+                b_bad_checks.fetch_add(1, std::memory_order_relaxed);
+                b_bad_checks_total.fetch_add(1, std::memory_order_relaxed);
+                b_bad_regs.fetch_add(bad, std::memory_order_relaxed);
+            }
+        }
+        std::memcpy(shadow, a_regs, RegCount * sizeof(u32));
+    }
+
     std::atomic<bool> starting{false};
     std::atomic<bool> started{false};
     std::unique_ptr<u64[]> ring;
@@ -502,6 +637,21 @@ private:
     u64 stat_async = 0;
     u64 stat_drains = 0;
     bool async_pending = false;
+    // Stage A: the engine the deltas belong to, the engines GPUBackB has a shadow of, draws.
+    const void* a_engine{};
+    std::vector<const void*> a_known;
+    u32 a_draws = 0;
+    // GPUBackB: the shadow of the bound engine and every engine's shadow (E04.T6 step 2).
+    u32* b_regs{};
+    std::unordered_map<const void*, std::unique_ptr<u32[]>> b_shadows;
+    std::array<bool, RegCount> b_reported{};
+    u32 b_report_lines = 0;
+    std::atomic<u64> b_engines{0};
+    std::atomic<u64> b_checks{0};
+    std::atomic<u64> b_bad_checks{0};
+    std::atomic<u64> b_bad_regs{0};
+    std::atomic<u64> b_checks_total{0};
+    std::atomic<u64> b_bad_checks_total{0};
     u64 task_posted = 0;
     TaskFn task_fn{};
     void* task_arg{};
@@ -522,8 +672,13 @@ private:
 
 inline RingState g_state;
 
-inline void EmitReg(u32 method, u32 argument) {
-    g_state.PushReg(method, argument);
+inline void EmitReg(const void* engine, const u32* regs, u32 method, u32 argument) {
+    g_state.PushReg(engine, regs, method, argument);
+}
+
+/// Stage A, at each draw of `engine` (E04.T6 step 2 shadow check).
+inline void CheckRegs(const void* engine, const u32* regs) {
+    g_state.MaybeCheck(engine, regs);
 }
 
 inline void EmitCbUpload(u64 gpu_addr, const u32* data, u32 count) {
