@@ -117,6 +117,12 @@ public:
     static void MarkGpuThread() {
         on_gpu_thread = true;
     }
+    /// E04.T6: GPUBackB, which owns the rasterizer, is a back thread too.
+    static void MarkBackThread() {
+        on_back_thread = true;
+    }
+    /// Runs a hook of the back (idle, tick) on the thread that owns the rasterizer.
+    static void CallHook(void (*hook)(void*), void* argument);
     [[nodiscard]] static bool OwnsScheduler() {
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
     }
@@ -711,7 +717,7 @@ private:
         if (tick_requested.load(std::memory_order_relaxed) &&
             tick_requested.exchange(false, std::memory_order_acq_rel) && tick_hook != nullptr)
             [[unlikely]] {
-            tick_hook(tick_argument);
+            CallHook(tick_hook, tick_argument);
         }
     }
 

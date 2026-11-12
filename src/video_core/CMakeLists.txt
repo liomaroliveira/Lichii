@@ -107,6 +107,9 @@ add_library(video_core STATIC
     gpu_timestamp.h
     gpu_split.cpp
     gpu_split.h
+    nx2_back_split.h
+    nx2_back_split_rasterizer.cpp
+    nx2_back_split_rasterizer.h
     gpu_thread.cpp
     gpu_thread.h
     gpu_wait_stats.h

@@ -14,6 +14,10 @@
 #include "common/logging.h"
 #include "common/thread.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 namespace VideoCommon::BackSplit {
 
 inline bool g_enabled = [] {
@@ -24,6 +28,30 @@ inline bool g_enabled = [] {
 /// Enables the Stage A -> Stage B SPSC prototype ring (E04.T5+).
 inline bool Enabled() noexcept {
     return g_enabled;
+}
+
+/// E04.T6: set on GPUBackB, the thread that owns the rasterizer with the split on.
+inline thread_local bool t_on_b{};
+
+/// Whether the calling thread is GPUBackB.
+inline bool OnB() noexcept {
+    return t_on_b;
+}
+
+/// GPUBackB, once at its start: marks it as a back thread for GpuSplit (OnBackThread and
+/// OwnsScheduler hold on both stages). Defined in nx2_back_split_rasterizer.cpp.
+void OnBThreadStart();
+
+/// Counters the A side keeps for the report (Call entries and deferred map/unmap closures).
+inline std::atomic<u64> g_calls{};
+inline std::atomic<u64> g_deferred{};
+
+inline void CpuPause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
 }
 
 // Bits 0..11 store register index (< 0xE00) when bits 12..15 == 0; commands use kinds 1..8 << 12.
@@ -89,6 +117,33 @@ public:
             return;
         }
         StartSlow();
+    }
+
+    using TaskFn = void (*)(void*);
+
+    /// Stage A: runs fn(arg) on GPUBackB after the ring entries sent so far, and waits for it
+    /// (E04.T6 locked mode).
+    void RunOnB(TaskFn fn, void* arg) {
+        EnsureStarted();
+        PublishNow();
+        task_fn = fn;
+        task_arg = arg;
+        const u64 seq = ++task_posted;
+        task_seq.store(seq, std::memory_order_seq_cst);
+        WakeConsumer();
+        ++stat_run_on_b;
+        for (u32 spin = 0; task_done.load(std::memory_order_acquire) != seq; ++spin) {
+            if (spin < 1U << 16) {
+                CpuPause();
+                continue;
+            }
+            ++stat_run_sleeps;
+            a_waiting.store(true, std::memory_order_seq_cst);
+            if (task_done.load(std::memory_order_seq_cst) != seq) {
+                task_done.wait(seq - 1, std::memory_order_seq_cst);
+            }
+            a_waiting.store(false, std::memory_order_relaxed);
+        }
     }
 
     void PushReg(u32 method, u32 argument) {
@@ -191,18 +246,30 @@ public:
         last_report_ns = now;
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit: cmds {:.0f}/s, delta_regs {:.0f}/s, cb_words {:.0f}/s, "
-                 "words {:.0f}/s, A_stalls {}",
+                 "words {:.0f}/s, A_stalls {}, run_on_b {:.0f}/s, run_sleeps {}, b_sleeps {}, "
+                 "calls {:.0f}/s, deferred {:.0f}/s",
                  static_cast<double>(stat_packets) / sec,
                  static_cast<double>(stat_delta_regs) / sec,
                  static_cast<double>(stat_cb_words) / sec,
                  static_cast<double>(write_position - last_report_words) / sec,
-                 stat_stalls);
+                 stat_stalls, static_cast<double>(stat_run_on_b) / sec, stat_run_sleeps,
+                 b_sleeps.exchange(0, std::memory_order_relaxed),
+                 static_cast<double>(g_calls.exchange(0, std::memory_order_relaxed)) / sec,
+                 static_cast<double>(g_deferred.exchange(0, std::memory_order_relaxed)) / sec);
+        if (report_hook != nullptr) {
+            report_hook(sec);
+        }
+        stat_run_on_b = 0;
+        stat_run_sleeps = 0;
         last_report_words = write_position;
         stat_packets = 0;
         stat_delta_regs = 0;
         stat_cb_words = 0;
         stat_stalls = 0;
     }
+
+    /// Extra lines for the report (the rasterizer proxy's per-call counts).
+    void (*report_hook)(double seconds){};
 
 private:
     void StartSlow() {
@@ -315,19 +382,30 @@ private:
         Common::SetCurrentThreadName("GPUBackB");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
+        t_on_b = true;
+        OnBThreadStart();
         u64 read_pos = 0;
         u64 sink = 0;
+        u64 done = 0;
         while (!stop_token.stop_requested()) {
+            // The task first: A published its ring entries before posting it.
+            u64 task = task_seq.load(std::memory_order_acquire);
             u64 available = published.load(std::memory_order_acquire);
-            if (available == read_pos) {
-                for (u32 spin = 0; spin < 2048 && available == read_pos; ++spin) {
+            if (available == read_pos && task == done) {
+                // Locked mode: A posts a task every few microseconds; stay awake (~50-100 us).
+                for (u32 spin = 0; spin < 4096 && available == read_pos && task == done;
+                     ++spin) {
+                    CpuPause();
+                    task = task_seq.load(std::memory_order_acquire);
                     available = published.load(std::memory_order_acquire);
                 }
-                if (available == read_pos) {
+                if (available == read_pos && task == done) {
                     consumer_waiting.store(true, std::memory_order_seq_cst);
                     const u32 seen = consumer_wake.load(std::memory_order_seq_cst);
+                    task = task_seq.load(std::memory_order_seq_cst);
                     available = published.load(std::memory_order_seq_cst);
-                    if (available == read_pos && !stop_token.stop_requested()) {
+                    if (available == read_pos && task == done && !stop_token.stop_requested()) {
+                        b_sleeps.fetch_add(1, std::memory_order_relaxed);
                         consumer_wake.wait(seen, std::memory_order_seq_cst);
                     }
                     consumer_waiting.store(false, std::memory_order_relaxed);
@@ -355,6 +433,14 @@ private:
             }
             consumed.store(read_pos, std::memory_order_release);
             NotifyProducer();
+            if (task != done) {
+                task_fn(task_arg);
+                done = task;
+                task_done.store(task, std::memory_order_seq_cst);
+                if (a_waiting.load(std::memory_order_seq_cst)) {
+                    task_done.notify_one();
+                }
+            }
         }
         consumer_sink.store(sink, std::memory_order_relaxed);
     }
@@ -373,6 +459,11 @@ private:
     u64 stat_delta_regs = 0;
     u64 stat_cb_words = 0;
     u64 stat_stalls = 0;
+    u64 stat_run_on_b = 0;
+    u64 stat_run_sleeps = 0;
+    u64 task_posted = 0;
+    TaskFn task_fn{};
+    void* task_arg{};
 
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
@@ -380,6 +471,10 @@ private:
     alignas(64) std::atomic<bool> consumer_waiting{false};
     alignas(64) std::atomic<u32> producer_wake{0};
     alignas(64) std::atomic<bool> producer_waiting{false};
+    alignas(64) std::atomic<u64> task_seq{0};
+    alignas(64) std::atomic<u64> task_done{0};
+    alignas(64) std::atomic<bool> a_waiting{false};
+    std::atomic<u64> b_sleeps{0};
     std::atomic<u64> consumer_sink{0};
     std::jthread consumer;
 };
@@ -416,6 +511,10 @@ inline void EmitInlineUpload(u64 dst_addr, const void* data, size_t bytes) {
 
 inline void EmitQuery(u64 gpu_addr, u64 payload, u64 meta) {
     g_state.PushQuery(gpu_addr, payload, meta);
+}
+
+inline void RunOnB(RingState::TaskFn fn, void* arg) {
+    g_state.RunOnB(fn, arg);
 }
 
 inline void MaybeReport() {

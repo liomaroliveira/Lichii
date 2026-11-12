@@ -43,6 +43,8 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_back_split.h"
+#include "video_core/nx2_back_split_rasterizer.h"
 #include "video_core/nx2_read_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
@@ -78,7 +80,7 @@ struct GPU::Impl {
             ASSERT(it != channels.end());
             bound_channel = channel_id;
             current_channel = it->second.get();
-            renderer->ReadRasterizer()->BindChannel(*current_channel);
+            Rasterizer()->BindChannel(*current_channel);
         }
     }
 
@@ -88,12 +90,12 @@ struct GPU::Impl {
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
         to_init.Init(system, program_id);
-        to_init.BindRasterizer(renderer->ReadRasterizer());
-        renderer->ReadRasterizer()->InitializeChannel(to_init);
+        to_init.BindRasterizer(Rasterizer());
+        Rasterizer()->InitializeChannel(to_init);
     }
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {
-        memory_manager.BindRasterizer(renderer->ReadRasterizer());
+        memory_manager.BindRasterizer(Rasterizer());
     }
 
     void ReleaseChannel(Control::ChannelState& to_release) {
@@ -103,13 +105,17 @@ struct GPU::Impl {
     /// Binds a renderer to the GPU.
     void BindRenderer(std::unique_ptr<VideoCore::RendererBase> renderer_) {
         renderer = std::move(renderer_);
-        system.Host1x().memory_manager.BindInterface(renderer->ReadRasterizer());
-        system.Host1x().gmmu_manager.BindRasterizer(renderer->ReadRasterizer());
+        if (VideoCommon::BackSplit::Enabled()) {
+            back_split_proxy =
+                std::make_unique<VideoCommon::BackSplit::RasterizerProxy>(*renderer->ReadRasterizer());
+        }
+        system.Host1x().memory_manager.BindInterface(Rasterizer());
+        system.Host1x().gmmu_manager.BindRasterizer(Rasterizer());
     }
 
     /// Flush all current written commands into the host GPU for execution.
     void FlushCommands() {
-        renderer->ReadRasterizer()->FlushCommands();
+        Rasterizer()->FlushCommands();
     }
 
     /// Synchronizes CPU writes with Host GPU memory.
@@ -134,7 +140,7 @@ struct GPU::Impl {
             std::scoped_lock lock{applying_writes_mutex};
             std::erase(applying_writes, &writes);
         };
-        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        Rasterizer()->OnCacheInvalidations(writes);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -151,7 +157,7 @@ struct GPU::Impl {
 
     /// Signal the ending of command list.
     void OnCommandListEnd() {
-        renderer->ReadRasterizer()->ReleaseFences(false);
+        Rasterizer()->ReleaseFences(false);
         Settings::UpdateGPUAccuracy();
     }
 
@@ -299,7 +305,7 @@ struct GPU::Impl {
         namespace Stats = VideoCommon::GpuWaitStats;
         const size_t core = system.GetCurrentHostThreadID();
         const u64 check_start = Stats::Now();
-        auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        auto raster_area = Rasterizer()->GetFlushArea(addr, size);
         const u64 request = Stats::Now();
         Stats::AddAreaCheck(core, request - check_start);
         if (raster_area.preemtive) {
@@ -323,7 +329,7 @@ struct GPU::Impl {
             trace.area = raster_area.start_address;
             trace.in_flight = raster_area.in_flight;
             trace.request = request;
-            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Request);
+            Rasterizer()->TraceRead(trace, ReadTrace::Step::Request);
         }
         // In flight: an earlier read's downloads cover the area, only FinishRead is left.
         if (!raster_area.in_flight) {
@@ -334,7 +340,7 @@ struct GPU::Impl {
                 // Apply collected guest writes before downloading GPU data over guest memory.
                 InvalidateGPUCache();
                 timing.applied = Stats::Now();
-                renderer->ReadRasterizer()->FlushRegionForRead(
+                Rasterizer()->FlushRegionForRead(
                     raster_area.start_address, raster_area.end_address - raster_area.start_address);
                 timing.host_ns = Stats::t_host_waits.ns - host_before.ns;
                 timing.finishes = Stats::t_host_waits.count - host_before.count;
@@ -347,11 +353,11 @@ struct GPU::Impl {
             gpu_thread.TickGPU(is_async);
             if (traced) [[unlikely]] {
                 // While the GPU thread runs the flush.
-                renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
+                Rasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
             }
             WaitForSyncOperation(fence);
         } else if (traced) [[unlikely]] {
-            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
+            Rasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
         }
         // The GPU thread submitted the downloads without waiting for the host GPU: this thread
         // waits for them and writes them to guest memory, while the GPU thread goes on.
@@ -359,13 +365,13 @@ struct GPU::Impl {
         if (traced) [[unlikely]] {
             ReadTrace::t_read = &trace;
         }
-        renderer->ReadRasterizer()->FinishRead(raster_area.start_address,
+        Rasterizer()->FinishRead(raster_area.start_address,
                                                raster_area.end_address - raster_area.start_address);
         const u64 woke = Stats::Now();
         if (traced) [[unlikely]] {
             ReadTrace::t_read = nullptr;
             trace.landed = woke;
-            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Done);
+            Rasterizer()->TraceRead(trace, ReadTrace::Step::Done);
         }
         timing.finish_ns = woke - finish_start;
         timing.in_flight = raster_area.in_flight;
@@ -376,7 +382,7 @@ struct GPU::Impl {
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
         if (preserve_gpu_writes) {
-            VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
+            VideoCore::RasterizerInterface* rasterizer = Rasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
                 const u64 request = VideoCommon::GpuWaitStats::Now();
                 const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
@@ -394,7 +400,7 @@ struct GPU::Impl {
     }
 
     bool OnCPUWrite(DAddr addr, u64 size) {
-        return renderer->ReadRasterizer()->OnCPUWrite(addr, size);
+        return Rasterizer()->OnCPUWrite(addr, size);
     }
 
     /// Notify rasterizer that any caches of the specified region should be flushed and invalidated
@@ -472,6 +478,15 @@ struct GPU::Impl {
     VideoCommon::GPUThread::ThreadManager gpu_thread;
 
     std::unique_ptr<VideoCore::RendererBase> renderer;
+    /// E04.T6 (EDEN_NX2_BACK_SPLIT=1): the renderer's rasterizer as the split's stage A calls it.
+    std::unique_ptr<VideoCommon::BackSplit::RasterizerProxy> back_split_proxy;
+
+    VideoCore::RasterizerInterface* Rasterizer() {
+        if (back_split_proxy) [[unlikely]] {
+            return back_split_proxy.get();
+        }
+        return renderer->ReadRasterizer();
+    }
     const bool use_nvdec;
 
     s32 new_channel_id{1};
@@ -576,7 +591,7 @@ void GPU::OnCommandListEnd() {
 
 u64 GPU::RequestFlush(DAddr addr, std::size_t size) {
     return impl->RequestSyncOperation([this, addr, size]() {
-        impl->renderer->ReadRasterizer()->FlushRegion(addr, size);
+        impl->Rasterizer()->FlushRegion(addr, size);
     });
 }
 

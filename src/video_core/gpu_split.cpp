@@ -24,6 +24,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/nx2_back_split.h"
+#include "video_core/nx2_back_split_rasterizer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
@@ -670,6 +671,9 @@ std::string GpuSplit::MethodEndingAt(u64 end) const {
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        VideoCommon::BackSplit::g_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
     auto* const heap = new std::function<void()>(std::move(func));
     Defer(
         [heap] {
@@ -780,11 +784,18 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
     }
     return 1;
+}
+
+void GpuSplit::CallHook(void (*hook)(void*), void* argument) {
+    VideoCommon::BackSplit::RunHook(hook, argument);
 }
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
@@ -833,7 +844,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                CallHook(idle_hook, idle_argument);
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -863,7 +874,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                CallHook(idle_hook, idle_argument);
             }
             // A guest thread waits for a flush: run it now, not after the draws and compute work
             // still queued here, or after everything the front holds (the guest synchronized with
