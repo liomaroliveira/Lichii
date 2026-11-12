@@ -149,6 +149,14 @@ void RunWithContext(Call call, F&& func) {
 template <typename F>
 void Route(Call call, F&& func) {
     if (!OnStageA()) {
+        if (call <= Call::Clear && Enabled() && !OnB()) [[unlikely]] {
+            // The caches read GPUBackB's shadow (step 3), which may lag this thread's methods.
+            static std::atomic<bool> reported{};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(HW_GPU, "Nx2BackSplit: {} ran off stage A with the shadow in use",
+                            call_names[static_cast<size_t>(call)]);
+            }
+        }
         func();
         return;
     }

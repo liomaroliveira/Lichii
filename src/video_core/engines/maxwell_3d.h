@@ -95,6 +95,9 @@ public:
     /// table the rasterizer reads, for GPUBackB's shadow.
     void SplitSendDraw();
     void SplitSendDrawTexture();
+    /// E04.T6 step 3, stage A before a draw or clear: the dirty flags set since the last one,
+    /// which GPUBackB ORs into the shadow's (its rasterizer reads and clears those); A's reset.
+    void SplitSendFlags();
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {

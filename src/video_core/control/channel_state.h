@@ -60,6 +60,12 @@ struct ChannelState {
         std::optional<Engines::Maxwell3D> maxwell_3d_b;
     };
     std::optional<Payload> payload;
+
+    /// The 3D engine the rasterizer and its caches read: GPUBackB's shadow with the back split
+    /// on (E04.T6 step 3), the real engine otherwise.
+    Engines::Maxwell3D& RasterizerMaxwell3D() {
+        return payload->maxwell_3d_b ? *payload->maxwell_3d_b : payload->maxwell_3d;
+    }
     MemoryManager* memory_manager = nullptr;
 
     s32 bind_id = -1;

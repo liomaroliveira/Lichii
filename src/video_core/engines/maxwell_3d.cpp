@@ -9,6 +9,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -1230,6 +1231,30 @@ void SplitApplyDrawTexture(const u64* payload) {
                 sizeof(Maxwell3D::DrawManager::DrawTextureState));
 }
 
+using SplitFlagWords = std::array<u64, 4>;
+static_assert(sizeof(Maxwell3D::DirtyState::Flags) == sizeof(SplitFlagWords));
+
+// EDEN_NX2_BACK_SPLIT_ALL_DIRTY=1 (debug): the shadow takes every flag before each draw, to
+// compare images with the shipped flags.
+const bool g_split_all_dirty = [] {
+    const char* value = std::getenv("EDEN_NX2_BACK_SPLIT_ALL_DIRTY");
+    return value != nullptr && value[0] == '1';
+}();
+
+void SplitApplyFlags(const u64* payload) {
+    Maxwell3D* shadow;
+    std::memcpy(&shadow, payload, sizeof(shadow));
+    if (g_split_all_dirty) [[unlikely]] {
+        shadow->dirty.flags.set();
+        return;
+    }
+    SplitFlagWords words;
+    std::memcpy(words.data(), payload + 1, sizeof(words));
+    Maxwell3D::DirtyState::Flags flags;
+    std::memcpy(&flags, words.data(), sizeof(flags));
+    shadow->dirty.flags |= flags;
+}
+
 void SplitApplyCbBind(const u64* payload) {
     SplitCbBindPacket packet;
     std::memcpy(&packet, payload, sizeof(packet));
@@ -1304,6 +1329,17 @@ void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& b
 void Maxwell3D::SplitSendRootLoad(u32 table, u32 index, u32 value) {
     const SplitRootLoadPacket packet{split_engine, table, index, value};
     VideoCommon::BackSplit::EmitTask(&SplitApplyRootLoad, &packet, sizeof(packet));
+}
+
+void Maxwell3D::SplitSendFlags() {
+    if (split_engine == nullptr || (!dirty.flags.any() && !g_split_all_dirty)) {
+        return;
+    }
+    std::array<u64, 1 + 4> data{};
+    std::memcpy(&data[0], &split_engine, sizeof(split_engine));
+    std::memcpy(&data[1], &dirty.flags, sizeof(dirty.flags));
+    VideoCommon::BackSplit::EmitTask(&SplitApplyFlags, data.data(), sizeof(data));
+    dirty.flags.reset();
 }
 
 void Maxwell3D::SplitSendDraw() {

@@ -258,7 +258,7 @@ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
 }
 
 void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
-    flags = &channel_state.payload->maxwell_3d.dirty.flags;
+    flags = &channel_state.RasterizerMaxwell3D().dirty.flags;
 }
 
 void StateTracker::InvalidateState() {
