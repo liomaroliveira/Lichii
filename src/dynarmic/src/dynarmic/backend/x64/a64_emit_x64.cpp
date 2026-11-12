@@ -15,6 +15,14 @@
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_set>
 
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/abi.h"
@@ -75,7 +83,81 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
 A64EmitX64::~A64EmitX64() = default;
 
+namespace {
+// TEST (EDEN_NX2_GPU_PROFILE): blocks each thread compiles, the time it takes, and how many of
+// them another thread had already compiled (same PC). Logged every second.
+struct JitEmitSlot {
+    std::atomic<u64> blocks{}, ns{}, dup_blocks{}, dup_ns{};
+};
+constexpr size_t kJitEmitSlots = 16;
+std::array<JitEmitSlot, kJitEmitSlots> g_jit_emit_slots{};
+std::atomic<size_t> g_jit_emit_next_slot{};
+std::atomic<s64> g_jit_emit_last_log{};
+std::mutex g_jit_emit_pcs_mutex;
+std::unordered_set<u64> g_jit_emit_pcs; // (pc << 4) | slot of the first thread to compile it
+bool JitEmitProfileOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("EDEN_NX2_GPU_PROFILE");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+size_t JitEmitSlotIndex() {
+    thread_local const size_t slot = g_jit_emit_next_slot.fetch_add(1) % kJitEmitSlots;
+    return slot;
+}
+struct JitEmitProbe {
+    std::chrono::steady_clock::time_point start;
+    size_t slot;
+    bool dup;
+    explicit JitEmitProbe(u64 pc) : start{std::chrono::steady_clock::now()}, slot{JitEmitSlotIndex()}, dup{} {
+        std::lock_guard lk{g_jit_emit_pcs_mutex};
+        // A PC first compiled by another slot counts as duplicated; the same slot recompiling
+        // (cache clear, invalidation) does not.
+        bool seen_other = false, seen_self = false;
+        for (size_t i = 0; i < kJitEmitSlots; ++i) {
+            if (g_jit_emit_pcs.count((pc << 4) | i)) {
+                (i == slot ? seen_self : seen_other) = true;
+            }
+        }
+        dup = seen_other && !seen_self;
+        g_jit_emit_pcs.insert((pc << 4) | slot);
+    }
+    ~JitEmitProbe() {
+        const auto now = std::chrono::steady_clock::now();
+        const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+        auto& s = g_jit_emit_slots[slot];
+        s.blocks.fetch_add(1, std::memory_order_relaxed);
+        s.ns.fetch_add(ns, std::memory_order_relaxed);
+        if (dup) {
+            s.dup_blocks.fetch_add(1, std::memory_order_relaxed);
+            s.dup_ns.fetch_add(ns, std::memory_order_relaxed);
+        }
+        const s64 sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+        s64 last = g_jit_emit_last_log.load(std::memory_order_relaxed);
+        if (sec > last && g_jit_emit_last_log.compare_exchange_strong(last, sec)) {
+            u64 tb = 0, tn = 0, tdb = 0, tdn = 0;
+            std::string per;
+            for (size_t i = 0; i < kJitEmitSlots; ++i) {
+                auto& x = g_jit_emit_slots[i];
+                const u64 b = x.blocks.exchange(0), n = x.ns.exchange(0);
+                const u64 db = x.dup_blocks.exchange(0), dn = x.dup_ns.exchange(0);
+                if (!b) continue;
+                tb += b; tn += n; tdb += db; tdn += dn;
+                per += fmt::format(" t{}={}/{:.2f}ms/dup{}/{:.2f}ms", i, b, n / 1e6, db, dn / 1e6);
+            }
+            LOG_INFO(Core, "Nx2JitEmit blocks={} ms={:.2f} dup_blocks={} dup_ms={:.2f} dup_pct={:.1f}{}",
+                     tb, tn / 1e6, tdb, tdn / 1e6, tn ? 100.0 * tdn / tn : 0.0, per);
+        }
+    }
+};
+} // namespace
+
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+    std::optional<JitEmitProbe> jit_emit_probe;
+    if (JitEmitProfileOn()) [[unlikely]] {
+        jit_emit_probe.emplace(A64::LocationDescriptor{block.Location()}.PC());
+    }
     if (conf.very_verbose_debugging_output) [[unlikely]] {
         std::puts(IR::DumpBlock(block).c_str());
     }
