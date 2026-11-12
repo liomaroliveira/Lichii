@@ -39,6 +39,37 @@ ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
     controller_interface = std::make_unique<Controller>(kernel.System());
 }
 
+bool ServiceManager::WaitForService(const std::string& name) {
+    std::unique_lock l{lock};
+    ++service_waiters;
+    SCOPE_EXIT {
+        --service_waiters;
+        waiters_left.notify_all();
+    };
+    while (registered_services.find(name) == registered_services.end()) {
+        if (closing) {
+            LOG_INFO(Service_SM, "Gave up waiting for {}: the services are closing", name);
+            return false;
+        }
+        l.unlock();
+        Kernel::Svc::SleepThread(
+            kernel.System(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds{100})
+                .count());
+        l.lock();
+    }
+    return true;
+}
+
+void ServiceManager::Close() {
+    std::unique_lock l{lock};
+    closing = true;
+    // Each waiter wakes from its 100 ms sleep: give them a few rounds.
+    if (!waiters_left.wait_for(l, std::chrono::seconds{2}, [this] { return service_waiters == 0; })) {
+        LOG_WARNING(Service_SM, "{} threads still wait for services", service_waiters);
+    }
+}
+
 ServiceManager::~ServiceManager() {
     for (auto& [name, port] : service_ports) {
         port->Close(kernel);
