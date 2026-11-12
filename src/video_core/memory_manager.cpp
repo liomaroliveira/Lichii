@@ -21,6 +21,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -42,6 +43,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     , page_table{address_space_bits, address_space_bits + page_bits - 38, page_bits != big_page_bits ? page_bits : 0}
     , kind_map{PTEKind::INVALID}, unique_identifier{unique_identifier_generator.fetch_add(1, std::memory_order_acq_rel)}
     , accumulator{}
+    , lock_accumulator{VideoCommon::BackSplit::Enabled()}
 {
     address_space_size = 1ULL << address_space_bits;
     page_size = 1ULL << page_bits;
@@ -629,7 +631,7 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
-    accumulator.Add(gpu_dest_addr, size);
+    AccumulateInvalidation(gpu_dest_addr, size);
 }
 
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
@@ -644,6 +646,10 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     }
     WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
     // The accumulator merges word by word differently from one range: keep its ranges.
+    std::unique_lock lock{accumulator_mutex, std::defer_lock};
+    if (lock_accumulator) [[unlikely]] {
+        lock.lock();
+    }
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
     }
@@ -1079,9 +1085,17 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 
 void MemoryManager::FlushCaching() {
     // Flush from the invalidate accumulator
-    if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
+    std::unique_lock lock{accumulator_mutex, std::defer_lock};
+    if (lock_accumulator) [[unlikely]] {
+        lock.lock();
+    }
+    const bool any = accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
-    })) {
+    });
+    if (lock.owns_lock()) {
+        lock.unlock();
+    }
+    if (any) {
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }

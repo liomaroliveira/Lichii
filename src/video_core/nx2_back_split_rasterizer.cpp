@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <exception>
 #include <numeric>
 #include <utility>
@@ -154,6 +155,46 @@ void Route(Call call, F&& func) {
     RunWithContext(call, std::forward<F>(func));
 }
 
+/// Largest inline write whose caches' part GPUBackB runs without stage A waiting.
+constexpr size_t MaxAsyncInlineBytes = 4096;
+
+/// GPUBackB, a call sent without waiting: the FastDraw flags of a thread that does not read the
+/// serials (every break bumps them); exceptions cannot reach stage A, so they are logged.
+template <typename F>
+void RunAsync(F&& func) {
+    const bool reads = Nx2FastDraw::t_reads_serials;
+    Nx2FastDraw::t_reads_serials = false;
+    try {
+        func();
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(HW_GPU, "Nx2BackSplit: async call threw: {}", e.what());
+    } catch (...) {
+        LOG_CRITICAL(HW_GPU, "Nx2BackSplit: async call threw");
+    }
+    Nx2FastDraw::t_reads_serials = reads;
+}
+
+struct BindUniformArgs {
+    VideoCore::RasterizerInterface* inner;
+    u64 gpu_addr;
+    u64 stage;
+    u32 index;
+    u32 size;
+};
+
+struct DisableUniformArgs {
+    VideoCore::RasterizerInterface* inner;
+    u64 stage;
+    u32 index;
+};
+
+struct InlineHeader {
+    VideoCore::RasterizerInterface* inner;
+    u64 address;
+    u64 device_addr;
+    u64 copy_size;
+};
+
 void ReportCounts(double seconds) {
     std::array<size_t, static_cast<size_t>(Call::Count)> order{};
     std::iota(order.begin(), order.end(), size_t{0});
@@ -211,10 +252,35 @@ void RasterizerProxy::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
 }
 void RasterizerProxy::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                 u32 size) {
-    Route(Call::BindUniform, [&] { inner.BindGraphicsUniformBuffer(stage, index, gpu_addr, size); });
+    if (!OnStageA()) {
+        inner.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+        return;
+    }
+    // Records the binding only (read at the next draw, which runs after it on GPUBackB).
+    ++g_counts[static_cast<size_t>(Call::BindUniform)];
+    const BindUniformArgs args{&inner, gpu_addr, stage, index, size};
+    g_state.PushTask(
+        [](const u64* payload) {
+            BindUniformArgs a;
+            std::memcpy(&a, payload, sizeof(a));
+            RunAsync([&] { a.inner->BindGraphicsUniformBuffer(a.stage, a.index, a.gpu_addr, a.size); });
+        },
+        &args, sizeof(args));
 }
 void RasterizerProxy::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
-    Route(Call::DisableUniform, [&] { inner.DisableGraphicsUniformBuffer(stage, index); });
+    if (!OnStageA()) {
+        inner.DisableGraphicsUniformBuffer(stage, index);
+        return;
+    }
+    ++g_counts[static_cast<size_t>(Call::DisableUniform)];
+    const DisableUniformArgs args{&inner, stage, index};
+    g_state.PushTask(
+        [](const u64* payload) {
+            DisableUniformArgs a;
+            std::memcpy(&a, payload, sizeof(a));
+            RunAsync([&] { a.inner->DisableGraphicsUniformBuffer(a.stage, a.index); });
+        },
+        &args, sizeof(args));
 }
 void RasterizerProxy::SignalFence(std::function<void()>&& func) {
     Route(Call::SignalFence, [&] { inner.SignalFence(std::move(func)); });
@@ -424,8 +490,36 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerProxy::AccessAccelerateDMA() {
 }
 void RasterizerProxy::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                std::span<const u8> memory) {
-    Route(Call::InlineToMemory,
-          [&] { inner.AccelerateInlineToMemory(address, copy_size, memory); });
+    if (!OnStageA() || !inner.SplitsInlineToMemory() || copy_size > MaxAsyncInlineBytes ||
+        memory.size() < copy_size) {
+        Route(Call::InlineToMemory,
+              [&] { inner.AccelerateInlineToMemory(address, copy_size, memory); });
+        return;
+    }
+    // Stage A writes guest memory itself (it may read the words back, e.g. a launch's QMD);
+    // GPUBackB updates the caches without stage A waiting.
+    ++g_counts[static_cast<size_t>(Call::InlineToMemory)];
+    const std::optional<DAddr> device_addr =
+        inner.InlineToMemoryGuestWrite(address, copy_size, memory);
+    if (!device_addr) {
+        return;
+    }
+    std::array<u64, 4 + MaxAsyncInlineBytes / sizeof(u64)> buffer;
+    const InlineHeader header{&inner, address, *device_addr, copy_size};
+    static_assert(sizeof(InlineHeader) == 4 * sizeof(u64));
+    std::memcpy(buffer.data(), &header, sizeof(header));
+    std::memcpy(buffer.data() + 4, memory.data(), copy_size);
+    g_state.PushTask(
+        [](const u64* payload) {
+            InlineHeader h;
+            std::memcpy(&h, payload, sizeof(h));
+            const std::span<const u8> bytes{reinterpret_cast<const u8*>(payload + 4),
+                                            static_cast<size_t>(h.copy_size)};
+            RunAsync([&] {
+                h.inner->InlineToMemoryCaches(h.address, h.device_addr, h.copy_size, bytes);
+            });
+        },
+        buffer.data(), sizeof(header) + copy_size);
 }
 void RasterizerProxy::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                         const VideoCore::DiskResourceLoadCallback& callback) {

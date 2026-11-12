@@ -175,6 +175,13 @@ public:
                                    std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
+    [[nodiscard]] bool SplitsInlineToMemory() const override {
+        return true;
+    }
+    std::optional<DAddr> InlineToMemoryGuestWrite(GPUVAddr address, size_t copy_size,
+                                                  std::span<const u8> memory) override;
+    void InlineToMemoryCaches(GPUVAddr address, DAddr device_addr, size_t copy_size,
+                              std::span<const u8> memory) override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

@@ -3916,6 +3916,14 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
+    if (const auto device_addr = InlineToMemoryGuestWrite(address, copy_size, memory)) {
+        InlineToMemoryCaches(address, *device_addr, copy_size, memory);
+    }
+}
+
+std::optional<DAddr> RasterizerVulkan::InlineToMemoryGuestWrite(GPUVAddr address,
+                                                                size_t copy_size,
+                                                                std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};
@@ -3933,9 +3941,15 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     if (!cpu_addr) [[unlikely]] {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
-        return;
+        return std::nullopt;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    return cpu_addr;
+}
+
+void RasterizerVulkan::InlineToMemoryCaches(GPUVAddr address, DAddr device_addr,
+                                            size_t copy_size, std::span<const u8> memory) {
+    const std::optional<DAddr> cpu_addr{device_addr};
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");

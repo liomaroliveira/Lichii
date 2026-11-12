@@ -353,6 +353,24 @@ public:
     virtual void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                           std::span<const u8> memory) = 0;
 
+    /// E04.T6: AccelerateInlineToMemory in two parts, so the thread that writes guest memory
+    /// can differ from the one that owns the caches. Whether this rasterizer has them.
+    [[nodiscard]] virtual bool SplitsInlineToMemory() const {
+        return false;
+    }
+    /// The guest memory write. The device address for InlineToMemoryCaches, or none when the
+    /// write is complete (no device address: written through the memory manager).
+    virtual std::optional<DAddr> InlineToMemoryGuestWrite(GPUVAddr address, size_t copy_size,
+                                                          std::span<const u8> memory) {
+        AccelerateInlineToMemory(address, copy_size, memory);
+        return std::nullopt;
+    }
+    /// The caches' part, after InlineToMemoryGuestWrite returned `device_addr`.
+    virtual void InlineToMemoryCaches([[maybe_unused]] GPUVAddr address,
+                                      [[maybe_unused]] DAddr device_addr,
+                                      [[maybe_unused]] size_t copy_size,
+                                      [[maybe_unused]] std::span<const u8> memory) {}
+
     /// Initialize disk cached resources for the game being emulated
     virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                    const DiskResourceLoadCallback& callback) {}

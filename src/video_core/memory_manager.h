@@ -207,6 +207,11 @@ public:
     /// Leaves the caches' invalidation of a range already written for the next FlushCaching
     /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
     void AccumulateInvalidation(GPUVAddr gpu_addr, std::size_t size) {
+        if (lock_accumulator) [[unlikely]] {
+            std::scoped_lock lock{accumulator_mutex};
+            accumulator.Add(gpu_addr, size);
+            return;
+        }
         accumulator.Add(gpu_addr, size);
     }
 
@@ -315,6 +320,10 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    /// E04.T6 (EDEN_NX2_BACK_SPLIT=1): GPUBackB adds inline writes' ranges while stage A adds
+    /// constant buffer uploads'.
+    bool lock_accumulator{};
+    std::mutex accumulator_mutex;
 
     static std::atomic<size_t> unique_identifier_generator;
 

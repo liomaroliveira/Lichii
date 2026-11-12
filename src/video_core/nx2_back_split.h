@@ -65,6 +65,8 @@ enum class Kind : u8 {
     LaunchDma = 6,
     InlineUpload = 7,
     Query = 8,
+    /// E04.T6: a call GPUBackB runs in ring order, without stage A waiting (aux = payload words).
+    Task = 9,
 };
 
 constexpr size_t RegCount = 0xE00;
@@ -101,6 +103,8 @@ inline constexpr size_t PacketWords(u64 word0) noexcept {
         return 2 + (static_cast<size_t>(aux) + sizeof(u64) - 1) / sizeof(u64);
     case Kind::Query:
         return 4;
+    case Kind::Task:
+        return 2 + static_cast<size_t>(aux);
     }
     return 1;
 }
@@ -126,6 +130,7 @@ public:
     void RunOnB(TaskFn fn, void* arg) {
         EnsureStarted();
         PublishNow();
+        async_pending = false;
         task_fn = fn;
         task_arg = arg;
         const u64 seq = ++task_posted;
@@ -143,6 +148,33 @@ public:
                 task_done.wait(seq - 1, std::memory_order_seq_cst);
             }
             a_waiting.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    using AsyncFn = void (*)(const u64* payload);
+
+    /// Stage A: has GPUBackB run fn(payload) in ring order, without waiting. `bytes` of `data`
+    /// are copied into the ring.
+    void PushTask(AsyncFn fn, const void* data, size_t bytes) {
+        const size_t payload = (bytes + sizeof(u64) - 1) / sizeof(u64);
+        const size_t words = 2 + payload;
+        u64* dst = Reserve(words);
+        dst[0] = MakeHeader(Kind::Task, static_cast<u32>(payload));
+        dst[1] = reinterpret_cast<u64>(fn);
+        if (payload != 0) {
+            dst[words - 1] = 0;
+            std::memcpy(dst + 2, data, bytes);
+        }
+        Commit(words);
+        ++stat_async;
+        async_pending = true;
+    }
+
+    /// Stage A: waits until GPUBackB ran every task sent without waiting.
+    void DrainAsync() {
+        if (async_pending) {
+            ++stat_drains;
+            RunOnB([](void*) {}, nullptr);
         }
     }
 
@@ -247,7 +279,7 @@ public:
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit: cmds {:.0f}/s, delta_regs {:.0f}/s, cb_words {:.0f}/s, "
                  "words {:.0f}/s, A_stalls {}, run_on_b {:.0f}/s, run_sleeps {}, b_sleeps {}, "
-                 "calls {:.0f}/s, deferred {:.0f}/s",
+                 "calls {:.0f}/s, deferred {:.0f}/s, async {:.0f}/s, drains {:.0f}/s",
                  static_cast<double>(stat_packets) / sec,
                  static_cast<double>(stat_delta_regs) / sec,
                  static_cast<double>(stat_cb_words) / sec,
@@ -255,7 +287,10 @@ public:
                  stat_stalls, static_cast<double>(stat_run_on_b) / sec, stat_run_sleeps,
                  b_sleeps.exchange(0, std::memory_order_relaxed),
                  static_cast<double>(g_calls.exchange(0, std::memory_order_relaxed)) / sec,
-                 static_cast<double>(g_deferred.exchange(0, std::memory_order_relaxed)) / sec);
+                 static_cast<double>(g_deferred.exchange(0, std::memory_order_relaxed)) / sec,
+                 static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec);
+        stat_async = 0;
+        stat_drains = 0;
         if (report_hook != nullptr) {
             report_hook(sec);
         }
@@ -419,6 +454,9 @@ private:
                 const size_t words = PacketWords(word0);
                 if (words == 0) {
                     read_pos += RingWords - index;
+                } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Task)) {
+                    reinterpret_cast<AsyncFn>(ring[index + 1])(&ring[index + 2]);
+                    read_pos += words;
                 } else {
                     for (size_t i = 0; i < words; ++i) {
                         sink ^= ring[index + i];
@@ -461,6 +499,9 @@ private:
     u64 stat_stalls = 0;
     u64 stat_run_on_b = 0;
     u64 stat_run_sleeps = 0;
+    u64 stat_async = 0;
+    u64 stat_drains = 0;
+    bool async_pending = false;
     u64 task_posted = 0;
     TaskFn task_fn{};
     void* task_arg{};
@@ -515,6 +556,10 @@ inline void EmitQuery(u64 gpu_addr, u64 payload, u64 meta) {
 
 inline void RunOnB(RingState::TaskFn fn, void* arg) {
     g_state.RunOnB(fn, arg);
+}
+
+inline void DrainAsync() {
+    g_state.DrainAsync();
 }
 
 inline void MaybeReport() {

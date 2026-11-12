@@ -786,6 +786,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
+            // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
+            // it was sent without waiting.
+            VideoCommon::BackSplit::DrainAsync();
         }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
