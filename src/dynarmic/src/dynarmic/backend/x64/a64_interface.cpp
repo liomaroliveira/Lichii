@@ -9,14 +9,26 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
+#include "common/logging.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/llvm_disassemble.h"
 #include <bit>
@@ -84,6 +96,223 @@ struct SharedCodeCache final {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
     }
 
+    ~SharedCodeCache() {
+        ShutdownPrewarm();
+    }
+
+    static s64 SteadyNowNs() noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    struct JitWarmHeader {
+        u32 magic = 0x574A324E;  // 'N2JW'
+        u32 version = 1;
+        u64 count = 0;
+    };
+    struct JitWarmEntry {
+        u64 desc = 0;
+        u32 opcode0 = 0;
+        u32 reserved = 0;
+    };
+
+    void ConfigurePrewarm(std::string path, std::function<std::optional<u32>(u64)> read_code) {
+        static const bool warm_on = [] {
+            const char* v = std::getenv("EDEN_NX2_JIT_WARM");
+            return v == nullptr || *v != '0';
+        }();
+        if (!warm_on || !is_shared || warm_configured.exchange(true)) {
+            return;
+        }
+        std::vector<JitWarmEntry> loaded;
+        {
+            std::lock_guard lk{warm_mutex};
+            if (stop_prewarm.load(std::memory_order_acquire)) {
+                return;
+            }
+            warm_path = std::move(path);
+            prewarm_read_code = std::move(read_code);
+            std::ifstream in{warm_path, std::ios::binary};
+            if (in.is_open()) {
+                JitWarmHeader hdr{};
+                in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+                if (in.good() && hdr.magic == 0x574A324E && hdr.version == 1 && hdr.count <= 8'000'000ULL) {
+                    loaded.resize(hdr.count);
+                    if (hdr.count > 0) {
+                        in.read(reinterpret_cast<char*>(loaded.data()), static_cast<std::streamsize>(hdr.count * sizeof(JitWarmEntry)));
+                        if (!in.good()) {
+                            loaded.clear();
+                        }
+                    }
+                }
+            }
+            for (const auto& e : loaded) {
+                warm_known[e.desc] = e.opcode0;
+            }
+            warm_enabled.store(true, std::memory_order_release);
+        }
+        LOG_INFO(Core, "Nx2JitWarm init loaded={} path={}", loaded.size(), warm_path);
+        prewarm_thread = std::thread([this, entries = std::move(loaded)]() mutable { PrewarmWorker(std::move(entries)); });
+    }
+
+    void ShutdownPrewarm() {
+        std::lock_guard stop_lk{warm_stop_mutex};
+        stop_prewarm.store(true, std::memory_order_release);
+        warm_cv.notify_all();
+        if (prewarm_thread.joinable()) {
+            prewarm_thread.join();
+        }
+        std::lock_guard lk{warm_mutex};
+        prewarm_read_code = nullptr;
+        if (warm_dirty && !warm_path.empty()) {
+            std::error_code ec;
+            const std::filesystem::path target{warm_path};
+            std::filesystem::create_directories(target.parent_path(), ec);
+            const std::string tmp_path = warm_path + ".tmp";
+            std::ofstream out{tmp_path, std::ios::binary | std::ios::trunc};
+            if (out.is_open()) {
+                JitWarmHeader hdr{};
+                hdr.count = warm_known.size();
+                out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+                std::vector<JitWarmEntry> buf;
+                buf.reserve(warm_known.size());
+                for (const auto& [desc, op0] : warm_known) {
+                    buf.push_back(JitWarmEntry{desc, op0, 0});
+                }
+                if (!buf.empty()) {
+                    out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size() * sizeof(JitWarmEntry)));
+                }
+                out.close();
+                if (out.good()) {
+                    std::filesystem::rename(tmp_path, target, ec);
+                    if (!ec) {
+                        LOG_INFO(Core, "Nx2JitWarm saved={} path={}", buf.size(), warm_path);
+                    }
+                }
+            }
+            warm_dirty = false;
+        }
+    }
+
+    void RecordWarmEntry(u64 desc, u32 op0) {
+        std::lock_guard lk{warm_mutex};
+        auto [it, inserted] = warm_known.emplace(desc, op0);
+        if (inserted || it->second != op0) {
+            it->second = op0;
+            warm_dirty = true;
+        }
+    }
+
+    void RunPrewarmPass(const std::vector<JitWarmEntry>& entries, std::vector<JitWarmEntry>& deferred_out, int pass_num) {
+        const s64 pass_start_ns = SteadyNowNs();
+        size_t hits = 0;
+        size_t compiled = 0;
+        size_t deferred_cnt = 0;
+        for (const auto& entry : entries) {
+            if (stop_prewarm.load(std::memory_order_acquire)) {
+                break;
+            }
+            if ((compiled & 31) == 31 && (SteadyNowNs() - last_miss_ns.load(std::memory_order_relaxed)) < 25'000'000LL) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (stop_prewarm.load(std::memory_order_acquire)) {
+                    break;
+                }
+            }
+            const IR::LocationDescriptor desc{entry.desc};
+            const A64::LocationDescriptor arch_desc{desc};
+            if (arch_desc.SingleStepping()) {
+                continue;
+            }
+            {
+                std::shared_lock slk{cache_mutex};
+                if (emitter.GetBasicBlock(desc)) {
+                    ++hits;
+                    continue;
+                }
+                if (block_of_code.SpaceRemaining() < 4 * 1024 * 1024) {
+                    break;
+                }
+            }
+            const auto word = prewarm_read_code ? prewarm_read_code(arch_desc.PC()) : std::nullopt;
+            if (!word || *word != entry.opcode0) {
+                deferred_out.push_back(entry);
+                ++deferred_cnt;
+                continue;
+            }
+            const auto get_prewarm_code = [this](u64 vaddr) { return prewarm_read_code(vaddr); };
+            prewarm_ir_block.Reset(arch_desc);
+            A64::Translate(prewarm_ir_block, arch_desc, get_prewarm_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+            Optimization::Optimize(prewarm_ir_block, conf, polyfill_options);
+            std::unique_lock lk{cache_mutex};
+            if (emitter.GetBasicBlock(desc)) {
+                ++hits;
+                continue;
+            }
+            if (block_of_code.SpaceRemaining() < 4 * 1024 * 1024) {
+                break;
+            }
+            block_of_code.EnsureMemoryCommitted(1 * 1024 * 1024);
+            emitter.Emit(prewarm_ir_block);
+            ++compiled;
+        }
+        const double ms = (SteadyNowNs() - pass_start_ns) / 1e6;
+        LOG_INFO(Core, "Nx2JitWarm pass={} total={} compiled={} hit={} deferred={} ms={:.1f}",
+                 pass_num, entries.size(), compiled, hits, deferred_cnt, ms);
+    }
+
+    void PrewarmWorker(std::vector<JitWarmEntry> entries) {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "JitPrewarm");
+#endif
+        if (entries.empty()) {
+            return;
+        }
+        const s64 wait_start_ns = SteadyNowNs();
+        {
+            std::unique_lock lk{warm_mutex};
+            while (!stop_prewarm.load(std::memory_order_acquire)) {
+                const u64 misses = miss_count.load(std::memory_order_relaxed);
+                const s64 now = SteadyNowNs();
+                const s64 first = first_miss_ns.load(std::memory_order_relaxed);
+                const s64 last = last_miss_ns.load(std::memory_order_relaxed);
+                const bool quiet_ready = first != 0 && misses >= 150000 &&
+                                         (now - first) >= 10'000'000'000LL &&
+                                         (now - last) >= 250'000'000LL;
+                const bool timeout_ready = first != 0 && (now - first) >= 14'000'000'000LL;
+                const bool fallback_ready = (now - wait_start_ns) >= 30'000'000'000LL && misses > 0;
+                if (quiet_ready || timeout_ready || fallback_ready) {
+                    break;
+                }
+                warm_cv.wait_for(lk, std::chrono::milliseconds(100));
+            }
+            if (stop_prewarm.load(std::memory_order_acquire)) {
+                return;
+            }
+        }
+        std::vector<JitWarmEntry> deferred;
+        RunPrewarmPass(entries, deferred, 1);
+        int pass_num = 2;
+        u64 last_retry_misses = miss_count.load(std::memory_order_relaxed);
+        while (!deferred.empty() && !stop_prewarm.load(std::memory_order_acquire) && pass_num <= 8) {
+            {
+                std::unique_lock lk{warm_mutex};
+                warm_cv.wait_for(lk, std::chrono::seconds(4));
+                if (stop_prewarm.load(std::memory_order_acquire)) {
+                    break;
+                }
+            }
+            const u64 cur_misses = miss_count.load(std::memory_order_relaxed);
+            const s64 now = SteadyNowNs();
+            if ((cur_misses - last_retry_misses) >= 400 && (now - last_miss_ns.load(std::memory_order_relaxed)) >= 250'000'000LL) {
+                std::vector<JitWarmEntry> next_deferred;
+                RunPrewarmPass(deferred, next_deferred, pass_num++);
+                deferred.swap(next_deferred);
+                last_retry_misses = cur_misses;
+            }
+        }
+    }
+
     CodePtr LookupOrCompile(IR::LocationDescriptor descriptor, UserCallbacks* caller_cb, IR::Block& local_ir_block, bool* need_clear_out = nullptr) {
         if (is_shared) {
             std::shared_lock slk{cache_mutex};
@@ -98,9 +327,23 @@ struct SharedCodeCache final {
             }
         }
 
+        const bool track_warm = is_shared && warm_enabled.load(std::memory_order_relaxed);
+        if (track_warm) {
+            miss_count.fetch_add(1, std::memory_order_relaxed);
+            const s64 now = SteadyNowNs();
+            last_miss_ns.store(now, std::memory_order_relaxed);
+            if (first_miss_ns.load(std::memory_order_relaxed) == 0) {
+                s64 zero = 0;
+                first_miss_ns.compare_exchange_strong(zero, now, std::memory_order_relaxed);
+            }
+        }
+
         // Translate + Optimize outside any cache lock using caller's IR::Block + code-page cache.
         const auto get_code = [caller_cb](u64 vaddr) { return caller_cb->MemoryReadCode(vaddr); };
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+        const u32 op0 = (track_warm && !arch_descriptor.SingleStepping())
+                            ? caller_cb->MemoryReadCode(arch_descriptor.PC()).value_or(0)
+                            : 0;
         local_ir_block.Reset(arch_descriptor);
         A64::Translate(local_ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::Optimize(local_ir_block, conf, polyfill_options);
@@ -136,7 +379,14 @@ struct SharedCodeCache final {
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
-        return emitter.Emit(local_ir_block).entrypoint;
+        CodePtr entry = emitter.Emit(local_ir_block).entrypoint;
+        if (lk.owns_lock()) {
+            lk.unlock();
+        }
+        if (op0 != 0) {
+            RecordWarmEntry(descriptor.Value(), op0);
+        }
+        return entry;
     }
 
     void RecordInvalidatedLocked(const std::vector<IR::LocationDescriptor>& locs) {
@@ -224,6 +474,22 @@ struct SharedCodeCache final {
     std::atomic<u32> active_runs{0};
     bool pending_full_clear = false;
     std::vector<volatile u32*> cores_halt;
+
+    IR::Block prewarm_ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};
+    std::mutex warm_stop_mutex;
+    std::mutex warm_mutex;
+    std::condition_variable warm_cv;
+    std::atomic<bool> warm_configured{false};
+    std::atomic<bool> warm_enabled{false};
+    std::atomic<bool> stop_prewarm{false};
+    std::atomic<u64> miss_count{0};
+    std::atomic<s64> first_miss_ns{0};
+    std::atomic<s64> last_miss_ns{0};
+    std::string warm_path;
+    std::function<std::optional<u32>(u64)> prewarm_read_code;
+    std::unordered_map<u64, u32> warm_known;
+    bool warm_dirty = false;
+    std::thread prewarm_thread;
 };
 
 struct Jit::Impl final {
@@ -537,6 +803,20 @@ private:
 
 std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf) {
     return std::make_shared<SharedCodeCache>(conf, true, &Jit::Impl::GetCurrentBlockThunk, nullptr);
+}
+
+void ConfigureSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache,
+                            std::string cache_path,
+                            std::function<std::optional<u32>(u64)> read_code) {
+    if (cache) {
+        cache->ConfigurePrewarm(std::move(cache_path), std::move(read_code));
+    }
+}
+
+void ShutdownSharedPrewarm(const std::shared_ptr<SharedCodeCache>& cache) {
+    if (cache) {
+        cache->ShutdownPrewarm();
+    }
 }
 
 Jit::Jit(UserConfig conf)

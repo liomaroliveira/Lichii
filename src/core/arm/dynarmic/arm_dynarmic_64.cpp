@@ -8,9 +8,12 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include <fmt/format.h>
+#include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -471,6 +474,31 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (!m_shared_cache) {
             m_shared_cache = Dynarmic::A64::MakeSharedCodeCache(config);
             wp = m_shared_cache;
+            const u64 program_id = m_cb->m_process->GetProgramId();
+            if (program_id != 0) {
+                const auto warm_path = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "jit_warm" /
+                                       fmt::format("{:016X}.bin", program_id);
+                Core::Memory::Memory* mem = &m_cb->m_memory;
+                auto prewarm_read = [mem, last_page = u64(~0ULL),
+                                     page_buf = std::vector<u32>(Core::Memory::YUZU_PAGESIZE / sizeof(u32))](
+                                        u64 vaddr) mutable -> std::optional<u32> {
+                    const u64 aligned = vaddr & ~Core::Memory::YUZU_PAGEMASK;
+                    if (aligned != last_page) {
+                        if (!mem->IsValidVirtualAddressRange(aligned, Core::Memory::YUZU_PAGESIZE)) {
+                            if (!mem->IsValidVirtualAddressRange(vaddr, sizeof(u32))) {
+                                return std::nullopt;
+                            }
+                            u32 inst = 0;
+                            mem->ReadBlockUnsafe(vaddr, &inst, sizeof(inst));
+                            return inst;
+                        }
+                        mem->ReadBlockUnsafe(aligned, page_buf.data(), Core::Memory::YUZU_PAGESIZE);
+                        last_page = aligned;
+                    }
+                    return page_buf[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+                };
+                Dynarmic::A64::ConfigureSharedPrewarm(m_shared_cache, warm_path.string(), std::move(prewarm_read));
+            }
         }
         config.shared_cache = m_shared_cache;
     }
@@ -521,7 +549,9 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
 }
 
-ArmDynarmic64::~ArmDynarmic64() = default;
+ArmDynarmic64::~ArmDynarmic64() {
+    Dynarmic::A64::ShutdownSharedPrewarm(m_shared_cache);
+}
 
 void ArmDynarmic64::SetTpidrroEl0(u64 value) {
     m_cb->m_tpidrro_el0 = value;
