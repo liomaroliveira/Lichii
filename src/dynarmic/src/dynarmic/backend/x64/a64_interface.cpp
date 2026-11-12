@@ -17,6 +17,7 @@
 #include <bit>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/backend/x64/jit_profile.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/devirtualize.h"
@@ -258,6 +259,18 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
+        if (JitProfile::On()) [[unlikely]] {
+            const std::int64_t t0 = JitProfile::NowNs();
+            A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+            const std::int64_t t1 = JitProfile::NowNs();
+            Optimization::Optimize(ir_block, conf, polyfill_options);
+            const std::int64_t t2 = JitProfile::NowNs();
+            const std::uint64_t ir_insts = ir_block.instructions.size();
+            const CodePtr entry = emitter.Emit(ir_block).entrypoint;
+            const std::int64_t t3 = JitProfile::NowNs();
+            JitProfile::Record(arch_descriptor.PC(), t1 - t0, t2 - t1, t3 - t2, ir_insts);
+            return entry;
+        }
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::Optimize(ir_block, conf, polyfill_options);
         return emitter.Emit(ir_block).entrypoint;
@@ -274,6 +287,9 @@ private:
             }
 
             jit_state.ResetRSB();
+            if (JitProfile::On()) [[unlikely]] {
+                (invalidate_entire_cache ? JitProfile::g_full_invalidations : JitProfile::g_invalidations).fetch_add(1);
+            }
             if (invalidate_entire_cache) {
                 block_of_code.ClearCache();
                 emitter.ClearCache();
