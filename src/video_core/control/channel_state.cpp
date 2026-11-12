@@ -16,6 +16,7 @@
 #include "video_core/macro.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_back_split.h"
 
 namespace Tegra::Control {
 namespace {
@@ -83,6 +84,15 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
         payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
                                                    macros.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+    }
+    if (VideoCommon::BackSplit::Enabled()) {
+        // Same defaults as the real engine; the ring's first snapshot seeds it with A's state.
+        auto& shadow = payload->maxwell_3d_b.emplace(*memory_manager);
+        if (g_nx2_ampere) {
+            // Read by the caches (native_turing); it runs no macro.
+            shadow.SetNativeTuringMacroMode(true);
+        }
+        payload->maxwell_3d.split_shadow = shadow.regs.reg_array.data();
     }
     initialized = true;
 }

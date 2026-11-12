@@ -73,10 +73,16 @@ public:
     /// E04.T6: sends a register the engine wrote without ProcessDirtyRegisters (an increment, a
     /// macro's direct write) to GPUBackB's shadow (EDEN_NX2_BACK_SPLIT=1).
     void NoteDirectWrite(u32 method) {
-        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            VideoCommon::BackSplit::EmitReg(this, regs.reg_array.data(), method, regs.reg_array[method]);
+        if (VideoCommon::BackSplit::Enabled() && split_shadow != nullptr) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
+                                            regs.reg_array[method]);
         }
     }
+
+    /// E04.T6 step 3: the register file of this channel's shadow engine on GPUBackB
+    /// (ChannelState::Payload::maxwell_3d_b), also its identity on the A->B ring. Null without
+    /// the split, and on the shadow itself.
+    u32* split_shadow{};
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {
@@ -3341,8 +3347,9 @@ private:
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
-        if (VideoCommon::BackSplit::Enabled() && regs.reg_array[method] != argument) [[unlikely]] {
-            VideoCommon::BackSplit::EmitReg(this, regs.reg_array.data(), method, argument);
+        if (VideoCommon::BackSplit::Enabled() && regs.reg_array[method] != argument &&
+            split_shadow != nullptr) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, argument);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

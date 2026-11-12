@@ -98,7 +98,7 @@ void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             VideoCommon::BackSplit::EmitClear(layer_count);
-            VideoCommon::BackSplit::CheckRegs(&maxwell3d, maxwell3d.regs.reg_array.data());
+            VideoCommon::BackSplit::CheckRegs(maxwell3d.split_shadow, maxwell3d.regs.reg_array.data());
         }
         maxwell3d.rasterizer->Clear(layer_count);
     }
@@ -357,7 +357,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             VideoCommon::BackSplit::EmitDraw(draw_indexed, false, instance_count);
-            VideoCommon::BackSplit::CheckRegs(&maxwell3d, maxwell3d.regs.reg_array.data());
+            VideoCommon::BackSplit::CheckRegs(maxwell3d.split_shadow, maxwell3d.regs.reg_array.data());
         }
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
@@ -373,7 +373,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
             VideoCommon::BackSplit::EmitDraw(indirect_state.is_indexed != 0, true, 1);
-            VideoCommon::BackSplit::CheckRegs(&maxwell3d, maxwell3d.regs.reg_array.data());
+            VideoCommon::BackSplit::CheckRegs(maxwell3d.split_shadow, maxwell3d.regs.reg_array.data());
         }
         maxwell3d.rasterizer->DrawIndirect();
     } else {

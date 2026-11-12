@@ -575,14 +575,10 @@ private:
         consumer_sink.store(sink, std::memory_order_relaxed);
     }
 
-    /// GPUBackB: the shadow register file of `engine`, created on first use.
-    u32* ShadowOf(const void* engine) {
-        auto& slot = b_shadows[engine];
-        if (!slot) {
-            slot = std::make_unique<u32[]>(RegCount);
-            b_engines.store(b_shadows.size(), std::memory_order_relaxed);
-        }
-        return slot.get();
+    /// GPUBackB: the shadow register file named by `engine` on the ring. Since step 3 the ring
+    /// names an engine by its shadow's registers (Maxwell3D::split_shadow), owned by the channel.
+    static u32* ShadowOf(const void* engine) {
+        return static_cast<u32*>(const_cast<void*>(engine));
     }
 
     /// GPUBackB: seeds (init) or checks (check) the shadow of `engine` against stage A's
@@ -590,6 +586,9 @@ private:
     void OnSnapshot(const void* engine, u32 kind, const u32* a_regs) {
         u32* const shadow = ShadowOf(engine);
         b_regs = shadow;
+        if (kind == SnapshotInit) {
+            b_engines.fetch_add(1, std::memory_order_relaxed);
+        }
         if (kind == SnapshotCheck) {
             b_checks.fetch_add(1, std::memory_order_relaxed);
             b_checks_total.fetch_add(1, std::memory_order_relaxed);
@@ -643,7 +642,6 @@ private:
     u32 a_draws = 0;
     // GPUBackB: the shadow of the bound engine and every engine's shadow (E04.T6 step 2).
     u32* b_regs{};
-    std::unordered_map<const void*, std::unique_ptr<u32[]>> b_shadows;
     std::array<bool, RegCount> b_reported{};
     u32 b_report_lines = 0;
     std::atomic<u64> b_engines{0};

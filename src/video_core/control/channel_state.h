@@ -55,6 +55,9 @@ struct ChannelState {
         /// NV01 Timer
         Engines::Nv01Timer nv01_timer;
         DmaPusher dma_pusher;
+        /// E04.T6 step 3: the 3D engine's shadow on GPUBackB, fed by the A->B ring
+        /// (EDEN_NX2_BACK_SPLIT=1). It is bound to no subchannel and never receives methods.
+        std::optional<Engines::Maxwell3D> maxwell_3d_b;
     };
     std::optional<Payload> payload;
     MemoryManager* memory_manager = nullptr;
