@@ -502,7 +502,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                 auto get_modules = [proc, mem]() -> std::vector<Dynarmic::A64::SharedWarmModule> {
                     std::vector<Dynarmic::A64::SharedWarmModule> mods;
                     auto& pt = proc->GetPageTable();
-                    VAddr cur_addr = 0;
+                    VAddr cur_addr = GetInteger(pt.GetAddressSpaceStart());
                     while (true) {
                         Kernel::KMemoryInfo mem_info{};
                         Kernel::Svc::PageInfo page_info{};
@@ -527,7 +527,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                             }
                         }
                         const uintptr_t next_address = svc_info.base_address + svc_info.size;
-                        if (next_address <= cur_addr) {
+                        if (next_address <= cur_addr || !pt.Contains(next_address)) {
                             break;
                         }
                         cur_addr = next_address;
@@ -588,6 +588,10 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
 }
 
 ArmDynarmic64::~ArmDynarmic64() {
+    PrepareForShutdown();
+}
+
+void ArmDynarmic64::PrepareForShutdown() {
     Dynarmic::A64::ShutdownSharedPrewarm(m_shared_cache);
 }
 
