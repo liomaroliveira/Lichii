@@ -17,6 +17,7 @@
 #include "dynarmic/backend/x64/xbyak.h"
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
+#include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64_memory.h"

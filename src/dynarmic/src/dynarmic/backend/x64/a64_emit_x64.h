@@ -9,15 +9,20 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <deque>
 #include <map>
 #include <optional>
 #include <tuple>
+#include <utility>
+#include <vector>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <boost/container/static_vector.hpp>
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -43,7 +48,7 @@ struct A64EmitContext final : public EmitContext {
 
 class A64EmitX64 final : public EmitX64 {
 public:
-    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface);
+    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface, bool shared_mode = false);
     ~A64EmitX64() override;
 
     /// Emit host machine code for a basic block with intermediate representation `block`.
@@ -53,6 +58,17 @@ public:
     void ClearCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+    bool DrainPendingFastmemRecompiles();
+    bool HasPendingFastmemRecompiles() const noexcept { return has_pending_fastmem_recompiles.load(std::memory_order_acquire); }
+    bool IsSharedMode() const noexcept { return shared_mode; }
+
+    template<auto mfp>
+    ArgCallback EmitCallback() const {
+        if (shared_mode) {
+            return DevirtualizeFromJitState<mfp>(conf.callbacks, offsetof(A64JitState, callbacks));
+        }
+        return Devirtualize<mfp>(conf.callbacks);
+    }
 
 //protected:
     struct FastDispatchEntry {
@@ -124,6 +140,19 @@ public:
 
 //data
     const A64::UserConfig conf;
+    const bool shared_mode = false;
+    std::atomic_flag fastmem_lock = ATOMIC_FLAG_INIT;
+    std::atomic<bool> has_pending_fastmem_recompiles{false};
+    std::vector<DoNotFastmemMarker> pending_fastmem_recompiles;
+    struct SharedPatchSlot {
+        std::atomic<CodePtr> target{nullptr};
+        CodePtr stub{nullptr};
+    };
+    std::deque<SharedPatchSlot> shared_patch_slots;
+    ::Common::unordered_map<IR::LocationDescriptor, std::vector<SharedPatchSlot*>> shared_patch_targets;
+    SharedPatchSlot* AllocSharedPatchSlot(IR::LocationDescriptor target_desc);
+    void PatchSharedSlots(IR::LocationDescriptor target_desc, CodePtr target_code_ptr);
+    void UnpatchSharedSlots(IR::LocationDescriptor target_desc);
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u64> block_ranges;
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;

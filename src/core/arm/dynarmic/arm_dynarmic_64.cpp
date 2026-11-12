@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -455,6 +457,22 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (!Settings::IsFastmemEnabled()) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
+    }
+    static const bool shared_jit_on = [] {
+        const char* v = std::getenv("EDEN_NX2_SHARED_JIT");
+        return v == nullptr || *v != '0';
+    }();
+    if (shared_jit_on && m_cb && m_cb->m_process) {
+        static std::mutex s_cache_map_mutex;
+        static std::unordered_map<Kernel::KProcess*, std::weak_ptr<Dynarmic::A64::SharedCodeCache>> s_process_caches;
+        std::lock_guard lk{s_cache_map_mutex};
+        auto& wp = s_process_caches[m_cb->m_process];
+        m_shared_cache = wp.lock();
+        if (!m_shared_cache) {
+            m_shared_cache = Dynarmic::A64::MakeSharedCodeCache(config);
+            wp = m_shared_cache;
+        }
+        config.shared_cache = m_shared_cache;
     }
     m_jit.emplace(config);
 }
