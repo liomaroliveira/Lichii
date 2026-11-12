@@ -23,6 +23,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
@@ -804,6 +805,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
+        VideoCommon::BackSplit::MaybeReport();
         MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {

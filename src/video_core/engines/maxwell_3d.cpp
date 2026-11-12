@@ -761,6 +761,10 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        VideoCommon::BackSplit::EmitCbUpload(address + offset, values.data(), count);
+    }
     // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
     const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
                       !FastDrawHeaderWrite(address + offset, address + offset + bytes);
@@ -963,6 +967,11 @@ void Maxwell3D::ProcessQueryGet() {
         if (VideoCommon::Nx2Profile::Enabled()) {
             VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
         }
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const u64 meta = (u64{flags.Value()} << 32) | (u64{subreport} << 16) | static_cast<u64>(query_type);
+            VideoCommon::BackSplit::EmitQuery(regs.reg_array.data(), sequence_address, payload, meta);
+        }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
@@ -973,6 +982,11 @@ void Maxwell3D::ProcessQueryGet() {
     case Regs::ReportSemaphore::Operation::ReportOnly:
         if (VideoCommon::Nx2Profile::Enabled()) {
             VideoCommon::Nx2Profile::QueryWriters()[sequence_address >> 5] = 2;
+        }
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            const u64 meta = (u64{flags.Value()} << 32) | (u64{subreport} << 16) | static_cast<u64>(query_type);
+            VideoCommon::BackSplit::EmitQuery(regs.reg_array.data(), sequence_address, payload, meta);
         }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
@@ -1176,6 +1190,10 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+            VideoCommon::BackSplit::EmitCbUpload(address, start_base, static_cast<u32>(write_size / sizeof(u32)));
+        }
         const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
                           !FastDrawHeaderWrite(address, address + write_size);
         if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address, start_base,

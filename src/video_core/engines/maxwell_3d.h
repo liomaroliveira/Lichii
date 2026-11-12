@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -3331,6 +3332,9 @@ private:
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+        }
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            VideoCommon::BackSplit::NoteRegisterWrite(method, argument);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

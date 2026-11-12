@@ -8,6 +8,7 @@
 
 #include "common/algorithm.h"
 #include "common/assert.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
@@ -70,6 +71,11 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const u32 count = write_offset - flushed_offset;
         if (count) {
+            if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+                const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+                VideoCommon::BackSplit::EmitInlineUpload(regs.dest.Address() + flushed_offset,
+                                                         inner_buffer.data() + flushed_offset, count);
+            }
             rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
                 std::span<const u8>{inner_buffer.data() + flushed_offset, count});
             flushed_offset = write_offset;
@@ -83,6 +89,10 @@ void State::ProcessData(const u32* data, size_t num_data) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const auto count = std::min<size_t>(num_data * sizeof(u32), copy_size - write_offset);
         if (count) {
+            if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+                const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+                VideoCommon::BackSplit::EmitInlineUpload(regs.dest.Address() + write_offset, data, count);
+            }
             rasterizer->AccelerateInlineToMemory(regs.dest.Address() + write_offset, count,
                 std::span<const u8>{reinterpret_cast<const u8*>(data), count});
             write_offset += static_cast<u32>(count);
@@ -96,6 +106,10 @@ void State::ProcessData(const u32* data, size_t num_data) {
 
 void State::ProcessData(std::span<const u8> read_buffer) {
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InlineUploads, 1);
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        VideoCommon::BackSplit::EmitInlineUpload(regs.dest.Address(), read_buffer.data(), read_buffer.size());
+    }
     const GPUVAddr address{regs.dest.Address()};
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
