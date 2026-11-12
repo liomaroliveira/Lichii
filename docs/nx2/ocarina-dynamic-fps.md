@@ -76,6 +76,41 @@ Normal and an unscaled counter are prerequisites for evaluating its timing;
 the Add-On does not change global clock behavior or automatically override
 the user's settings. Correct gameplay speed with the Add-On is unverified.
 
+## FPS Unlock step counters
+
+`FPS Unlock (built-in)` also corrects four counters through a shared fractional
+step accumulator. `Dynamic FPS by Dark (built-in)` keeps its
+original records and does not install these fixes. Addresses below are `main`
+module offsets.
+
+| Hook | System | Without the fix | Fix |
+|---|---|---|---|
+| `0xA68300` | Pickup window count-up | Truncating a step below one stalls the displayed count. | Advance by accumulated whole ticks. |
+| `0x3293410` | Ocarina playback tick | Truncating a step below one stalls playback. | Advance by accumulated whole ticks. |
+| `0x2F53268` | Step rate manager countdown | `max(round(step), 1)` per frame runs fast above 60 fps. | Decrement by accumulated whole ticks. |
+| `0x53F914` | Ambient wave phase | Counting frames makes the phase run fast above 60 fps. | Accumulate the raw step instead of adding one. |
+
+The helper takes the counter address in `x13` and step in `s0`, returning ticks
+in `w13`. Each of 16 slots retains a fractional remainder. A new or evicted
+slot returns `max(trunc(step), 1)`; reused addresses inherit the stored fraction.
+More than 16 interleaved counters can therefore fall back to that minimum.
+
+The stubs occupy `0x3C46900` (40 bytes), `0x3C46928` (40 bytes), `0x3C46950`
+(48 bytes), and `0x3C46A00` (60 bytes); the 128-byte helper starts at
+`0x3C46980`. All are guarded zero-filled executable padding. The hitstop hook
+validates all 44 original bytes through `0x2F53294`, including the instructions
+the stub skips. Any changed hook, cave, state byte, or user mod in a record
+skips the entire FPS Unlock patch transactionally.
+
+FPS Unlock reserves `0x1C0` bytes from `0x4E9FE00`. Its step state occupies
+`0x4E9FEB0..0x4E9FFC0` (end exclusive): a replacement index at `+0`, then 16
+slots of `{u64 counter address, f32 remainder, pad}` at `+0x10`. The range
+`0x4E9FE10..0x4E9FEB0` stays free for the separate open water PR #1180 (state
+through `+0x98`, cave `0x3C46300`) and sound PR #1289 (state through `+0xA8`,
+caves `0x3C46280` and `0x3C46800`). Those patches are not included here.
+Zero initialization and non-overlap do not establish exclusive BSS ownership
+throughout gameplay.
+
 ## Tests
 
 The `[patch_manager]` tests call production `PatchManager::PatchNSO` with
