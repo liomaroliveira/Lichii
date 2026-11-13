@@ -511,7 +511,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         if (draw.memory_serial != FastDraw::MemorySerial() ||
             draw.texture_registers != ReadTextureRegisters(regs) ||
             regs.transform_feedback_enabled != 0) {
-            const u32 last_break = FastDraw::g_last_break.load(std::memory_order_relaxed);
+            const u32 last_break = FastDraw::LastBreak();
             ++fast_draw_stats.breaks[last_break & 0xff];
             if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
                 ++fast_draw_stats.break_methods[method];

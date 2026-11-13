@@ -807,6 +807,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
+    // E04.T6 step 3g: with the back split, this thread is stage A; its FastDraw breaks ship
+    // with each draw.
+    Nx2FastDraw::t_stage_a = VideoCommon::BackSplit::Enabled();
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     if (Settings::values.pin_gpu_threads.GetValue()) {

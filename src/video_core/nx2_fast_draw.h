@@ -110,8 +110,31 @@ inline thread_local bool t_reads_serials{};
 inline thread_local bool t_serial_bumped{};
 inline thread_local bool t_memory_serial_bumped{};
 
+/// E04.T6 step 3g: stage A of the back split (GPUBack with EDEN_NX2_BACK_SPLIT=1). Its breaks go
+/// to plain counters it ships with each draw (SplitSendFastDraw); GPUBackB, which draws, reads
+/// the global serials plus the shipped ones, so it never sees breaks of draws A is ahead on.
+inline thread_local bool t_stage_a{};
+struct StageSerials {
+    u64 serial{};
+    u64 memory_serial{};
+    u32 last_break{};
+};
+/// Stage A only.
+inline StageSerials g_stage_a;
+/// GPUBackB only: stage A's serials as of the draw it runs; `moved` when A broke since the
+/// previous shipment (LastBreak).
+inline StageSerials g_shipped;
+inline bool g_shipped_moved{};
+
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
+        if (t_stage_a) {
+            StageSerials& a = g_stage_a;
+            a.memory_serial += reason != Reason::Register ? 1 : 0;
+            ++a.serial;
+            a.last_break = static_cast<u32>(reason) | (method << 8);
+            return;
+        }
         if (reason != Reason::Register && !(t_reads_serials && t_memory_serial_bumped)) {
             g_memory_serial.fetch_add(1, std::memory_order_relaxed);
             t_memory_serial_bumped = t_reads_serials;
@@ -129,13 +152,24 @@ inline void Break(Reason reason, u32 method = 0) {
 inline u64 Serial() {
     t_reads_serials = true;
     t_serial_bumped = false;
-    return g_serial.load(std::memory_order_relaxed);
+    return g_serial.load(std::memory_order_relaxed) + g_shipped.serial;
 }
 
 inline u64 MemorySerial() {
     t_reads_serials = true;
     t_memory_serial_bumped = false;
-    return g_memory_serial.load(std::memory_order_relaxed);
+    return g_memory_serial.load(std::memory_order_relaxed) + g_shipped.memory_serial;
+}
+
+/// The thread that draws: the break that changed the serial last (diagnostics).
+inline u32 LastBreak() {
+    return g_shipped_moved ? g_shipped.last_break : g_last_break.load(std::memory_order_relaxed);
+}
+
+/// GPUBackB: stage A's serials shipped before a draw.
+inline void ApplyShipped(const StageSerials& shipped) {
+    g_shipped_moved = shipped.serial != g_shipped.serial;
+    g_shipped = shipped;
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the
@@ -298,16 +332,44 @@ inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
     return true;
 }
 
+/// Stage A of the back split: its delta, shipped with each draw and merged into g_delta on
+/// GPUBackB (MergeDelta).
+inline Delta g_stage_a_delta;
+
+/// The delta notes go to on this thread.
+inline Delta& NoteDelta() {
+    return t_stage_a ? g_stage_a_delta : g_delta;
+}
+
+/// GPUBackB: adds a delta stage A shipped to g_delta.
+inline void MergeDelta(const std::array<u32, 5>& binds, std::span<const u64> writes,
+                       std::span<const u64> device_writes, bool no_uniform_keeps) {
+    Delta& delta = g_delta;
+    for (size_t stage = 0; stage < binds.size(); ++stage) {
+        delta.binds[stage] |= binds[stage];
+    }
+    for (size_t i = 0; i + 1 < writes.size(); i += 2) {
+        delta.no_uniform_keeps |= AppendRange(delta.write_begin, delta.write_end, delta.num_writes,
+                                              writes[i], writes[i + 1]);
+    }
+    for (size_t i = 0; i + 1 < device_writes.size(); i += 2) {
+        delta.no_uniform_keeps |= AppendRange(delta.device_begin, delta.device_end,
+                                              delta.num_device_writes, device_writes[i],
+                                              device_writes[i + 1]);
+    }
+    delta.no_uniform_keeps |= no_uniform_keeps;
+}
+
 inline void NoteBind(size_t stage, u32 slot) {
     if (Enabled()) {
-        g_delta.binds[stage] |= 1U << slot;
+        NoteDelta().binds[stage] |= 1U << slot;
     }
 }
 
 /// Inline constant buffer data written to GPU addresses [begin, end).
 inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
     if (Enabled()) {
-        Delta& delta = g_delta;
+        Delta& delta = NoteDelta();
         delta.no_uniform_keeps |=
             AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end);
     }
@@ -316,7 +378,7 @@ inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
 /// The device addresses [begin, end) that inline constant buffer data landed on.
 inline void NoteDeviceData(DAddr begin, DAddr end) {
     if (Enabled()) {
-        Delta& delta = g_delta;
+        Delta& delta = NoteDelta();
         delta.no_uniform_keeps |= AppendRange(delta.device_begin, delta.device_end,
                                               delta.num_device_writes, begin, end);
     }

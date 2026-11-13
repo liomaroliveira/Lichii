@@ -1224,6 +1224,70 @@ void SplitApplyDraw(const u64* payload) {
     }
 }
 
+// E04.T6 step 3g: stage A's FastDraw serials and delta, shipped before each draw so GPUBackB
+// compares draws against the breaks up to that draw, not those of draws A is ahead on.
+struct SplitFastDrawHeader {
+    VideoCommon::Nx2FastDraw::StageSerials serials;
+    std::array<u32, 5> binds;
+    u32 num_writes;
+    u32 num_device_writes;
+    u32 no_uniform_keeps;
+    // Followed by num_writes and num_device_writes [begin, end) pairs of u64.
+};
+
+void SplitApplyFastDraw(const u64* payload) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    SplitFastDrawHeader header;
+    std::memcpy(&header, payload, sizeof(header));
+    FastDraw::ApplyShipped(header.serials);
+    if (header.num_writes + header.num_device_writes == 0 &&
+        (header.binds[0] | header.binds[1] | header.binds[2] | header.binds[3] |
+         header.binds[4]) == 0 &&
+        header.no_uniform_keeps == 0) [[likely]] {
+        return;
+    }
+    const auto* ranges = reinterpret_cast<const u64*>(reinterpret_cast<const u8*>(payload) +
+                                                      sizeof(SplitFastDrawHeader));
+    FastDraw::MergeDelta(header.binds, std::span(ranges, header.num_writes * 2),
+                         std::span(ranges + header.num_writes * 2, header.num_device_writes * 2),
+                         header.no_uniform_keeps != 0);
+}
+
+void SplitSendFastDraw() {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    if (!FastDraw::t_stage_a) {
+        return;
+    }
+    constexpr size_t MaxBytes = sizeof(SplitFastDrawHeader) + 4 * FastDraw::Delta::MaxWrites * 8;
+    alignas(8) std::array<u8, (MaxBytes + 7) / 8 * 8> data;
+    FastDraw::Delta& delta = FastDraw::g_stage_a_delta;
+    SplitFastDrawHeader header{
+        .serials = FastDraw::g_stage_a,
+        .binds = delta.binds,
+        .num_writes = delta.num_writes,
+        .num_device_writes = delta.num_device_writes,
+        .no_uniform_keeps = delta.no_uniform_keeps ? 1U : 0U,
+    };
+    std::memcpy(data.data(), &header, sizeof(header));
+    size_t bytes = sizeof(header);
+    u64* ranges = reinterpret_cast<u64*>(data.data() + sizeof(header));
+    size_t word = 0;
+    for (u32 i = 0; i < delta.num_writes; ++i) {
+        ranges[word++] = delta.write_begin[i];
+        ranges[word++] = delta.write_end[i];
+    }
+    for (u32 i = 0; i < delta.num_device_writes; ++i) {
+        ranges[word++] = delta.device_begin[i];
+        ranges[word++] = delta.device_end[i];
+    }
+    bytes += word * sizeof(u64);
+    delta.binds = {};
+    delta.num_writes = 0;
+    delta.num_device_writes = 0;
+    delta.no_uniform_keeps = false;
+    VideoCommon::BackSplit::EmitTask(&SplitApplyFastDraw, data.data(), bytes);
+}
+
 void SplitApplyDrawTexture(const u64* payload) {
     Maxwell3D* shadow;
     std::memcpy(&shadow, payload, sizeof(shadow));
@@ -1346,6 +1410,7 @@ void Maxwell3D::SplitSendDraw() {
     if (split_engine == nullptr) {
         return;
     }
+    SplitSendFastDraw();
     const auto& state = draw_manager.draw_state;
     SplitDrawPacket packet{};
     packet.shadow = split_engine;
@@ -1389,6 +1454,7 @@ void Maxwell3D::SplitSendDrawTexture() {
     if (split_engine == nullptr) {
         return;
     }
+    SplitSendFastDraw();
     std::array<u64, 1 + (sizeof(DrawManager::DrawTextureState) + 7) / 8> data{};
     std::memcpy(&data[0], &split_engine, sizeof(split_engine));
     std::memcpy(&data[1], &draw_manager.draw_texture_state, sizeof(DrawManager::DrawTextureState));

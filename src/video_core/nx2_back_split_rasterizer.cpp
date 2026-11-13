@@ -65,9 +65,6 @@ std::array<u64, static_cast<size_t>(Call::Count)> g_counts{};
 
 /// The thread-local state a rasterizer call reads or writes for its calling thread.
 struct Context {
-    bool fd_reads_serials;
-    bool fd_serial_bumped;
-    bool fd_memory_serial_bumped;
     bool signaling_query_report_fence;
     Tegra::Nx2ListStats::WriterTag writer;
     Tegra::Nx2ListStats::ServedDetail served;
@@ -79,9 +76,6 @@ struct Context {
 
     static Context Capture() {
         return Context{
-            .fd_reads_serials = Nx2FastDraw::t_reads_serials,
-            .fd_serial_bumped = Nx2FastDraw::t_serial_bumped,
-            .fd_memory_serial_bumped = Nx2FastDraw::t_memory_serial_bumped,
             .signaling_query_report_fence = VideoCore::g_signaling_query_report_fence,
             .writer = Tegra::Nx2ListStats::t_writer,
             .served = Tegra::Nx2ListStats::t_served,
@@ -94,9 +88,6 @@ struct Context {
     }
 
     void Apply() const {
-        Nx2FastDraw::t_reads_serials = fd_reads_serials;
-        Nx2FastDraw::t_serial_bumped = fd_serial_bumped;
-        Nx2FastDraw::t_memory_serial_bumped = fd_memory_serial_bumped;
         VideoCore::g_signaling_query_report_fence = signaling_query_report_fence;
         Tegra::Nx2ListStats::t_writer = writer;
         Tegra::Nx2ListStats::t_served = served;
