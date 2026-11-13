@@ -341,6 +341,11 @@ struct UserConfig {
     /// per guest call.
     bool host_call_return = false;
 
+    /// x64 only, with omit_block_frame. Pins the K hottest guest GPRs into host callee-saved
+    /// host registers across Run/Step and callbacks (0 = disabled; 2 = X8->RBP, X0->R14, loading
+    /// page_table inline on software lookup fallback instead of dedicating R14 to it).
+    std::uint32_t pin_guest_regs = 0;
+
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
     /// definite behaviour for some unpredictable instructions.

@@ -20,6 +20,7 @@ add_executable(dynarmic_tests
     A64/fibonacci.cpp
     A64/fp_min_max.cpp
     A64/host_call_return.cpp
+    A64/pin_guest_regs.cpp
     A64/misaligned_page_table.cpp
     A64/test_invalidation.cpp
     A64/real_world.cpp

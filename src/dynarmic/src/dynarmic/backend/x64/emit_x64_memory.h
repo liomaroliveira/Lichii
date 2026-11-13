@@ -133,8 +133,9 @@ template<>
     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_table_const_bits;
     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
 
+    const bool share_tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 && ctx.conf.pin_guest_regs < 2;
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
-    const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr(code);
+    const Xbyak::Reg64 tmp = share_tmp ? page : ctx.reg_alloc.ScratchGpr(code);
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp);
 
@@ -167,11 +168,18 @@ template<>
         code.jnz(abort, code.T_NEAR);
     }
 
+    const Xbyak::Reg64 table_base = [&] {
+        if (ctx.conf.pin_guest_regs >= 2) {
+            code.mov(page, u64(reinterpret_cast<uintptr_t>(ctx.conf.page_table)));
+            return page;
+        }
+        return r14;
+    }();
     if (ctx.conf.page_table_log2_stride > 3) {
         code.shl(tmp, int(ctx.conf.page_table_log2_stride));
-        code.mov(page, qword[r14 + tmp.cvt64()]);
+        code.mov(page, qword[table_base + tmp.cvt64()]);
     } else {
-        code.mov(page, qword[r14 + tmp.cvt64() * int(1 << ctx.conf.page_table_log2_stride)]);
+        code.mov(page, qword[table_base + tmp.cvt64() * int(1 << ctx.conf.page_table_log2_stride)]);
     }
 
     // check for marked bit, use as unmapped if marked

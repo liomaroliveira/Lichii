@@ -58,6 +58,7 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface, bool shared_mode)
         : EmitX64(code), conf(conf), shared_mode(shared_mode), jit_interface{jit_interface} {
+    ASSERT(conf.pin_guest_regs == 0 || (conf.pin_guest_regs == 2 && conf.omit_block_frame));
     if (shared_mode || conf.fastmem_pointer) {
         fastmem_patch_info.reserve(65536);
     }
@@ -101,8 +102,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
         std::bitset<32> gprs = any_gpr;
         if (conf.fastmem_pointer)
             gprs.reset(size_t(HostLoc::R13));
-        if (conf.page_table)
+        if (conf.page_table || conf.pin_guest_regs >= 2)
             gprs.reset(size_t(HostLoc::R14));
+        if (conf.pin_guest_regs >= 2)
+            gprs.reset(size_t(HostLoc::RBP));
         return gprs;
     }(), any_xmm, conf.spill_to_free_gpr, conf.scratch_copy_to_free_reg,
        HostCallReturn(conf) ? std::optional<s32>{s32(offsetof(A64JitState, spill))} : std::nullopt);
@@ -601,11 +604,45 @@ void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     code.nzcv_live_pos = flags_live ? code.getCurr() : nullptr;
 }
 
+std::optional<Xbyak::Reg64> A64EmitX64::PinnedHostReg(A64::Reg reg) const {
+    if (conf.pin_guest_regs < 2) {
+        return std::nullopt;
+    }
+    switch (reg) {
+    case A64::Reg::R8:
+        return code.rbp;
+    case A64::Reg::R0:
+        return code.r14;
+    default:
+        return std::nullopt;
+    }
+}
+
+void A64EmitX64::EmitSavePinnedRegs() {
+    if (conf.pin_guest_regs < 2) {
+        return;
+    }
+    code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 8], code.rbp);
+    code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 0], code.r14);
+}
+
+void A64EmitX64::EmitLoadPinnedRegs() {
+    if (conf.pin_guest_regs < 2) {
+        return;
+    }
+    code.mov(code.rbp, code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 8]);
+    code.mov(code.r14, code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 0]);
+}
+
 void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
 
-    code.mov(result, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    if (const auto pinned = PinnedHostReg(reg)) {
+        code.mov(result, pinned->cvt32());
+    } else {
+        code.mov(result, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    }
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
 
@@ -613,7 +650,11 @@ void A64EmitX64::EmitA64GetX(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
 
-    code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    if (const auto pinned = PinnedHostReg(reg)) {
+        code.mov(result, *pinned);
+    } else {
+        code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+    }
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
 
@@ -672,6 +713,21 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     const bool flags_live = code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    if (const auto pinned = PinnedHostReg(reg)) {
+        const Xbyak::Reg32 dst = pinned->cvt32();
+        if (args[1].FitsInImmediateU32()) {
+            code.mov(dst, args[1].GetImmediateU32());
+        } else if (args[1].IsInXmm(ctx.reg_alloc)) {
+            const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(code, args[1]);
+            code.movd(dst, to_store);
+        } else {
+            const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
+            code.mov(dst, to_store.cvt32());
+        }
+        if (flags_live)
+            code.nzcv_live_pos = code.getCurr();
+        return;
+    }
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
@@ -692,6 +748,23 @@ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
     const bool flags_live = code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    if (const auto pinned = PinnedHostReg(reg)) {
+        const Xbyak::Reg64 dst = *pinned;
+        if (args[1].FitsInImmediateS32()) {
+            code.mov(dst, args[1].GetImmediateS32());
+        } else if (args[1].FitsInImmediateU32()) {
+            code.mov(dst.cvt32(), args[1].GetImmediateU32());
+        } else if (args[1].IsInXmm(ctx.reg_alloc)) {
+            const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(code, args[1]);
+            code.movq(dst, to_store);
+        } else {
+            const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
+            code.mov(dst, to_store);
+        }
+        if (flags_live)
+            code.nzcv_live_pos = code.getCurr();
+        return;
+    }
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
@@ -795,9 +868,11 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
+    EmitSavePinnedRegs();
     EmitCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
+    EmitLoadPinnedRegs();
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_state)], u8(0));
 }
@@ -808,10 +883,12 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
     const u64 pc = args[0].GetImmediateU64();
     const u64 exception = args[1].GetImmediateU64();
+    EmitSavePinnedRegs();
     EmitCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], pc);
         code.mov(param[1], exception);
     });
+    EmitLoadPinnedRegs();
 }
 
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {

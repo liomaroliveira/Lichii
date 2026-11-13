@@ -511,6 +511,20 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         // indirect jump through the return stack buffer (multicore only, no cycle counter).
         config.host_call_return = jit_on("callret") && !config.enable_cycle_counting;
     }
+    static const std::uint32_t jit_pin = []() -> std::uint32_t {
+        const char* v = std::getenv("EDEN_NX2_JIT_PIN");
+        if (!v || !*v) {
+            return 0;
+        }
+        return std::strtoul(v, nullptr, 10) >= 2 ? 2 : 0;
+    }();
+    if (jit_pin >= 2) {
+        if (config.omit_block_frame) {
+            config.pin_guest_regs = 2;
+        } else {
+            LOG_WARNING(Core_ARM, "EDEN_NX2_JIT_PIN={} ignored because omit_block_frame is off", jit_pin);
+        }
+    }
 #endif
     static const bool shared_jit_on = [] {
         const char* v = std::getenv("EDEN_NX2_SHARED_JIT");

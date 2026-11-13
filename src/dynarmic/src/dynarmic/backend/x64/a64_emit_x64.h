@@ -90,6 +90,9 @@ public:
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
     void GenTerminalHandlers();
+    std::optional<Xbyak::Reg64> PinnedHostReg(A64::Reg reg) const;
+    void EmitSavePinnedRegs();
+    void EmitLoadPinnedRegs();
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);

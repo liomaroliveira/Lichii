@@ -45,7 +45,8 @@ struct RunCodeCallbacks {
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
-    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
+    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp,
+                std::function<void(BlockOfCode&)> epilogue = {});
     BlockOfCode(const BlockOfCode&) = delete;
 
     /// Call when external emitters have finished emitting their preludes.
@@ -231,7 +232,7 @@ private:
     CodePtr code_begin = nullptr;
     bool prelude_complete = false;
 
-    void GenRunCode(std::function<void(BlockOfCode&)> rcp);
+    void GenRunCode(std::function<void(BlockOfCode&)> rcp, std::function<void(BlockOfCode&)> epilogue);
 };
 
 }  // namespace Dynarmic::Backend::X64

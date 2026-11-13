@@ -69,7 +69,10 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
 
 static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
     return [conf](BlockOfCode& code) {
-        if (conf.page_table) {
+        if (conf.pin_guest_regs >= 2) {
+            code.mov(code.rbp, code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 8]);
+            code.mov(code.r14, code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 0]);
+        } else if (conf.page_table) {
             code.mov(code.r14, std::bit_cast<u64>(conf.page_table));
         }
         if (conf.fastmem_pointer) {
@@ -84,6 +87,16 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
             code.lea(code.rax, code.ptr[code.rsp - HostCallFrameSize * HostCallMaxDepth]);
             code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, host_stack_limit)], code.rax);
         }
+    };
+}
+
+static std::function<void(BlockOfCode&)> GenExitEpilogue(const A64::UserConfig& conf) {
+    if (conf.pin_guest_regs < 2) {
+        return {};
+    }
+    return [](BlockOfCode& code) {
+        code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 8], code.rbp);
+        code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * 0], code.r14);
     };
 }
 
@@ -108,11 +121,12 @@ struct SharedCodeCache final {
         : conf(conf)
         , is_shared(is_shared)
         , block_of_code(GenRunCodeCallbacks(conf.callbacks, LookupBlock, single_core_arg, conf, is_shared),
-                        JitStateInfo{dummy_state, RsbPtrMask(conf)}, conf.code_cache_size, GenRCP(conf))
+                        JitStateInfo{dummy_state, RsbPtrMask(conf)}, conf.code_cache_size, GenRCP(conf), GenExitEpilogue(conf))
         , emitter(block_of_code, conf, nullptr, is_shared)
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
+        ASSERT(conf.pin_guest_regs == 0 || (conf.pin_guest_regs == 2 && conf.omit_block_frame));
     }
 
     ~SharedCodeCache() {

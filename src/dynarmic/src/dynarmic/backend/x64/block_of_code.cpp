@@ -170,7 +170,8 @@ bool IsUnderRosetta() {
 
 }  // anonymous namespace
 
-BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp)
+BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp,
+                         std::function<void(BlockOfCode&)> epilogue)
     : Xbyak::CodeGenerator(total_code_size
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         , Xbyak::DontSetProtectRWE
@@ -184,7 +185,7 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
 {
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
-    GenRunCode(rcp);
+    GenRunCode(std::move(rcp), std::move(epilogue));
 }
 
 bool BlockOfCode::HasHostFeature(HostFeature feature) const noexcept {
@@ -342,7 +343,7 @@ void BlockOfCode::ForceReturnFromRunCode(bool mxcsr_already_exited) {
     jmp(return_from_run_code[index]);
 }
 
-void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
+void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp, std::function<void(BlockOfCode&)> epilogue) {
     Xbyak::Label return_to_caller, return_to_caller_mxcsr_already_exited;
 
     align();
@@ -440,6 +441,10 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     return_from_run_code[MXCSR_ALREADY_EXITED | FORCE_RETURN] = getCurr<const void*>();
     L(return_to_caller_mxcsr_already_exited);
     reset_host_stack();
+
+    if (epilogue) {
+        epilogue(*this);
+    }
 
     if (cb.enable_cycle_counting) {
         cb.AddTicks.EmitCall(*this, [this](RegList param) {
