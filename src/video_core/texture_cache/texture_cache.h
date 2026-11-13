@@ -344,9 +344,9 @@ void TextureCache<P>::RetireStaleTargets() {
     // Bad-overlap targets can fill the cache before collection starts. Retire them at the
     // collector's critical age, independently of memory pressure and costly textures.
     constexpr size_t MaxPerFrame = 512;
-    // Candidates the checks below keep are examined but take no retirement slot, so a run of
-    // them at the old end of the LRU cannot hide the retirable ones behind it. This bounds the
-    // examined ones instead.
+    // Candidates the checks below keep are examined but take no retirement slot. A scan that
+    // stops at this bound leaves the next one to resume after the candidates it examined, so a
+    // run of kept targets at the old end of the LRU cannot hold every scan in front of it.
     constexpr size_t MaxExaminedPerFrame = 8 * MaxPerFrame;
     const u64 cutoff = frame_tick - STALE_TARGET_AGE;
     const auto unused = [&](ImageId image_id) {
@@ -378,22 +378,32 @@ void TextureCache<P>::RetireStaleTargets() {
     };
     boost::container::small_vector<ImageId, 64> aged;
     bool references_collected = false;
+    const size_t resume_from = stale_retire_resume;
+    size_t matched = 0;
     size_t examined = 0;
+    bool stopped = false;
     lru_cache.ForEachItemBelow(cutoff, [&](ImageId image_id) {
         const Image& image = slot_images[image_id];
         if (False(image.flags & ImageFlagBits::BadOverlap) || !GpuWrittenRenderTarget(image) ||
             !StaleMarkerCovers(image)) {
             return false;
         }
+        if (matched++ < resume_from) {
+            return false; // Examined by an earlier scan of this round.
+        }
         if (!references_collected) {
             CollectStaleReferences();
             references_collected = true;
         }
+        ++examined;
         if (!kept(image_id, image)) {
             aged.push_back(image_id);
         }
-        return aged.size() >= MaxPerFrame || ++examined >= MaxExaminedPerFrame;
+        stopped = aged.size() >= MaxPerFrame || examined >= MaxExaminedPerFrame;
+        return stopped;
     });
+    // A scan that reaches the end of the old candidates starts the next round at the oldest.
+    stale_retire_resume = stopped ? resume_from + examined : 0;
     if (aged.empty()) {
         return;
     }
@@ -438,6 +448,9 @@ void TextureCache<P>::RetireStaleTargets() {
         }
         if (retire(image_id)) {
             --remaining;
+            if (stopped) {
+                --stale_retire_resume; // Left the LRU: no longer in front of the resume point.
+            }
             for (const ImageId partner_id : partners) {
                 if (retire(partner_id)) {
                     --remaining;

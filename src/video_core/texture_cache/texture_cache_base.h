@@ -683,6 +683,9 @@ private:
     void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
     StalePages stale_pages;
     ::Common::unordered_set<ImageId> stale_references;
+    /// RetireStaleTargets: matching candidates in front of the point where its last scan
+    /// stopped at its examination bound (0 after a scan that reached the end).
+    size_t stale_retire_resume{};
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
