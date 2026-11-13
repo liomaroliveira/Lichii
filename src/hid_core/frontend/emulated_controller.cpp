@@ -23,6 +23,10 @@ constexpr Common::UUID TAS_UUID =
     Common::UUID{{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7, 0xA5, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}};
 constexpr Common::UUID VIRTUAL_UUID =
     Common::UUID{{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7, 0xFF, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}};
+// EDEN_NX2_KEYBOARD_LAYER: its own UUID, so SetButton/SetStick hand a button or stick over to the
+// keyboard when a key is pressed and back to the mapped device when it is pressed
+constexpr Common::UUID NX2_KEYBOARD_UUID =
+    Common::UUID{{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7, 0xBD, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}};
 
 EmulatedController::EmulatedController(NpadIdType npad_id_type_) : npad_id_type(npad_id_type_) {}
 
@@ -228,6 +232,31 @@ void EmulatedController::LoadDevices() {
                            Common::Input::CreateInputDevice);
     std::ranges::transform(virtual_motion_params, virtual_motion_devices.begin(),
                            Common::Input::CreateInputDevice);
+
+    // EDEN_NX2_KEYBOARD_LAYER: a key the mapped device already uses is left to it (no double input)
+    const auto is_keyboard = [](const Common::ParamPackage& param) {
+        return param.Get("engine", "") == "keyboard" || param.Get("engine", "") == "analog_from_button";
+    };
+    for (std::size_t index = 0; index < nx2_keyboard_button_devices.size(); ++index) {
+        nx2_keyboard_button_devices[index].reset();
+        const auto& param = nx2_keyboard_button_params[index];
+        if (param.Has("engine") && !is_keyboard(button_params[index])) {
+            nx2_keyboard_button_devices[index] = Common::Input::CreateInputDevice(param);
+        }
+    }
+    for (std::size_t index = 0; index < nx2_keyboard_stick_devices.size(); ++index) {
+        nx2_keyboard_stick_devices[index].reset();
+        const auto& param = nx2_keyboard_stick_params[index];
+        if (param.Has("engine") && !is_keyboard(stick_params[index])) {
+            nx2_keyboard_stick_devices[index] = Common::Input::CreateInputDevice(param);
+        }
+    }
+}
+
+void EmulatedController::SetNx2KeyboardLayer(const ButtonParams& buttons,
+                                             const StickParams& sticks) {
+    nx2_keyboard_button_params = buttons;
+    nx2_keyboard_stick_params = sticks;
 }
 
 void EmulatedController::LoadTASParams() {
@@ -523,6 +552,30 @@ void EmulatedController::ReloadInput() {
                 },
         });
     }
+    // Register the keyboard layer (EDEN_NX2_KEYBOARD_LAYER). No need to force update
+    for (std::size_t index = 0; index < nx2_keyboard_button_devices.size(); ++index) {
+        if (!nx2_keyboard_button_devices[index]) {
+            continue;
+        }
+        nx2_keyboard_button_devices[index]->SetCallback({
+            .on_change =
+                [this, index](const Common::Input::CallbackStatus& callback) {
+                    SetButton(callback, index, NX2_KEYBOARD_UUID);
+                },
+        });
+    }
+
+    for (std::size_t index = 0; index < nx2_keyboard_stick_devices.size(); ++index) {
+        if (!nx2_keyboard_stick_devices[index]) {
+            continue;
+        }
+        nx2_keyboard_stick_devices[index]->SetCallback({
+            .on_change =
+                [this, index](const Common::Input::CallbackStatus& callback) {
+                    SetStick(callback, index, NX2_KEYBOARD_UUID);
+                },
+        });
+    }
     turbo_button_state = 0;
     is_initialized = true;
 }
@@ -564,6 +617,12 @@ void EmulatedController::UnloadInput() {
     }
     for (auto& motion : virtual_motion_devices) {
         motion.reset();
+    }
+    for (auto& button : nx2_keyboard_button_devices) {
+        button.reset();
+    }
+    for (auto& stick : nx2_keyboard_stick_devices) {
+        stick.reset();
     }
     for (auto& camera : camera_devices) {
         camera.reset();

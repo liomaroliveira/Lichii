@@ -182,6 +182,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 // Input //
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "input_common/main.h"
+#include "qt_common/config/qt_config.h"
 #include "input_common/drivers/virtual_amiibo.h"
 
 // Video Core //
@@ -503,6 +505,31 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         nx2_automap_timer.setInterval(2000);
         connect(&nx2_automap_timer, &QTimer::timeout, this, &MainWindow::Nx2AutoMapController);
         nx2_automap_timer.start();
+    }
+    // EDEN_NX2_KEYBOARD_LAYER=1: the keyboard (Lichii's default keys) also drives player 1 and
+    // handheld next to the mapped controller, as in PC games: whichever is pressed takes over.
+    if (const char* layer = std::getenv("EDEN_NX2_KEYBOARD_LAYER"); layer != nullptr && layer[0] == '1') {
+        Core::HID::ButtonParams buttons{};
+        Core::HID::StickParams sticks{};
+        for (std::size_t i = 0; i < buttons.size(); ++i) {
+            if (QtConfig::default_buttons[i] != 0) {
+                buttons[i] = Common::ParamPackage{
+                    InputCommon::GenerateKeyboardParam(QtConfig::default_buttons[i])};
+            }
+        }
+        for (std::size_t i = 0; i < sticks.size(); ++i) {
+            const auto& keys = QtConfig::default_analogs[i];
+            sticks[i] = Common::ParamPackage{InputCommon::GenerateAnalogParamFromKeys(
+                keys[0], keys[1], keys[2], keys[3], QtConfig::default_stick_mod[i], 0.5f)};
+        }
+        auto& hid = QtCommon::system->HIDCore();
+        for (const auto id : {Core::HID::NpadIdType::Player1, Core::HID::NpadIdType::Handheld}) {
+            if (auto* controller = hid.GetEmulatedController(id)) {
+                controller->SetNx2KeyboardLayer(buttons, sticks);
+                controller->ReloadInput();
+            }
+        }
+        LOG_INFO(Frontend, "EDEN_NX2_KEYBOARD_LAYER: keyboard and controller both drive player 1");
     }
 
     if (has_broken_vulkan) {

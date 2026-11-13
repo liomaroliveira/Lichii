@@ -270,6 +270,13 @@ public:
     /// Reload all input devices
     void ReloadInput();
 
+    /**
+     * EDEN_NX2_KEYBOARD_LAYER: a second set of inputs (the keyboard) that drives the same buttons
+     * and sticks as the mapped device, as PC games do: whichever device is pressed takes over.
+     * Empty parameters turn the layer off. Takes effect at the next ReloadInput().
+     */
+    void SetNx2KeyboardLayer(const ButtonParams& buttons, const StickParams& sticks);
+
     /// Overrides current mapped devices with the stored configuration and reloads all input devices
     void ReloadFromSettings();
 
@@ -649,6 +656,12 @@ private:
     ButtonDevices virtual_button_devices;
     StickDevices virtual_stick_devices;
     ControllerMotionDevices virtual_motion_devices;
+
+    // EDEN_NX2_KEYBOARD_LAYER: keyboard inputs that share the mapped device's buttons and sticks
+    ButtonParams nx2_keyboard_button_params;
+    StickParams nx2_keyboard_stick_params;
+    ButtonDevices nx2_keyboard_button_devices;
+    StickDevices nx2_keyboard_stick_devices;
 
     std::optional<InjectedInput> Injected() const;
 
