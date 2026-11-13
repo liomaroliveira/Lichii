@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <utility>
 #include <vector>
 #include "common/container/unordered_map.h"
@@ -21,6 +22,16 @@ class Inst;
 }
 
 namespace Shader {
+
+/// A constant buffer pointer slot (index, offset), or the entry `indirect` bytes into the pointer
+/// table that slot points to.
+struct StoragePointerSlot {
+    u32 index;
+    u32 offset;
+    std::optional<u32> indirect;
+
+    bool operator==(const StoragePointerSlot&) const = default;
+};
 
 struct CbufWordKey {
     u32 index;
@@ -92,8 +103,9 @@ public:
         return true;
     }
 
-    /// Native programs: (index, offset) slots classified as non-pointers because they were null.
-    [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
+    /// Native programs: slots classified as non-pointers because they held null or an unmapped
+    /// address when the program was translated, plain constant buffer and pointer-table slots.
+    [[nodiscard]] virtual std::vector<StoragePointerSlot> UnboundStoragePointerSlots() const {
         return {};
     }
 

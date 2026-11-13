@@ -56,21 +56,22 @@ constexpr size_t INST_SIZE = sizeof(u64);
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
-// Constant buffer slots that held a null pointer when the program was translated and were
-// therefore not bound as storage buffers. A later non-null value makes the translation stale.
-static std::vector<std::pair<u32, u32>> NullStoragePointerSlots(
+// Pointer slots that held null or an unmapped address when the program was translated and were
+// therefore not bound as storage buffers. A later mapped address makes the translation stale.
+static std::vector<Shader::StoragePointerSlot> UnboundStoragePointerSlots(
     const ::Common::unordered_map<u64, u32>& cbuf_values,
     const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
-    std::vector<std::pair<u32, u32>> slots;
+    std::vector<Shader::StoragePointerSlot> slots;
     for (const auto& [key, type] : storage_pointer_types) {
-        if (type != 0 || (key >> 63) != 0) {
+        if (type != 0) {
             continue;
         }
-        const auto low = cbuf_values.find(key);
-        const auto high = cbuf_values.find(key + 4);
-        if (low != cbuf_values.end() && high != cbuf_values.end() && low->second == 0 &&
-            high->second == 0) {
-            slots.emplace_back(static_cast<u32>(key >> 32), static_cast<u32>(key));
+        const u32 index = static_cast<u32>(key >> 32) & 0xff;
+        const u32 offset = static_cast<u32>(key);
+        if ((key >> 63) != 0) {
+            slots.push_back({index, offset, static_cast<u32>(key >> 40) & 0x3fffff});
+        } else if (cbuf_values.contains(key) && cbuf_values.contains(key + 4)) {
+            slots.push_back({index, offset, std::nullopt});
         }
     }
     return slots;
@@ -284,8 +285,8 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
     return mapped;
 }
 
-std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() const {
-    return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+std::vector<Shader::StoragePointerSlot> GenericEnvironment::UnboundStoragePointerSlots() const {
+    return VideoCommon::UnboundStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
 std::vector<u64> GenericEnvironment::MappedStoragePointerKeys() const {
@@ -1302,8 +1303,8 @@ bool FileEnvironment::IsNativeProgram() const {
     return Shader::Ampere::HasNativeAddressMap(code);
 }
 
-std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {
-    return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+std::vector<Shader::StoragePointerSlot> FileEnvironment::UnboundStoragePointerSlots() const {
+    return VideoCommon::UnboundStoragePointerSlots(cbuf_values, storage_pointer_types);
 }
 
 std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {

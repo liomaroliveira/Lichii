@@ -63,7 +63,7 @@ public:
     [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
                                                           u32 indirect) override;
 
-    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+    [[nodiscard]] std::vector<Shader::StoragePointerSlot> UnboundStoragePointerSlots() const override;
 
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
@@ -273,7 +273,7 @@ public:
     [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
                                                           u32 indirect) override;
 
-    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+    [[nodiscard]] std::vector<Shader::StoragePointerSlot> UnboundStoragePointerSlots() const override;
 
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 

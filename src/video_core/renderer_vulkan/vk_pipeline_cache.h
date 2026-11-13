@@ -110,8 +110,8 @@ using VideoCommon::ShaderPools;
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
-    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
-    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Pointer slots left unbound at translation (see UnboundStoragePointerSlots)
+    std::vector<Shader::StoragePointerSlot> unbound_pointer_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
@@ -183,7 +183,8 @@ private:
     /// Releases the pools' contents and keeps a few for later builds
     void ReturnPools(std::shared_ptr<ShaderPools> pools);
 
-    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+    [[nodiscard]] bool StaleUnboundPointerSlot(const ComputePipelineCacheEntry& entry,
+                                               u64 shader_hash) const;
 
     /// Translates the current compute program, binding the pointers in keep_pointers whatever
     /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
