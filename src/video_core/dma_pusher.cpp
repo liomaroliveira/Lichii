@@ -444,8 +444,10 @@ bool DmaPusher::Step() {
 
     // A guest write that trapped while the caches were busy is left to the next gather
     // (RasterizerVulkan::OnCPUWrite): apply those before a new list's work, which the game may have
-    // submitted to read them.
-    if (dma_pushbuffer_subindex == 0 && command_resume_offset == 0) {
+    // submitted to read them, and after a resumed acquire, which the game may have released once
+    // it wrote them.
+    const bool resumed = suspensions.load(std::memory_order_relaxed) != suspensions_before;
+    if ((dma_pushbuffer_subindex == 0 && command_resume_offset == 0) || resumed) {
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             split.Defer([r = rasterizer] { r->InvalidateGPUCache(); });
         } else {
