@@ -344,20 +344,11 @@ void TextureCache<P>::RetireStaleTargets() {
     // Bad-overlap targets can fill the cache before collection starts. Retire them at the
     // collector's critical age, independently of memory pressure and costly textures.
     constexpr size_t MaxPerFrame = 512;
+    // Candidates the checks below keep are examined but take no retirement slot, so a run of
+    // them at the old end of the LRU cannot hide the retirable ones behind it. This bounds the
+    // examined ones instead.
+    constexpr size_t MaxExaminedPerFrame = 8 * MaxPerFrame;
     const u64 cutoff = frame_tick - STALE_TARGET_AGE;
-    boost::container::small_vector<ImageId, 64> aged;
-    lru_cache.ForEachItemBelow(cutoff, [&](ImageId image_id) {
-        const Image& image = slot_images[image_id];
-        if (True(image.flags & ImageFlagBits::BadOverlap) && GpuWrittenRenderTarget(image) &&
-            StaleMarkerCovers(image)) {
-            aged.push_back(image_id);
-        }
-        return aged.size() >= MaxPerFrame;
-    });
-    if (aged.empty()) {
-        return;
-    }
-    CollectStaleReferences();
     const auto unused = [&](ImageId image_id) {
         const Image& image = slot_images[image_id];
         return image.lru_index != SIZE_MAX && lru_cache.GetTick(image.lru_index) <= cutoff;
@@ -385,6 +376,27 @@ void TextureCache<P>::RetireStaleTargets() {
         }
         return false;
     };
+    boost::container::small_vector<ImageId, 64> aged;
+    bool references_collected = false;
+    size_t examined = 0;
+    lru_cache.ForEachItemBelow(cutoff, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::BadOverlap) || !GpuWrittenRenderTarget(image) ||
+            !StaleMarkerCovers(image)) {
+            return false;
+        }
+        if (!references_collected) {
+            CollectStaleReferences();
+            references_collected = true;
+        }
+        if (!kept(image_id, image)) {
+            aged.push_back(image_id);
+        }
+        return aged.size() >= MaxPerFrame || ++examined >= MaxExaminedPerFrame;
+    });
+    if (aged.empty()) {
+        return;
+    }
     const auto retire = [&](ImageId image_id) {
         Image& image = slot_images[image_id];
         MarkStale(image); // Keep page tracking before removing the image's own tracking.
@@ -405,7 +417,9 @@ void TextureCache<P>::RetireStaleTargets() {
             break;
         }
         const Image& image = slot_images[image_id];
-        if (False(image.flags & ImageFlagBits::BadOverlap) || kept(image_id, image)) {
+        // Retiring the images before this one only removes partners and overlaps, so it cannot
+        // make this one kept; it can clear its BadOverlap once no overlap is left.
+        if (False(image.flags & ImageFlagBits::BadOverlap)) {
             continue;
         }
         // A sampled twin with no other aliases goes with its target when both are unused.
