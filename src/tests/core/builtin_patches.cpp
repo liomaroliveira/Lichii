@@ -242,6 +242,13 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
 
 namespace {
 
+// The three "frame rate over 100" branches FPS Unlock removes, with their original words.
+constexpr std::array<std::pair<size_t, u32>, 3> GroundVelocityBranches{{
+    {sizeof(Loader::NSOHeader) + 0x13A070, 0x5400196C},
+    {sizeof(Loader::NSOHeader) + 0x13D710, 0x54001E2C},
+    {sizeof(Loader::NSOHeader) + 0x389AC2C, 0x540017CC},
+}};
+
 std::vector<u8> MakeDynamicMain() {
     auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
     nso.resize(DynamicStateOffset + StepStateSize);
@@ -266,6 +273,9 @@ std::vector<u8> MakeDynamicMain() {
         0x3F, 0x05, 0x00, 0x71, 0x29, 0xC5, 0x9F, 0x1A,
     };
     std::copy(hitstop_original.begin(), hitstop_original.end(), nso.begin() + HitstopHookOffset);
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        std::memcpy(nso.data() + offset, &original, sizeof(original));
+    }
     return nso;
 }
 
@@ -470,6 +480,36 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Built-in FPS Unlock removes the ground velocity branches", "[patch_manager]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    auto patched = manager.PatchNSO(nso, "main");
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        REQUIRE(WordAt(patched, offset) == NopInstruction);
+    }
+
+    // Dynamic FPS never exceeds 60 fps and keeps the game's branches.
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        REQUIRE(WordAt(patched, offset) == original);
+    }
+
+    // Another branch at one of the sites skips all of FPS Unlock.
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
+    for (const auto& [changed, word] : GroundVelocityBranches) {
+        auto other = nso;
+        other[changed] ^= 1;
+        patched = manager.PatchNSO(other, "main");
+        REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
+        for (const auto& [offset, original] : GroundVelocityBranches) {
+            REQUIRE(WordAt(patched, offset) == WordAt(other, offset));
+        }
+    }
 }
 
 TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transactionally",

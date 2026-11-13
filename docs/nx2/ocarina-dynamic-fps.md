@@ -111,6 +111,15 @@ caves `0x3C46280` and `0x3C46800`). Those patches are not included here.
 Zero initialization and non-overlap do not establish exclusive BSS ownership
 throughout gameplay.
 
+## FPS Unlock ground velocity
+
+The character controller compares a frame-rate value with `100.0` in three places; above it
+(`b.gt` at `0x13A070`, `0x13D710` and `0x389AC2C`) it scales its ground's velocity by `0.1`
+(`0x3E40FB4`). Over 100 fps a moving platform then slides away under the player.
+`FPS Unlock (built-in)` replaces the three branches with `nop`. `Dynamic FPS by Dark (built-in)`
+never exceeds 60 fps and leaves them alone. Measured on the Deku Tree B1 raft: the applied
+velocity was 0.100 of the ground's at steps below 0.6 and 1.000 at steps of 0.627 and above.
+
 ## Tests
 
 The `[patch_manager]` tests call production `PatchManager::PatchNSO` with
