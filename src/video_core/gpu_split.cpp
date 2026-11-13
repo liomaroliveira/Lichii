@@ -820,6 +820,29 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    // E04.T6 step 4a: with the back split, `consumed` means GPUBackB ran it: stage A sends the
+    // position in ring order and GPUBackB stores it (published at once, or a front waiting for it
+    // while this thread sleeps would never wake).
+    const bool split_consumed = Nx2FastDraw::t_stage_a;
+    const auto store_consumed = [&](u64 position) {
+        if (split_consumed) [[unlikely]] {
+            struct Mark {
+                GpuSplit* split;
+                u64 position;
+            } const mark{this, position};
+            VideoCommon::BackSplit::EmitTask(
+                [](const u64* payload) {
+                    Mark m;
+                    std::memcpy(&m, payload, sizeof(m));
+                    m.split->StoreConsumed(m.position);
+                },
+                &mark, sizeof(mark));
+            VideoCommon::BackSplit::Flush();
+            return;
+        }
+        consumed.store(position, std::memory_order_seq_cst);
+        NotifyFront();
+    };
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
         VideoCommon::BackSplit::MaybeReport();
@@ -891,13 +914,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
-                consumed.store(read_position, std::memory_order_seq_cst);
+                store_consumed(read_position);
                 last_store = read_position;
-                NotifyFront();
             }
         }
-        consumed.store(read_position, std::memory_order_seq_cst);
-        NotifyFront();
+        store_consumed(read_position);
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);

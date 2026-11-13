@@ -701,6 +701,15 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
+public:
+    /// E04.T6 step 4a: with the back split, GPUBackB stores the position once it ran everything
+    /// stage A executed before it (the front reads `consumed` as "the back ran it").
+    void StoreConsumed(u64 position) {
+        consumed.store(position, std::memory_order_seq_cst);
+        NotifyFront();
+    }
+
+private:
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {

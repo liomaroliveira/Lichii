@@ -710,6 +710,11 @@ void Maxwell3D::VerifyCallMethod(Core::System& system, u32 method, u32 method_ar
               shadow_state.reg_array[method], flag_differences);
 }
 
+namespace {
+bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const void* data,
+                       size_t bytes, bool note, bool words);
+} // Anonymous namespace
+
 void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
                                      const u32* arguments, u32 count) {
     const u32 offset = regs.const_buffer.offset;
@@ -734,6 +739,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             CallMethod(system, methods[i], arguments[i], true);
         }
         std::array<u32, 64> written;
+        if (VideoCommon::Nx2FastDraw::t_stage_a) {
+            VideoCommon::BackSplit::DrainAsync(); // GPUBackB writes the words (step 4b)
+        }
         const bool mapped = memory_manager.IsFullyMappedRange(address + offset, bytes);
         if (mapped) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::StageACbReadbacks, 1);
@@ -766,15 +774,12 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
-    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-        const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-        VideoCommon::BackSplit::EmitCbUpload(address + offset, values.data(), count);
-    }
     // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
     const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
                       !FastDrawHeaderWrite(address + offset, address + offset + bytes);
-    if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address + offset,
-                                                      values.data(), bytes)) {
+    const bool sent = SplitSendCbUpload(memory_manager, address + offset, values.data(), bytes, note, true);
+    if (!sent && (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address + offset,
+                                                                values.data(), bytes))) {
         memory_manager.WriteWordsCached(address + offset, values.data(), count);
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
@@ -1028,6 +1033,13 @@ void Maxwell3D::ProcessQueryCondition() {
         execute_on = false;
         break;
     case Regs::RenderEnable::Override::UseRenderEnable: {
+        // E04.T6 step 4d: a constant buffer upload sent to GPUBackB may not have landed.
+        if (VideoCommon::Nx2FastDraw::t_stage_a &&
+            regs.render_enable.mode != Regs::RenderEnable::Mode::True &&
+            regs.render_enable.mode != Regs::RenderEnable::Mode::False) [[unlikely]] {
+            VideoCommon::BackSplit::GuardRead(condition_address, sizeof(cmp),
+                                              VideoCommon::BackSplit::GuardSite::Query);
+        }
         switch (regs.render_enable.mode) {
         case Regs::RenderEnable::Mode::True: {
             execute_on = true;
@@ -1251,6 +1263,61 @@ void SplitApplyFastDraw(const u64* payload) {
     FastDraw::MergeDelta(header.binds, std::span(ranges, header.num_writes * 2),
                          std::span(ranges + header.num_writes * 2, header.num_device_writes * 2),
                          header.no_uniform_keeps != 0);
+}
+
+// E04.T6 step 4b: constant buffer uploads land in guest memory on GPUBackB, in ring order, so
+// a draw B runs reads the words of its own upload and not those of draws A is ahead on.
+struct SplitCbUploadHeader {
+    Tegra::MemoryManager* memory;
+    GPUVAddr address;
+    u32 bytes;
+    u32 flags; ///< bit 0: note the data for fast draws (WriteData); bit 1: whole words
+};
+constexpr u32 SplitCbNote = 1;
+constexpr u32 SplitCbWords = 2;
+
+void SplitApplyCbUpload(const u64* payload) {
+    SplitCbUploadHeader header;
+    std::memcpy(&header, payload, sizeof(header));
+    const auto* data = reinterpret_cast<const u8*>(payload) + sizeof(SplitCbUploadHeader);
+    if ((header.flags & SplitCbNote) != 0 &&
+        VideoCommon::Nx2FastDraw::WriteData(*header.memory, header.address, data, header.bytes)) {
+        return;
+    }
+    if ((header.flags & SplitCbWords) != 0) {
+        header.memory->WriteWordsCached(header.address, reinterpret_cast<const u32*>(data),
+                                        header.bytes / sizeof(u32));
+    } else {
+        header.memory->WriteBlockCached(header.address, data, header.bytes);
+    }
+}
+
+/// Stage A: sends a constant buffer upload to GPUBackB (false: not stage A, write it here).
+bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const void* data,
+                       size_t bytes, bool note, bool words) {
+    if (!VideoCommon::Nx2FastDraw::t_stage_a) [[likely]] {
+        return false;
+    }
+    const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+    constexpr size_t MaxInline = 256;
+    alignas(8) std::array<u8, sizeof(SplitCbUploadHeader) + MaxInline> small;
+    std::vector<u8> large;
+    u8* buffer = small.data();
+    if (bytes > MaxInline) [[unlikely]] {
+        large.resize(sizeof(SplitCbUploadHeader) + bytes);
+        buffer = large.data();
+    }
+    const SplitCbUploadHeader header{
+        .memory = &memory,
+        .address = address,
+        .bytes = static_cast<u32>(bytes),
+        .flags = (note ? SplitCbNote : 0U) | (words ? SplitCbWords : 0U),
+    };
+    std::memcpy(buffer, &header, sizeof(header));
+    std::memcpy(buffer + sizeof(header), data, bytes);
+    VideoCommon::BackSplit::EmitTask(&SplitApplyCbUpload, buffer, sizeof(header) + bytes);
+    VideoCommon::BackSplit::NotePendingWrite(address, bytes);
+    return true;
 }
 
 void SplitSendFastDraw() {
@@ -1531,14 +1598,11 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-            VideoCommon::BackSplit::EmitCbUpload(address, start_base, static_cast<u32>(write_size / sizeof(u32)));
-        }
         const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
                           !FastDrawHeaderWrite(address, address + write_size);
-        if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address, start_base,
-                                                          write_size)) {
+        const bool sent = SplitSendCbUpload(memory_manager, address, start_base, write_size, note, false);
+        if (!sent && (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address,
+                                                                    start_base, write_size))) {
             memory_manager.WriteBlockCached(address, start_base, write_size);
         }
         if (VideoCommon::Nx2Profile::Enabled()) {

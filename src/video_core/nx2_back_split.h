@@ -201,6 +201,24 @@ public:
 
     /// Stage A: waits until GPUBackB consumed everything sent since the last wait: tasks sent
     /// without waiting and register deltas (a Call closure on stage A reads B's shadow).
+    /// Stage A (step 4d): the ring position after everything sent so far, and the one GPUBackB
+    /// is known to have run up to (the last RunOnB).
+    [[nodiscard]] u64 WritePosition() const {
+        return write_position;
+    }
+    [[nodiscard]] u64 DrainedPosition() const {
+        return drained_position;
+    }
+
+    /// Stage A: makes everything sent so far visible to GPUBackB now (and wakes it).
+    void Flush() {
+        PublishNow();
+    }
+
+    void CountGuardDrain(size_t site) {
+        ++stat_guard_drains[site];
+    }
+
     void DrainAsync() {
         if (write_position != drained_position) {
             ++stat_drains;
@@ -350,7 +368,8 @@ public:
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit: cmds {:.0f}/s, delta_regs {:.0f}/s, cb_words {:.0f}/s, "
                  "words {:.0f}/s, A_stalls {}, run_on_b {:.0f}/s, run_sleeps {}, b_sleeps {}, "
-                 "calls {:.0f}/s, deferred {:.0f}/s, async {:.0f}/s, drains {:.0f}/s",
+                 "calls {:.0f}/s, deferred {:.0f}/s, async {:.0f}/s, drains {:.0f}/s, "
+                 "read guard drains {:.0f}/s (macro {}, query {}, other {})",
                  static_cast<double>(stat_packets) / sec,
                  static_cast<double>(stat_delta_regs) / sec,
                  static_cast<double>(stat_cb_words) / sec,
@@ -359,7 +378,10 @@ public:
                  b_sleeps.exchange(0, std::memory_order_relaxed),
                  static_cast<double>(g_calls.exchange(0, std::memory_order_relaxed)) / sec,
                  static_cast<double>(g_deferred.exchange(0, std::memory_order_relaxed)) / sec,
-                 static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec);
+                 static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec,
+                 static_cast<double>(stat_guard_drains[0] + stat_guard_drains[1] +
+                                     stat_guard_drains[2]) / sec,
+                 stat_guard_drains[0], stat_guard_drains[1], stat_guard_drains[2]);
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit shadow: engines {}, checks {}, diverged checks {}, diverged regs {} "
                  "(total since boot: checks {}, diverged checks {}); state checks {}, diverged "
@@ -375,6 +397,7 @@ public:
                  b_bad_state_total.load(std::memory_order_relaxed));
         stat_async = 0;
         stat_drains = 0;
+        stat_guard_drains = {};
         if (report_hook != nullptr) {
             report_hook(sec);
         }
@@ -647,6 +670,7 @@ private:
     u64 stat_run_sleeps = 0;
     u64 stat_async = 0;
     u64 stat_drains = 0;
+    std::array<u64, 3> stat_guard_drains{}; ///< step 4d, by GuardRead site
     u64 drained_position = 0; ///< write_position at the last RunOnB
     // Stage A: the engine the deltas belong to, the engines GPUBackB has a shadow of, draws.
     const void* a_engine{};
@@ -730,6 +754,43 @@ inline void RunOnB(RingState::TaskFn fn, void* arg) {
 
 inline void DrainAsync() {
     g_state.DrainAsync();
+}
+
+inline void Flush() {
+    g_state.Flush();
+}
+
+/// E04.T6 step 4d: per GPU page (hashed), the ring position after the last guest write stage A
+/// sent to GPUBackB there. Stage A only.
+inline std::array<u64, 4096> g_pending_pages{};
+
+/// Stage A: guest memory [gpu_addr, gpu_addr + bytes) is written by GPUBackB in ring order.
+inline void NotePendingWrite(u64 gpu_addr, u64 bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    const u64 position = g_state.WritePosition();
+    for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
+        g_pending_pages[page & 4095] = position;
+    }
+}
+
+enum class GuardSite : u8 { Macro = 0, Query = 1, Other = 2 };
+
+/// Stage A, before reading guest memory: waits for GPUBackB when a write it was sent there may
+/// not have landed yet (a hashed page can drain needlessly, never miss).
+inline void GuardRead(u64 gpu_addr, u64 bytes, GuardSite site) {
+    if (bytes == 0) {
+        return;
+    }
+    const u64 drained = g_state.DrainedPosition();
+    for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
+        if (g_pending_pages[page & 4095] > drained) [[unlikely]] {
+            g_state.CountGuardDrain(static_cast<size_t>(site));
+            g_state.DrainAsync();
+            return;
+        }
+    }
 }
 
 inline void MaybeReport() {

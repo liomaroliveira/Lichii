@@ -495,16 +495,11 @@ void RasterizerProxy::AccelerateInlineToMemory(GPUVAddr address, size_t copy_siz
               [&] { inner.AccelerateInlineToMemory(address, copy_size, memory); });
         return;
     }
-    // Stage A writes guest memory itself (it may read the words back, e.g. a launch's QMD);
-    // GPUBackB updates the caches without stage A waiting.
+    // E04.T6 step 4c: GPUBackB writes guest memory and updates the caches in ring order, without
+    // stage A waiting; stage A reads the words back (e.g. a launch's QMD) only after GuardRead.
     ++g_counts[static_cast<size_t>(Call::InlineToMemory)];
-    const std::optional<DAddr> device_addr =
-        inner.InlineToMemoryGuestWrite(address, copy_size, memory);
-    if (!device_addr) {
-        return;
-    }
     std::array<u64, 4 + MaxAsyncInlineBytes / sizeof(u64)> buffer;
-    const InlineHeader header{&inner, address, *device_addr, copy_size};
+    const InlineHeader header{&inner, address, 0, copy_size};
     static_assert(sizeof(InlineHeader) == 4 * sizeof(u64));
     std::memcpy(buffer.data(), &header, sizeof(header));
     std::memcpy(buffer.data() + 4, memory.data(), copy_size);
@@ -514,11 +509,10 @@ void RasterizerProxy::AccelerateInlineToMemory(GPUVAddr address, size_t copy_siz
             std::memcpy(&h, payload, sizeof(h));
             const std::span<const u8> bytes{reinterpret_cast<const u8*>(payload + 4),
                                             static_cast<size_t>(h.copy_size)};
-            RunAsync([&] {
-                h.inner->InlineToMemoryCaches(h.address, h.device_addr, h.copy_size, bytes);
-            });
+            RunAsync([&] { h.inner->AccelerateInlineToMemory(h.address, h.copy_size, bytes); });
         },
         buffer.data(), sizeof(header) + copy_size);
+    NotePendingWrite(address, copy_size);
 }
 void RasterizerProxy::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                         const VideoCore::DiskResourceLoadCallback& callback) {

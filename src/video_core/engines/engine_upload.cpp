@@ -9,6 +9,7 @@
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "video_core/nx2_back_split.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
@@ -129,6 +130,11 @@ void State::ProcessData(std::span<const u8> read_buffer) {
             true, bytes_per_pixel, width, regs.dest.height, regs.dest.depth,
             regs.dest.BlockHeight(), regs.dest.BlockDepth());
 
+        // E04.T6 step 4: stage A writes this one itself (rare): GPUBackB first runs every write
+        // it was sent, so they land in order.
+        if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] {
+            VideoCommon::BackSplit::DrainAsync();
+        }
         Tegra::Memory::GpuGuestMemoryScoped<u8,
                                             Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
             tmp(memory_manager, address, dst_size, &tmp_buffer);

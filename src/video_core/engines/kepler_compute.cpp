@@ -25,6 +25,8 @@
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/front_qmd.h"
+#include "video_core/nx2_back_split.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_drain_check.h"
@@ -45,6 +47,18 @@
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
+
+namespace {
+/// E04.T6 step 4d: a constant buffer word stage A reads, after any upload GPUBackB was sent
+/// there landed.
+u32 ReadGuarded(const Tegra::MemoryManager& memory, GPUVAddr address) {
+    if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] {
+        VideoCommon::BackSplit::GuardRead(address, sizeof(u32),
+                                          VideoCommon::BackSplit::GuardSite::Other);
+    }
+    return memory.Read<u32>(address);
+}
+} // Anonymous namespace
 
 namespace {
 // TEST (EDEN_NX2_SEM_WATCH_DEVICE): the QMDs that released into the watched word, and the QMD the
@@ -388,6 +402,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
+                if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] { // E04.T6 step 4d
+                    VideoCommon::BackSplit::GuardRead(address, sizeof(descriptor), VideoCommon::BackSplit::GuardSite::Other);
+                }
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
                 if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
                     // TEST: what the front's QMD view compares the descriptors it read with.
@@ -517,6 +534,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         native_macro->native_execution_failed = true;
         std::array<u32, 128> qmd{};
         if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
+            if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] { // E04.T6 step 4d
+                VideoCommon::BackSplit::GuardRead(qmd_address, sizeof(qmd), VideoCommon::BackSplit::GuardSite::Other);
+            }
             memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
         }
         // Log a failing program's first few dispatches only (QMD words 48-49 hold its code
@@ -709,7 +729,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
         const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
             if (offset + sizeof(u32) > cbuf.size.Value()) return std::nullopt;
-            const u32 handle = memory_manager.Read<u32>(cbuf_address + offset);
+            const u32 handle = ReadGuarded(memory_manager, cbuf_address + offset);
             if (handle == 0 || (handle & 0xfffff) > regs.tic.limit) return std::nullopt;
             return GetTICEntry(handle & 0xfffff);
         };
@@ -977,7 +997,7 @@ void KeplerCompute::CheckDlssNetwork() {
         return;
     }
     const auto surface = [&](u32 offset) -> std::optional<Fermi2D::Surface> {
-        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+        const u32 tic_index = ReadGuarded(memory_manager, cbuf_address + offset) & 0xfffff;
         if (tic_index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
                 regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
                 sizeof(Texture::TICEntry))) {
@@ -1149,7 +1169,7 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
              launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
              launch_description.block_dim_z.Value(), regs.tic.Address());
     for (u32 offset = 0x80; offset < 0x120; offset += 4) {
-        const u32 handle = memory_manager.Read<u32>(cbuf_address + offset);
+        const u32 handle = ReadGuarded(memory_manager, cbuf_address + offset);
         const u32 tic_index = handle & 0xfffff;
         if (handle == 0 || tic_index > regs.tic.limit) continue;
         const auto tic = GetTICEntry(tic_index);
@@ -1168,7 +1188,7 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
         !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
         return std::nullopt;
     }
-    const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+    const u32 tic_index = ReadGuarded(memory_manager, cbuf_address + offset) & 0xfffff;
     if (tic_index > regs.tic.limit ||
         !memory_manager.IsFullyMappedRange(regs.tic.Address() +
                                                u64{tic_index} * sizeof(Texture::TICEntry),
@@ -1341,7 +1361,7 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return;
     }
     const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
-        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+        const u32 tic_index = ReadGuarded(memory_manager, cbuf_address + offset) & 0xfffff;
         if (tic_index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
                 regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
                 sizeof(Texture::TICEntry))) {
@@ -1596,6 +1616,9 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
 
 void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
+    if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] { // E04.T6 step 4d
+        VideoCommon::BackSplit::GuardRead(launch_desc_loc, LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32), VideoCommon::BackSplit::GuardSite::Other);
+    }
     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
                                    LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
     rasterizer->DispatchCompute();

@@ -39,6 +39,7 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -1436,6 +1437,11 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     // from a culling dispatch) and still be only in host buffers: flush them first,
                     // or the macro draws with an older frame's arguments (objects pop in and out).
                     const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
+                    // E04.T6 step 4d: a constant buffer upload sent to GPUBackB may not have landed.
+                    if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] {
+                        VideoCommon::BackSplit::GuardRead(source, read_bytes,
+                                                          VideoCommon::BackSplit::GuardSite::Macro);
+                    }
                     if (VideoCommon::Nx2Profile::Enabled()) {
                         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
                         u8 writer = 0;
