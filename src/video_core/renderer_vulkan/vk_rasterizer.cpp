@@ -2948,7 +2948,15 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
                            !VideoCommon::GpuSplit::OwnsScheduler();
         bool gpu_modified;
         {
-            std::scoped_lock lock{buffer_cache.mutex};
+            // Draws hold the caches for tens of microseconds, thousands of times a second: a game
+            // thread writing buffers meanwhile waited each time (The Duskbloods' five worker threads
+            // spent ~25 ms a frame here). A busy cache leaves the write to the next gather instead,
+            // as for GPU-written memory: the caller collects it, and DmaPusher::Step gathers before
+            // each new command list.
+            std::unique_lock lock{buffer_cache.mutex, std::try_to_lock};
+            if (!lock.owns_lock()) {
+                return true;
+            }
             if (defer) {
                 VideoCommon::t_deferred_page_caching = &deferred;
             }
