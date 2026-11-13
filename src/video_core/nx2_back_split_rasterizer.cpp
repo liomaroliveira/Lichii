@@ -6,6 +6,7 @@
 #include <cstring>
 #include <exception>
 #include <numeric>
+#include <type_traits>
 #include <utility>
 
 #include "common/logging.h"
@@ -205,6 +206,24 @@ void RunAsync(F&& func) {
     Nx2FastDraw::t_reads_serials = reads;
 }
 
+/// Night 2026-11-12 (E04 item 3): a call without a result GPUBackB runs in ring order without
+/// stage A waiting; `func` (trivially copyable, captures by value) is copied into the ring.
+template <typename F>
+void RouteAsync(Call call, const F& func) {
+    static_assert(std::is_trivially_copyable_v<F> && alignof(F) <= alignof(u64));
+    if (!OnStageA()) {
+        func();
+        return;
+    }
+    ++g_counts[static_cast<size_t>(call)];
+    g_state.PushTask(
+        [](const u64* payload) {
+            const F& f = *reinterpret_cast<const F*>(payload);
+            RunAsync([&] { f(); });
+        },
+        &func, sizeof(F));
+}
+
 struct BindUniformArgs {
     VideoCore::RasterizerInterface* inner;
     u64 gpu_addr;
@@ -284,7 +303,7 @@ void RasterizerProxy::DispatchCompute() {
     Route(Call::DispatchCompute, [&] { inner.DispatchCompute(); });
 }
 void RasterizerProxy::ResetCounter(VideoCommon::QueryType type) {
-    Route(Call::ResetCounter, [&] { inner.ResetCounter(type); });
+    RouteAsync(Call::ResetCounter, [in = &inner, type] { in->ResetCounter(type); });
 }
 void RasterizerProxy::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                             VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
@@ -397,7 +416,8 @@ void RasterizerProxy::Nx2NoteOwedListWord(DAddr device_addr, u32 value) {
     Route(Call::NoteOwedListWord, [&] { inner.Nx2NoteOwedListWord(device_addr, value); });
 }
 void RasterizerProxy::Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) {
-    Route(Call::NoteInlineQmdGrid, [&] { inner.Nx2NoteInlineQmdGrid(device_addr, x, y, z); });
+    RouteAsync(Call::NoteInlineQmdGrid,
+               [in = &inner, device_addr, x, y, z] { in->Nx2NoteInlineQmdGrid(device_addr, x, y, z); });
 }
 void RasterizerProxy::Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) {
     Route(Call::ReadListSlots, [&] { inner.Nx2ReadListSlots(slots, words); });
@@ -455,7 +475,7 @@ bool RasterizerProxy::OnCPUWrite(PAddr addr, u64 size) {
     return result;
 }
 void RasterizerProxy::InvalidateGPUCache() {
-    Route(Call::InvalidateGPUCache, [&] { inner.InvalidateGPUCache(); });
+    RouteAsync(Call::InvalidateGPUCache, [in = &inner] { in->InvalidateGPUCache(); });
 }
 void RasterizerProxy::UnmapMemory(DAddr addr, u64 size) {
     Route(Call::UnmapMemory, [&] { inner.UnmapMemory(addr, size); });
@@ -472,7 +492,7 @@ void RasterizerProxy::WaitForIdle() {
     Route(Call::WaitForIdle, [&] { inner.WaitForIdle(); });
 }
 void RasterizerProxy::FragmentBarrier() {
-    Route(Call::FragmentBarrier, [&] { inner.FragmentBarrier(); });
+    RouteAsync(Call::FragmentBarrier, [in = &inner] { in->FragmentBarrier(); });
 }
 void RasterizerProxy::TiledCacheBarrier() {
     Route(Call::TiledCacheBarrier, [&] { inner.TiledCacheBarrier(); });

@@ -236,6 +236,9 @@ public:
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
+    /// Defer flag (E04 back split): `func` only touches stage A's engine state and reaches the
+    /// rasterizer through the proxy, so stage A runs it without draining GPUBackB first.
+    static constexpr u64 StageASafe = 1 << 4;
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.

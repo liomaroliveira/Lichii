@@ -790,7 +790,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             CountCallSite(entry[1]);
             // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
             // it was sent without waiting.
-            VideoCommon::BackSplit::DrainAsync();
+            if ((head & StageASafe) == 0) {
+                VideoCommon::BackSplit::DrainAsync();
+            }
         }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
