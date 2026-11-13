@@ -1046,7 +1046,6 @@ void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_mana
     {
         std::scoped_lock lk{impl->server_lock};
         if (impl->is_shutting_down || impl->services_closed) {
-            impl->refused_servers.emplace_back(std::move(server_manager));
             refused = true;
         } else {
             impl->server_managers.emplace_back(std::move(server_manager));
@@ -1054,8 +1053,12 @@ void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_mana
     }
 
     if (refused) {
-        // Services are closing: this server never runs. The kernel keeps it until it shuts down.
+        // Services are closing: this server never runs. It stays ours until SkipLoop is done, so a
+        // CloseServices running meanwhile can't destroy it under us. Then the kernel keeps it until
+        // it shuts down.
         manager->SkipLoop();
+        std::scoped_lock lk{impl->server_lock};
+        impl->refused_servers.emplace_back(std::move(server_manager));
         return;
     }
 
