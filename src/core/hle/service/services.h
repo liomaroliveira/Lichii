@@ -16,7 +16,14 @@ class Services final {
 public:
     explicit Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system,
                       std::stop_token token);
+    /// Joins the audio and vi threads. At shutdown this runs after ServiceManager::Close and
+    /// CloseServices, so they leave their wait or server at once, and before the service manager
+    /// they use is destroyed.
     ~Services() = default;
+
+private:
+    std::jthread audio_worker;
+    std::jthread vi_worker;
 };
 
 } // namespace Service
