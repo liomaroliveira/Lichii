@@ -46,7 +46,9 @@ struct Session {
     Kernel::KProcess* process;
     Core::Asid asid;
     bool has_preallocated_area{};
-    std::unique_ptr<HeapMapper> mapper{};
+    /// Shared with GPU-thread work queued before the session closed (nvhost_as_gpu::Nx2Release
+    /// unmaps through it); the last owner frees its SMMU region.
+    std::shared_ptr<HeapMapper> mapper{};
     bool is_active{};
     s32 ref_count{};
 };

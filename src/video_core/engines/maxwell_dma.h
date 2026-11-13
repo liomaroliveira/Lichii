@@ -20,6 +20,10 @@ namespace Core {
 class System;
 }
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 class MemoryManager;
 }
@@ -99,6 +103,8 @@ public:
  */
 
 class MaxwellDMA final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     struct PackedGPUVAddr {
         u32 upper;

@@ -120,10 +120,9 @@ namespace Core {
 
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
-/// Steady-clock time of each guest present, by present count; written only while the debug
-/// server runs (g_nx2_present_time_services: debug services alive), for its frame_times tool.
+/// Steady-clock time of each guest present, by present count, for the debug server's frame_times
+/// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
-extern std::atomic<u32> g_nx2_present_time_services;
 
 class CpuManager;
 class Debugger;
@@ -227,6 +226,12 @@ public:
     [[nodiscard]] SystemResultStatus Load(Frontend::EmuWindow& emu_window,
                                           const std::string& filepath,
                                           Service::AM::FrontendAppletParameters& params);
+
+    /// Brings up the kernel, Host1x and the GPU without an application process, audio or
+    /// services, for a GPU trace replay (video_core/gpu_trace/replay.h). ShutdownMainProcess
+    /// tears it down.
+    [[nodiscard]] SystemResultStatus InitializeForGpuReplay(Frontend::EmuWindow& emu_window,
+                                                            u64 program_id);
 
     /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an

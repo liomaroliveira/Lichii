@@ -307,8 +307,8 @@ struct GPU::Impl {
     // Queued without waiting, also with synchronous GPU: callers hold the nx2:gpu region, GPU
     // memory registry or address space lock, which the GPU thread takes when work queued earlier
     // writes into a lazily backed sparse region (BackSparseWrite).
-    void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), true);
+    void RunInOrder(std::function<void()>&& func, bool before_later_reads) {
+        gpu_thread.Run(std::move(func), true, before_later_reads);
     }
 
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
@@ -752,8 +752,8 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
     impl->FlushRegion(addr, size);
 }
 
-void GPU::RunInOrder(std::function<void()>&& func) {
-    impl->RunInOrder(std::move(func));
+void GPU::RunInOrder(std::function<void()>&& func, bool before_later_reads) {
+    impl->RunInOrder(std::move(func), before_later_reads);
 }
 
 void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {

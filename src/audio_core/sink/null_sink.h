@@ -27,6 +27,10 @@ public:
         return buffer.frames == TargetSampleCount && buffer.frames_played == 0 &&
                !buffer.consumed && samples.size() == TargetSampleCount * 2;
     }
+    /// Preserve guest PCM pacing without host callbacks: one block per 5 ms pump.
+    u32 SysmixQueueLimit() const override {
+        return 1;
+    }
     bool IsReady() const override {
         return true;
     }

@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
@@ -47,7 +46,6 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_entry_check.h"
@@ -786,8 +784,6 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (gpu_written && TakeListGrid(dma_state.dma_get, static_cast<u32>(header.size))) {
-            // Nothing to parse: the words stay on the host GPU (nx2_list_grid.h).
         } else if (gpu_written && TakeGpuWrittenListWords(header)) {
             // The words stay on the host GPU: the call takes their placeholders (not recorded
             // for EDEN_NX2_PB_CHECK, which would find the entry's memory changed).
@@ -1287,79 +1283,6 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
     }
     return false;
-}
-
-bool DmaPusher::TakeListGrid(GPUVAddr address, u32 count) {
-    auto& split = VideoCommon::GpuSplit::Get();
-    // The three words are all the parameters of a compute macro call begun in the entry before,
-    // on one mapped page.
-    if (count != 3 || dma_state.method_count != 3 || command_resume_offset != 0 ||
-        rasterizer == nullptr || !split.Active() || !split.FrontMacros() ||
-        dma_state.method < MacroRegistersStart || (dma_state.method & 1) != 0 ||
-        (address & 0xfff) > 0x1000 - 3 * sizeof(u32) ||
-        subchannels[dma_state.subchannel] == nullptr ||
-        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::KeplerCompute ||
-        !memory_manager.GpuToCpuAddress(address)) {
-        return false;
-    }
-    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
-    if (!compute->FrontRunsMacros()) {
-        return false;
-    }
-    const std::optional<u64> keep_id = compute->FrontClaimListGrid(split, dma_state.method);
-    if (!keep_id) {
-        return false;
-    }
-    // Verify mode: the words the old way too, for the checks to compare against.
-    std::array<u32, 3> real{};
-    if (Nx2ListGrid::g_verify) {
-        if (ReadGpuWrittenCommands(address, count)) {
-            std::memcpy(real.data(), command_headers.data(), sizeof(real));
-        } else {
-            FlushGpuWrittenCommands(address, sizeof(real));
-            memory_manager.ReadBlockUnsafe(address, real.data(), sizeof(real));
-        }
-    }
-    const Nx2ListGrid::ListReader reader{
-        [](void* self, GPUVAddr list, u64 keep_id, std::span<u32> words) {
-            return static_cast<DmaPusher*>(self)->ReadListWords(list, keep_id, words);
-        },
-        this};
-    compute->FrontTakeListGrid(split, dma_state.method, *keep_id, address, reader,
-                               Nx2ListGrid::g_verify ? std::span<const u32>{real}
-                                                     : std::span<const u32>{});
-    dma_state.method_count = 0;
-    dma_state.is_last_call = true;
-    return true;
-}
-
-bool DmaPusher::ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words) {
-    if (rasterizer == nullptr || words.size() != 3) {
-        return false;
-    }
-    // The copy the back kept at the list's place in the stream: the words as the list had them,
-    // whatever later work wrote there. Its slot is reused only after the list's markers were
-    // resolved (Nx2ListGrid::ClaimSlot).
-    auto& split = VideoCommon::GpuSplit::Get();
-    bool kept = false;
-    split.Run([&] { kept = rasterizer->Nx2ReadKeptListWords(keep_id, words); },
-              VideoCommon::DrainSite::ListFlush);
-    if (kept) {
-        return true;
-    }
-    // No copy (the back found no buffer for the list): the old way, the list as it is after
-    // everything sent so far.
-    if (!memory_manager.GpuToCpuAddress(address)) {
-        LOG_ERROR(HW_GPU, "List-fed grid: list {} at {:#x} is neither kept nor mapped", keep_id,
-                  address);
-        return false;
-    }
-    LOG_WARNING(HW_GPU, "List-fed grid: list {} at {:#x} has no kept copy, read from memory",
-                keep_id, address);
-    split.Drain(VideoCommon::DrainSite::ListFlush);
-    FlushGpuWrittenCommands(address, words.size_bytes());
-    memory_manager.ReadBlockUnsafe(address, words.data(), words.size_bytes());
-    return true;
 }
 
 void DmaPusher::NoteListWriterWait(bool command_entry, bool gpu_written, u64 ns, u32 words) {

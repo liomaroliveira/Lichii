@@ -11,6 +11,7 @@
 #include <QTranslator>
 #include "common/fs/path_util.h"
 #include "common/fs/profile_migration.h"
+#include "common/fs/symlink.h"
 #include "frontend_common/profile_import.h"
 #include "qt_common/qt_string_lookup.h"
 #include "user_data_migration.h"
@@ -101,9 +102,19 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     }
     migration_prompt.addBox(source);
     const auto update_cache_default = [&] {
-        clear_shaders->setChecked(found.at(source->currentIndex()).e_user_dir !=
-                                  Common::FS::LegacyEdenDir);
+        const Emulator& emu = found.at(source->currentIndex());
+        clear_shaders->setChecked(emu.e_user_dir != Common::FS::LegacyEdenDir);
         clear_shaders->setEnabled(!link_old->isChecked());
+        // A profile folder that is a link (e.g. a junction to another drive) can be copied or
+        // linked, but Move would rename the real folder behind the link, so it is not offered.
+        bool linked = false;
+        for (const auto dir : {emu.e_user_dir, emu.e_config_dir, emu.e_cache_dir}) {
+            linked = linked || Common::FS::IsSymlink(Common::FS::GetLegacyPath(dir));
+        }
+        if (linked && clear_old->isChecked()) {
+            keep_old->setChecked(true);
+        }
+        clear_old->setEnabled(!linked);
     };
     QObject::connect(source, &QComboBox::currentIndexChanged, &migration_prompt,
                      update_cache_default);

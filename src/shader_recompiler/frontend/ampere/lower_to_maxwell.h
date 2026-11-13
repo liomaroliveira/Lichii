@@ -116,6 +116,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     const auto write_count = [](const Instruction& instruction) -> std::optional<u32> {
         switch (instruction.Bits(0, 12)) {
         case 0x202: case 0x802: case 0x803: case 0x424: case 0x724: case 0x824: case 0xe24: case 0x227:
+        // IMAD (0x224) and its uniform-guard form (0x8a4, lowered to 0x824), USHF (0x899,
+        // lowered to one SHR/SHL) and the uniform-register LEA (0xc11, as 0xc12) write only Rd;
+        // Ocarina of Time's per-tap gathers and call links are proven through them.
+        case 0x224: case 0x8a4: case 0x899: case 0xc11:
         case 0x810: case 0x819: case 0x845: case 0x906: case 0x820:
         case 0x812: case 0x589:
         case 0x212: case 0x207: case 0x807: case 0x208: case 0x808:

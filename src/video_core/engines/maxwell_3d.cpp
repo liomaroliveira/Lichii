@@ -1495,10 +1495,6 @@ struct Maxwell3D::FrontState {
     u64 back_last{};                 ///< The position after the last macro sent to the back
     std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
     u32 back_escapes_seen{};
-    /// By start in the macro code of data_ram_generation: 0 unknown, 1 the macro can't use the
-    /// data RAM, 2 it can.
-    std::vector<u8> data_ram_macros;
-    u64 data_ram_generation{~u64{0}};
 };
 
 namespace {
@@ -1772,10 +1768,6 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 // split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
 // goes stale from now on, and a restart copies the registers again (Front).
 void Maxwell3D::ReleaseFront() {
-    // The engine's macros run unguarded from now on.
-    if (grid_marker.set) {
-        Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
-    }
     // The macros run on the engine from now on: the data RAM gets the GPU-written list words
     // its words hold placeholders of (Nx2ListIndirect).
     if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
@@ -2061,25 +2053,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
-    // List-fed grid markers (nx2_list_grid.h) in the data RAM: a 3D macro that can read it gets
-    // the real words first.
-    if (grid_marker.set && grid_marker.In(native_data_ram)) {
-        if (fs.data_ram_generation != engine.native_code_generation) {
-            fs.data_ram_macros.assign(engine.native_code.size() / 3, 0);
-            fs.data_ram_generation = engine.native_code_generation;
-        }
-        if (start < fs.data_ram_macros.size()) {
-            u8& uses = fs.data_ram_macros[start];
-            if (uses == 0) {
-                uses = TuringMacroInterpreter::AnalyzeEffects(engine.native_code, start).data_ram
-                           ? 2
-                           : 1;
-            }
-            if (uses == 2) {
-                Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
-            }
-        }
-    }
     namespace ListTrace = VideoCommon::ListMacroTrace;
     ListTrace::Call* const trace =
         ListTrace::g_enabled

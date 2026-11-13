@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -110,6 +115,150 @@ TEST_CASE("NX2 destroyed memory gets a new device range when registered again",
     const u64 second = ranges.at({0x10000, 0x4000});
     REQUIRE(second != first);
     REQUIRE(registry.DeviceAddressOf(0x10000) == second);
+}
+namespace {
+
+// Records the calls one listener receives, in order, from any thread.
+struct Recorder {
+    std::mutex mutex;
+    std::vector<std::string> events;
+
+    void Add(std::string event) {
+        std::scoped_lock lk{mutex};
+        events.push_back(std::move(event));
+    }
+    std::vector<std::string> Get() {
+        std::scoped_lock lk{mutex};
+        return events;
+    }
+};
+
+// Lets a test hold a listener call (a GPU-thread wait in the emulator) until it releases it.
+struct Gate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> open{false};
+
+    void Hold() {
+        entered = true;
+        while (!open) {
+            std::this_thread::yield();
+        }
+    }
+    void WaitEntered() const {
+        while (!entered) {
+            std::this_thread::yield();
+        }
+    }
+};
+
+} // namespace
+
+TEST_CASE("NX2 listeners see a map and a later unmap of the same range in order",
+          "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    Recorder recorder;
+    Gate gate;
+    registry.AddListener(
+        &recorder,
+        [&](u64 gpu_address, u64, u64) {
+            gate.Hold();
+            recorder.Add("map " + std::to_string(gpu_address));
+        },
+        [&](u64 gpu_address, u64) { recorder.Add("unmap " + std::to_string(gpu_address)); });
+
+    // The map's listener call is held (as if waiting for the GPU thread) while another thread
+    // unmaps the range: the unmap must not reach the listener first.
+    std::thread mapper{[&] { registry.MapAt(0x8000, 0x4000, 0x1000); }};
+    gate.WaitEntered();
+    std::thread unmapper{[&] { registry.Unmap(0x8000, 0x1000); }};
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    REQUIRE(recorder.Get().empty());
+    gate.open = true;
+    mapper.join();
+    unmapper.join();
+
+    const std::vector<std::string> expected{"map 32768", "unmap 32768"};
+    REQUIRE(recorder.Get() == expected);
+    REQUIRE_FALSE(registry.DeviceAddressOfGpu(0x8000));
+}
+
+TEST_CASE("NX2 a new listener's replay comes before a racing unmap", "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    registry.MapAt(0x8000, 0x4000, 0x1000);
+    Recorder recorder;
+    Gate gate;
+
+    // AddListener replays the existing mapping outside the registry lock; an unmap made while
+    // the replay is held must reach the new listener after it, not before (which would leave
+    // the replayed mapping behind).
+    std::thread adder{[&] {
+        registry.AddListener(
+            &recorder,
+            [&](u64 gpu_address, u64, u64) {
+                gate.Hold();
+                recorder.Add("map " + std::to_string(gpu_address));
+            },
+            [&](u64 gpu_address, u64) { recorder.Add("unmap " + std::to_string(gpu_address)); });
+    }};
+    gate.WaitEntered();
+    std::thread unmapper{[&] { registry.Unmap(0x8000, 0x1000); }};
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    REQUIRE(recorder.Get().empty());
+    gate.open = true;
+    adder.join();
+    unmapper.join();
+
+    const std::vector<std::string> expected{"map 32768", "unmap 32768"};
+    REQUIRE(recorder.Get() == expected);
+}
+
+TEST_CASE("NX2 listeners can call back into the registry", "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    Recorder recorder;
+    registry.AddListener(
+        &recorder,
+        [&](u64 gpu_address, u64 cpu_address, u64 size) {
+            // Lookups and further changes from a listener call neither deadlock on the registry
+            // lock nor wait for the turn the call itself holds: the nested map follows it.
+            REQUIRE(registry.GpuAddressOf(7, 0) == 0x8000U);
+            recorder.Add("map " + std::to_string(gpu_address));
+            if (gpu_address == 0x8000) {
+                registry.MapAt(0x9000, cpu_address + size, size);
+                recorder.Add("nested map queued");
+            }
+        },
+        [](u64, u64) {});
+    registry.MapAt(7, 0, 0x8000, 0x4000, 0x1000);
+
+    const std::vector<std::string> expected{"map 32768", "nested map queued", "map 36864"};
+    REQUIRE(recorder.Get() == expected);
+}
+
+TEST_CASE("NX2 changes made in a defer scope reach listeners after it, in order",
+          "[video_core][nx2_mapping]") {
+    using Registry = Service::Nvidia::Devices::Nx2GpuMemoryRegistry;
+    Registry registry;
+    Recorder recorder;
+    registry.AddListener(
+        &recorder,
+        [&](u64 gpu_address, u64, u64) { recorder.Add("map " + std::to_string(gpu_address)); },
+        [&](u64 gpu_address, u64) { recorder.Add("unmap " + std::to_string(gpu_address)); });
+    {
+        // Like nx2:gpu under its region mutex: the registry changes now, the listeners (which
+        // wait for the GPU thread in the emulator) are called when the scope ends.
+        const Registry::DeferScope defer;
+        registry.MapAt(0x8000, 0x4000, 0x1000);
+        registry.Unmap(0x8000, 0x1000);
+        Registry::Defer([&] { recorder.Add("deferred work"); });
+        REQUIRE_FALSE(registry.DeviceAddressOfGpu(0x8000));
+        REQUIRE(recorder.Get().empty());
+    }
+    const std::vector<std::string> expected{"map 32768", "unmap 32768", "deferred work"};
+    REQUIRE(recorder.Get() == expected);
+
+    // Without a scope, Defer runs right away.
+    Registry::Defer([&] { recorder.Add("now"); });
+    REQUIRE(recorder.Get().back() == "now");
 }
 
 namespace {

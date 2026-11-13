@@ -419,6 +419,18 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
+    if (ctx.native_half_rounding) {
+        // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        if (!profile.support_separate_denorm_behavior || !profile.support_separate_rounding_mode) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 64U);
+        }
+        return;
+    }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
         return;

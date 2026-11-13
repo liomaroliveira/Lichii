@@ -140,6 +140,9 @@ jobs:
           python3 tools/nx2/test_thread_worker_wake.py
           python3 -I tools/nx2/thread_worker_wake.py --cxx g++-13
 
+      - name: Test offline RADV shader checks
+        run: python3 tools/nx2/radv_offline/test_checks.py
+
       - name: Test Linux switch discovery
         run: CXX=g++-13 python3 tools/nx2/test_switches.py
 
@@ -266,7 +269,7 @@ jobs:
       - name: Check the shipped programs carry a version resource
         run: |
           for exe in lichii eden-cli lichii-updater; do
-            if ! "$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe" | grep -q 'Type: VERSIONINFO'; then
+            if ! grep -q 'Type: VERSIONINFO' <<< "$("$LLVM_ROOT/bin/llvm-readobj" --coff-resources "build/bin/$exe.exe")"; then
               echo "::error::$exe.exe has no version resource"
               exit 1
             fi

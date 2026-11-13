@@ -296,13 +296,6 @@ public:
     /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
     /// `*pending` and pending_list_tick instead of waiting (the result is false then).
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
-    /// List-fed grid macros (nx2_list_grid.h): the entry at `address` is the three GPU-written
-    /// parameters of a call the compute engine stores as markers. Returns whether it took them
-    /// without reading them (no wait for the back, the host GPU or a copy).
-    bool TakeListGrid(GPUVAddr address, u32 count);
-    /// The three words of the list kept as `keep_id`, after everything sent so far (a wait for
-    /// the back and the host GPU). False if they are no longer kept.
-    bool ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words);
     /// A GPU-written list that is all the parameters of the compute macro call about to start,
     /// on the split with macros on its front: if the call only moves the words where the back can
     /// take them over (Nx2ListIndirect), puts their placeholders in command_headers instead of

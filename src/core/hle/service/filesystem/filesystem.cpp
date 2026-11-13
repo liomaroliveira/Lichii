@@ -183,13 +183,12 @@ Result VfsDirectoryServiceWrapper::RenameFile(const std::string& src_path_,
     std::string src_path(Common::FS::SanitizePath(src_path_));
     std::string dest_path(Common::FS::SanitizePath(dest_path_));
     auto src = backing->GetFileRelative(src_path);
+    if (src == nullptr) {
+        return FileSys::ResultPathNotFound;
+    }
     auto dst = backing->GetFileRelative(dest_path);
     if (Common::FS::GetParentPath(src_path) == Common::FS::GetParentPath(dest_path)) {
         // Use more-optimized vfs implementation rename.
-        if (src == nullptr) {
-            return FileSys::ResultPathNotFound;
-        }
-
         if (dst && Common::FS::Exists(dst->GetFullPath())) {
             LOG_ERROR(Service_FS, "File at new_path={} already exists", dst->GetFullPath());
             return FileSys::ResultPathAlreadyExists;

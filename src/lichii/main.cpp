@@ -5,6 +5,8 @@
 #include <QMessageBox>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <system_error>
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
@@ -84,7 +86,40 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 #endif
 }
 
+#if defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__)
+/// On NVIDIA, Lichii keeps no driver pipeline cache of its own (DriverCachesPipelines) and relies on
+/// the driver's disk cache, whose default limit is 1 GiB for the whole cache folder. A large Ocarina
+/// of Time cache (~20,000 pipelines) fills it, and every boot then compiles the pipelines that no
+/// longer fit again. Before anything loads the driver, give Lichii its own cache folder, so another
+/// application running with the default limit can't trim it, and raise the limit to 10 GiB. A value
+/// the user set for either variable is kept. Other drivers ignore both.
+static void SetUpNvidiaShaderDiskCache() {
+    if (std::getenv("__GL_SHADER_DISK_CACHE_PATH") == nullptr) {
+        const char* const xdg_cache = std::getenv("XDG_CACHE_HOME");
+        const char* const home = std::getenv("HOME");
+        std::filesystem::path base;
+        if (xdg_cache != nullptr && xdg_cache[0] == '/') {
+            base = xdg_cache;
+        } else if (home != nullptr && home[0] == '/') {
+            base = std::filesystem::path{home} / ".cache";
+        }
+        if (!base.empty()) {
+            const std::filesystem::path folder = base / "lichii" / "nvidia";
+            std::error_code ec;
+            std::filesystem::create_directories(folder, ec);
+            if (!ec) {
+                setenv("__GL_SHADER_DISK_CACHE_PATH", folder.c_str(), 0);
+            }
+        }
+    }
+    setenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240", 0);
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#if defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__)
+    SetUpNvidiaShaderDiskCache();
+#endif
     LoadNx2Switches(argv[0]);
 #if LICHII_ROOM
     bool launch_room = false;
@@ -182,6 +217,14 @@ int main(int argc, char* argv[]) {
 
     // Enables the core to make the qt created contexts current on std::threads
     QCoreApplication::setAttribute(Qt::AA_DontCheckOpenGLContextThreadAffinity);
+
+#ifdef _WIN32
+    // A native window (the render widget's, for the graphics surface) would otherwise make its
+    // siblings native too: the loading screen and the game list, next to GRenderWindow. In
+    // single-window borderless fullscreen those cover the main window, which Qt then no longer
+    // repaints (see RenderWidget in bootmanager.cpp).
+    QCoreApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+#endif
 
 #ifdef _WIN32
     QApplication::setStyle(QStringLiteral("windowsvista"));

@@ -566,9 +566,12 @@ FN_MAX_LIMIT_LIST
         return is_warp_potentially_bigger;
     }
 
-    /// Returns true if the device can be forced to use the guest warp size.
+    /// Returns true if the device can be forced to use the guest warp size. Lavapipe's
+    /// subgroups are 8 wide and can't be forced to 32.
     bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
-        return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+        const auto& control = properties.subgroup_size_control;
+        return (control.requiredSubgroupSizeStages & stage) != 0 &&
+               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
     }
 
     /// Returns true if the device supports the provided subgroup feature.
@@ -1097,6 +1100,12 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
@@ -1110,6 +1119,9 @@ FN_MAX_LIMIT_LIST
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not
     /// subtracted: see GetDeviceMemorySlack().
     u64 GetDeviceMemoryBudget() const;
+
+    /// GetDeviceMemoryBudget() before the cap an integrated GPU gets: the heap's own budget.
+    u64 GetDeviceHeapMemoryBudget() const;
 
     /// Memory the allocator holds from the driver in the main device-local heap but has no
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
@@ -1257,11 +1269,9 @@ FN_MAX_LIMIT_LIST
     /// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own, so the
     /// emulator keeps none on top: a VkPipelineCache only kept every pipeline the title ever built
     /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
-    /// at each save, which stalled frames, and pipelines built no slower without it.
-    bool DriverCachesPipelines() const noexcept {
-        return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
-               properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
-    }
+    /// at each save, which stalled frames, and pipelines built no slower without it. RADV keeps
+    /// one too through Mesa's shader cache, unless it is disabled.
+    bool DriverCachesPipelines() const noexcept;
 
     bool IsMoltenVK() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
@@ -1443,6 +1453,7 @@ private:
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

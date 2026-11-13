@@ -126,6 +126,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    frame_created_buffers.clear();
     native_indirect_uniforms_this_frame.clear();
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
     if (static std::chrono::steady_clock::time_point last{}; mem_trace) {
@@ -1754,7 +1755,6 @@ void BufferCache<P>::NoteLandedBytes(ReadCheck& check, const ReadDownload& downl
 
 template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
-    Nx2ForgetKeptWords(device_addr, size);
     if (const std::optional<u64> waited = FinishReadDownloads(device_addr, size)) {
         VideoCore::AsyncReadback::CountClearLanding(*waited);
     }
@@ -2377,7 +2377,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             std::optional<std::array<u32, 3>> grid;
             // A dispatch from GPU-written list words (Nx2ListIndirect) has the slot's placeholders
             // in its grid, not the counts the host GPU dispatches: its grid is unknown here too.
-            if (!kepler_compute->GetIndirectComputeAddress() && !kepler_compute->GetKeptGrid() &&
+            if (!kepler_compute->GetIndirectComputeAddress() &&
                 !kepler_compute->GetIndirectListSlot()) {
                 grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                           qmd.grid_dim_z.Value()};
@@ -3792,7 +3792,6 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size,
                                        bool needs_sync, GpuWaitStats::WriteSite site) {
-    Nx2ForgetKeptWords(device_addr, size);
     GpuWaitStats::NoteGpuWrite(device_addr, size, site);
     if (ReadTrace::Enabled()) [[unlikely]] {
         TraceWriteRange(device_addr, size);
@@ -4117,7 +4116,6 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
 
 template <class P>
 void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size) {
-    Nx2ForgetKeptWords(device_addr, size);
     if constexpr (!IS_OPENGL) {
         if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
             return;
@@ -4195,8 +4193,23 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
                                                                        u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
+    boost::container::small_vector<BufferId, 2> cut_ids;
     DAddr begin = device_addr;
     DAddr end = device_addr + wanted_size;
+    const DAddr wanted_begin = begin;
+    const DAddr wanted_end = end;
+    // A buffer this large that shares no more than a page with the wanted range is not joined.
+    // Yoshi and the Mysterious Book reads 4 MiB texel buffers from blocks laid end to end in its
+    // heap, a few new ones a second at rising addresses: each shared a page with the buffer
+    // before it, so one buffer took them all over and was copied whole for every block, past
+    // 2 GiB (and past what a u32 size holds). Such a buffer is deleted instead, after what the
+    // GPU wrote of it is downloaded, as when the collector evicts one; what the game still reads
+    // of it is uploaded again from its memory.
+    // A buffer made this frame is always joined. The callers resolve their ranges again after a
+    // buffer is deleted, and two large ranges of one draw or copy that share a page would
+    // otherwise delete each other's buffer in turn without end. This way a frame cuts only buffers
+    // older than itself, and once those are gone it joins as before.
+    static constexpr u64 CHAIN_LIMIT = 128_MiB;
     int stream_score = 0;
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
@@ -4220,6 +4233,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     if (begin == 0) {
         return OverlapResult{
             .ids = std::move(overlap_ids),
+            .cut = std::move(cut_ids),
             .begin = begin,
             .end = end,
             .has_stream_leap = has_stream_leap,
@@ -4235,9 +4249,20 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         if (overlap.IsPicked()) {
             continue;
         }
+        const DAddr overlap_device_addr = overlap.CpuAddr();
+        if (overlap.SizeBytes() >= CHAIN_LIMIT &&
+            std::ranges::find(frame_created_buffers, overlap_id) == frame_created_buffers.end()) {
+            const DAddr shared_begin = (std::max)(overlap_device_addr, wanted_begin);
+            const DAddr shared_end =
+                (std::min)(overlap_device_addr + overlap.SizeBytes(), wanted_end);
+            if (shared_end <= shared_begin + CACHING_PAGESIZE) {
+                overlap.Pick();
+                cut_ids.push_back(overlap_id);
+                continue;
+            }
+        }
         overlap_ids.push_back(overlap_id);
         overlap.Pick();
-        const DAddr overlap_device_addr = overlap.CpuAddr();
         const bool expands_left = overlap_device_addr < begin;
         if (expands_left) {
             begin = overlap_device_addr;
@@ -4262,6 +4287,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     }
     return OverlapResult{
         .ids = std::move(overlap_ids),
+        .cut = std::move(cut_ids),
         .begin = begin,
         .end = end,
         .has_stream_leap = has_stream_leap,
@@ -4302,6 +4328,10 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size, bool s
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    for (const BufferId cut_id : overlap.cut) {
+        DownloadBufferMemory(slot_buffers[cut_id]);
+        DeleteBuffer(cut_id);
+    }
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     if (CreateTrace& trace = create_trace; trace.enabled) {
         u64 joined{};
@@ -4324,6 +4354,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size, bool s
     }
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+    frame_created_buffers.push_back(new_buffer_id);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);

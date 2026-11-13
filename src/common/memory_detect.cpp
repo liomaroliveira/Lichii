@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #endif
@@ -92,8 +93,59 @@ HostRam GetHostRam() {
 #ifdef __APPLE__
     return {GetMemInfo().TotalPhysicalMemory, true};
 #else
+#ifdef __linux__
+    // udev keeps the firmware's memory devices (SMBIOS type 17) readable without root. This
+    // counts memory the GPU reserves, e.g. the Steam Deck's 16 GiB, of which Linux manages 11.5.
+    if (std::ifstream file{"/run/udev/data/+dmi:id"}) {
+        const std::string data{std::istreambuf_iterator<char>{file}, {}};
+        return HostRamFromUdev(data, GetMemInfo().TotalPhysicalMemory);
+    }
+#endif
     return {GetMemInfo().TotalPhysicalMemory, false};
 #endif
+}
+
+HostRam HostRamFromUdev(std::string_view data, u64 managed) {
+    // Installed RAM is never less than what the OS manages. A smaller total is a partial one:
+    // udev has no size entry for a device whose size the firmware reports as unknown.
+    if (const u64 installed = InstalledRamFromUdev(data); installed != 0 && installed >= managed) {
+        return {installed, true};
+    }
+    return {managed, false};
+}
+
+u64 InstalledRamFromUdev(std::string_view data) {
+    constexpr std::string_view prefix = "E:MEMORY_DEVICE_";
+    constexpr std::string_view suffix = "_SIZE=";
+    u64 total = 0;
+    while (!data.empty()) {
+        const size_t end = data.find('\n');
+        std::string_view line = data.substr(0, end);
+        data = end == std::string_view::npos ? std::string_view{} : data.substr(end + 1);
+        if (!line.starts_with(prefix)) {
+            continue;
+        }
+        line.remove_prefix(prefix.size());
+        const size_t digits = line.find_first_not_of("0123456789");
+        if (digits == 0 || digits == std::string_view::npos ||
+            !line.substr(digits).starts_with(suffix)) {
+            continue;
+        }
+        line.remove_prefix(digits + suffix.size());
+        u64 size = 0;
+        bool valid = !line.empty();
+        for (const char c : line) {
+            if (c < '0' || c > '9') {
+                valid = false;
+                break;
+            }
+            size = size * 10 + static_cast<u64>(c - '0');
+        }
+        if (valid) {
+            total += size;
+        }
+    }
+    return total;
 }
 
 bool IsBelowSwitch2RamMinimum(HostRam ram) {

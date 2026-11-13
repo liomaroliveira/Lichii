@@ -865,61 +865,80 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
     std::unordered_set<const IR::Inst*> on_stack;
     std::vector<const IR::Inst*> stack;
     u32 next_index{};
-    const auto visit = [&](auto&& self, const IR::Inst* inst) -> void {
-        if (indices.contains(inst)) {
-            return;
-        }
+    struct VisitFrame {
+        const IR::Inst* inst;
+        size_t next_arg;
+    };
+    std::vector<VisitFrame> pending;
+    const auto enter = [&](const IR::Inst* inst) {
         const u32 index = next_index++;
         indices[inst] = lowlinks[inst] = index;
         stack.push_back(inst);
         on_stack.insert(inst);
-        const auto op = inst->GetOpcode();
-        if (op == IR::Opcode::IAdd32 || op == IR::Opcode::Phi || op == IR::Opcode::SelectU32) {
-            for (size_t arg = op == IR::Opcode::SelectU32 ? 1 : 0; arg < inst->NumArgs(); ++arg) {
-                if (inst->Arg(arg).IsImmediate()) {
+        pending.push_back({inst, inst->GetOpcode() == IR::Opcode::SelectU32 ? 1U : 0U});
+    };
+    const auto visit = [&](const IR::Inst* root) {
+        if (indices.contains(root)) {
+            return;
+        }
+        enter(root);
+        while (!pending.empty()) {
+            auto& frame = pending.back();
+            const IR::Inst* inst = frame.inst;
+            const auto op = inst->GetOpcode();
+            const bool follows_args = op == IR::Opcode::IAdd32 || op == IR::Opcode::Phi ||
+                                      op == IR::Opcode::SelectU32;
+            if (follows_args && frame.next_arg < inst->NumArgs()) {
+                const auto& arg = inst->Arg(frame.next_arg++);
+                if (arg.IsImmediate()) {
                     continue;
                 }
-                const IR::Inst* next = inst->Arg(arg).InstRecursive();
+                const IR::Inst* next = arg.InstRecursive();
                 if (!indices.contains(next)) {
-                    self(self, next);
-                    lowlinks[inst] = std::min(lowlinks[inst], lowlinks[next]);
+                    enter(next);
                 } else if (on_stack.contains(next)) {
                     lowlinks[inst] = std::min(lowlinks[inst], indices[next]);
                 }
-            }
-        }
-        if (lowlinks[inst] != index) {
-            return;
-        }
-        std::vector<const IR::Inst*> component;
-        const IR::Inst* member;
-        do {
-            member = stack.back();
-            stack.pop_back();
-            on_stack.erase(member);
-            component.push_back(member);
-        } while (member != inst);
-        if (component.size() < 2) {
-            return;
-        }
-        const std::unordered_set<const IR::Inst*> members(component.begin(), component.end());
-        for (const IR::Inst* add : component) {
-            if (add->GetOpcode() != IR::Opcode::IAdd32) {
                 continue;
             }
-            for (size_t arg = 0; arg < add->NumArgs(); ++arg) {
-                const auto& term = add->Arg(arg);
-                if (!term.IsImmediate() && members.contains(term.InstRecursive())) {
+            pending.pop_back();
+            if (!pending.empty()) {
+                const IR::Inst* parent = pending.back().inst;
+                lowlinks[parent] = std::min(lowlinks[parent], lowlinks[inst]);
+            }
+            if (lowlinks[inst] != indices[inst]) {
+                continue;
+            }
+            std::vector<const IR::Inst*> component;
+            const IR::Inst* member;
+            do {
+                member = stack.back();
+                stack.pop_back();
+                on_stack.erase(member);
+                component.push_back(member);
+            } while (member != inst);
+            if (component.size() < 2) {
+                continue;
+            }
+            const std::unordered_set<const IR::Inst*> members(component.begin(), component.end());
+            for (const IR::Inst* add : component) {
+                if (add->GetOpcode() != IR::Opcode::IAdd32) {
                     continue;
                 }
-                ForEachSummedWord(term, [&](StorageBufferAddr word, u32) { result.insert(word); });
+                for (size_t arg = 0; arg < add->NumArgs(); ++arg) {
+                    const auto& term = add->Arg(arg);
+                    if (!term.IsImmediate() && members.contains(term.InstRecursive())) {
+                        continue;
+                    }
+                    ForEachSummedWord(term, [&](StorageBufferAddr word, u32) { result.insert(word); });
+                }
             }
         }
     };
     for (IR::Block* block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::Phi) {
-                visit(visit, &inst);
+                visit(&inst);
             }
         }
     }

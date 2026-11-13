@@ -132,9 +132,9 @@ skips the entire FPS Unlock patch transactionally.
 FPS Unlock reserves `0x1C0` bytes from `0x4E9FE00`. Its step state occupies
 `0x4E9FEB0..0x4E9FFC0` (end exclusive): a replacement index at `+0`, then 16
 slots of `{u64 counter address, f32 remainder, pad}` at `+0x10`. The range
-`0x4E9FE10..0x4E9FEB0` stays free for the separate open water PR #1180 (state
-through `+0x98`, cave `0x3C46300`) and sound PR #1289 (state through `+0xA8`,
-caves `0x3C46280` and `0x3C46800`). Those patches are not included here.
+`0x4E9FE10..0x4E9FEB0` stays free for the separate water (state
+through `+0x98`, cave `0x3C46300`) and sound (state through `+0xA8`,
+caves `0x3C46280` and `0x3C46800`) patches.
 Zero initialization and non-overlap do not establish exclusive BSS ownership
 throughout gameplay.
 
@@ -146,6 +146,32 @@ The character controller compares a frame-rate value with `100.0` in three place
 `FPS Unlock (built-in)` replaces the three branches with `nop`. `Dynamic FPS by Dark (built-in)`
 never exceeds 60 fps and leaves them alone. Measured on the Deku Tree B1 raft: the applied
 velocity was 0.100 of the ground's at steps below 0.6 and 1.000 at steps of 0.627 and above.
+
+## FPS Unlock: sound manager at 60 Hz
+
+`FPS Unlock (built-in)` lowers the step below 1.0 above 60 fps (0.5 at 120 fps).
+The game's sound engine expects at least one whole 60 fps step per update: its
+fade and delay timers and parameter ramps count updates from the step it is
+given. With less, some sounds are not released when an area unloads; they pile
+up until the game's voice budget is full, and then most new sounds and the
+music stop until a restart (sword swings, spin and jump attacks, swimming,
+area and shop music; #716, #1092).
+
+The sound manager job at `0x415300` (phase in `w2`: phase 0 reads the step and
+updates the sound engine, phase 1 follows) is entered every frame. FPS Unlock
+replaces its first instruction, `pacibsp`, with `b 0x3C46800` (124-byte gate)
+and its step load at `0x415334`, `ldr s0, [x8, #0x10]`, with `bl 0x3C46280`
+(16 bytes, returns `max(step, 1.0)`). In phase 0 the gate runs the job as before
+when the step is at least 1.0. Below that it adds the step to an accumulator
+at `0x4E9FEA0` and runs the job only once a whole step has built up, keeping
+the remainder; otherwise it returns. Other phases follow that frame's decision
+(flag at `0x4E9FEA4`). So above 60 fps the sound manager runs at 60 Hz with
+whole steps and sound still follows real time; at 60 fps and below nothing
+changes. FPS Unlock's timer state grows to `0xA8` bytes for those words (within the `0x1C0`
+total reservation). Dynamic FPS never lowers the step below 1.0 and does not include the gate.
+
+Both caves are in the executable padding after the text (`0x3C46280` follows
+the FPS routine at `0x3C46200`; `0x3C46800` is past the other caves in use).
 
 ## Tests
 

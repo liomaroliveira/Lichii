@@ -499,7 +499,9 @@ SignInResult SignIn(std::string_view client_id,
 #endif
     });
     server.Get("/callback", [&](const httplib::Request& request, httplib::Response& response) {
-        Callback parsed = ParseCallback(request.params, *state);
+        const std::multimap<std::string, std::string> params(request.params.begin(),
+                                                             request.params.end());
+        Callback parsed = ParseCallback(params, *state);
         if (!parsed.matched) {
             response.status = 400;
             response.set_content(parsed.error, "text/plain; charset=utf-8");

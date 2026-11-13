@@ -53,6 +53,7 @@ class GImageInfo;
 class GRenderWindow;
 class LoadingScreen;
 class OverlayDialog;
+class BugReportDialog;
 class ControllerDialog;
 class QLabel;
 class MultiplayerState;
@@ -453,6 +454,7 @@ private slots:
     void OnCreateHomeMenuDesktopShortcut();
     void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
+    void OnReportBug();
     /// Checks for decryption keys; `prompt` asks to install them when they are missing.
     void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
@@ -550,6 +552,7 @@ private:
     QTimer nextendo_session_timer;
     QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
+    BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;

@@ -48,7 +48,8 @@ public:
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
                              vk::ShaderModule spv_module, u64 shader_hash,
-                             std::function<vk::ShaderModule()> emit = {});
+                             std::vector<u8> kept_spirv,
+                             std::function<vk::ShaderModule(std::vector<u8>&)> emit = {});
 
     ~ComputePipeline();
 
@@ -84,6 +85,16 @@ public:
 
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
+    }
+
+    /// The build finished or failed, so KeptSpirv() is no longer written.
+    [[nodiscard]] bool IsBuilt() const noexcept {
+        return is_built.load(std::memory_order_acquire);
+    }
+
+    /// The SPIR-V (zstd) the pipeline was built from; read it only once IsBuilt().
+    [[nodiscard]] const std::vector<u8>& KeptSpirv() const noexcept {
+        return kept_spirv;
     }
 
     /// Storage images written by the last configured dispatch
@@ -134,6 +145,7 @@ private:
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
+    std::vector<u8> kept_spirv;
     vk::DescriptorSetLayout descriptor_set_layout;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
