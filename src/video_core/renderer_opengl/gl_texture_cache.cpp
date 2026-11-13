@@ -741,7 +741,16 @@ void Image::UploadMemory(GLuint buffer_handle, size_t buffer_offset,
         ScaleDown(true);
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer_handle);
-    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, buffer_offset, unswizzled_size_bytes);
+    // Flush the bytes the copies read. A converted image's copies (ConvertedLayout) cover more
+    // or fewer bytes than its unswizzled guest layout.
+    size_t flush_size = 0;
+    for (const VideoCommon::BufferImageCopy& copy : copies) {
+        flush_size = (std::max)(flush_size, copy.buffer_offset + copy.buffer_size);
+    }
+    if (flush_size != 0) {
+        glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, static_cast<GLintptr>(buffer_offset),
+                                 static_cast<GLsizeiptr>(flush_size));
+    }
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
