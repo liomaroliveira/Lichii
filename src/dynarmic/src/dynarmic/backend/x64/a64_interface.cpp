@@ -63,6 +63,7 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
         ArgCallback(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         ArgCallback(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
+        HostCallReturn(conf) ? std::optional<u32>{u32(offsetof(A64JitState, host_stack_base))} : std::nullopt,
     };
 }
 
@@ -74,7 +75,25 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
         if (conf.fastmem_pointer) {
             code.mov(code.r13, *conf.fastmem_pointer);
         }
+        if (HostCallReturn(conf)) {
+            // A RET compares its target with the frame's [rsp + ABI_SHADOW_SPACE]; with no guest
+            // frame that is the first StackLayout word (the spills live in the JIT state), which
+            // holds a value no location descriptor has (bits 57-58 are never set in one).
+            code.mov(code.qword[code.rsp + ABI_SHADOW_SPACE], -1);
+            code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, host_stack_base)], code.rsp);
+            code.lea(code.rax, code.ptr[code.rsp - HostCallFrameSize * HostCallMaxDepth]);
+            code.mov(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, host_stack_limit)], code.rax);
+        }
     };
+}
+
+// Largest power of two <= conf.rsb_size, between 8 and A64JitState::RSB_SIZE, minus one.
+static size_t RsbPtrMask(const A64::UserConfig& conf) {
+    size_t size = A64JitState::RSB_SIZE;
+    while (size > 8 && size > conf.rsb_size) {
+        size >>= 1;
+    }
+    return size - 1;
 }
 
 static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code) {
@@ -89,7 +108,7 @@ struct SharedCodeCache final {
         : conf(conf)
         , is_shared(is_shared)
         , block_of_code(GenRunCodeCallbacks(conf.callbacks, LookupBlock, single_core_arg, conf, is_shared),
-                        JitStateInfo{dummy_state}, conf.code_cache_size, GenRCP(conf))
+                        JitStateInfo{dummy_state, RsbPtrMask(conf)}, conf.code_cache_size, GenRCP(conf))
         , emitter(block_of_code, conf, nullptr, is_shared)
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
@@ -581,7 +600,7 @@ public:
                                   : std::make_shared<SharedCodeCache>(conf, false, &GetCurrentBlockThunk, this))
     {
         if (cache->is_shared && conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-            fast_dispatch_table.resize(A64EmitX64::fast_dispatch_table_size);
+            fast_dispatch_table.resize(cache->emitter.fast_dispatch_table_entries);
         }
         InitJitStatePerCore();
         if (cache->is_shared) {
@@ -603,7 +622,8 @@ public:
         cache->active_runs.fetch_add(1, std::memory_order_acq_rel);
         const CodePtr current_code_ptr = [this] {
             // RSB optimization
-            const u32 new_rsb_ptr = (jit_state.rsb_ptr - 1) & A64JitState::RSB_PTR_MASK;
+            // The cache's conf: its code and this core must use the same RSB size.
+            const u32 new_rsb_ptr = (jit_state.rsb_ptr - 1) & u32(RsbPtrMask(cache->conf));
             if (jit_state.GetUniqueHash() == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
                 jit_state.rsb_ptr = new_rsb_ptr;
                 return CodePtr(jit_state.rsb_codeptrs[new_rsb_ptr]);
@@ -798,9 +818,12 @@ private:
                 for (u64 s = local_epoch + 1; s <= cur_seq; ++s) {
                     const auto& rec = cache->invalidation_ring[s & (SharedCodeCache::INVALIDATION_RING_SIZE - 1)];
                     if (rec.seq == s) {
-                        auto& entry = (*cache->emitter.shared_fast_dispatch_lookup)(rec.loc, table);
-                        if (entry.location_descriptor == rec.loc) {
-                            entry = {};
+                        // The lookup returns the set; with fast_dispatch_set_associative it has several ways.
+                        auto* set = &(*cache->emitter.shared_fast_dispatch_lookup)(rec.loc, table);
+                        for (size_t way = 0; way < cache->emitter.fast_dispatch_set_size; ++way) {
+                            if (set[way].location_descriptor == rec.loc) {
+                                set[way] = {};
+                            }
                         }
                     }
                 }
@@ -883,6 +906,13 @@ private:
 };
 
 std::shared_ptr<SharedCodeCache> MakeSharedCodeCache(UserConfig conf) {
+    // Block links of shared code go through SharedPatchSlots: the #1531 options that patch or
+    // emit links themselves (and the cold region, whose space the shared clear does not count)
+    // stay off here.
+    conf.compact_block_exits = false;
+    conf.halt_check_on_back_edges = false;
+    conf.host_call_return = false;
+    conf.far_code = false;
     return std::make_shared<SharedCodeCache>(conf, true, &Jit::Impl::GetCurrentBlockThunk, nullptr);
 }
 

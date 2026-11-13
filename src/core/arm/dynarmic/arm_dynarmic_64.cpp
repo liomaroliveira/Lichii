@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -462,6 +463,55 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(ARCHITECTURE_x86_64)
+    // x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
+    // Set before the shared code cache is made: its emitter generates code with these options.
+    // EDEN_NX2_JIT_1531_OFF=spill,zext,fold,frame,dispatch,rsb,compact,far,flags,backedge,callret
+    // turns single options off to isolate one without a rebuild (the shared cache always keeps
+    // compact, far, backedge and callret off: MakeSharedCodeCache).
+    static const std::string jit_off = [] {
+        const char* v = std::getenv("EDEN_NX2_JIT_1531_OFF");
+        return "," + std::string(v ? v : "") + ",";
+    }();
+    const auto jit_on = [](const char* name) { return jit_off.find("," + std::string(name) + ",") == std::string::npos; };
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        // The JIT spilled ~9% of its instructions to stack slots in Ocarina of Time's hot code
+        // while callee-saved GPRs sat empty: evictions go to a free callee-saved GPR first, and an
+        // operand that is overwritten but still needed is copied to a free register instead.
+        config.spill_to_free_gpr = jit_on("spill");
+        config.scratch_copy_to_free_reg = jit_on("spill");
+        // W-register writes and zero-extends of values a 32-bit instruction produced skip the
+        // second `mov r32, r32`.
+        config.elide_redundant_zext = jit_on("zext");
+        // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
+        // separate LEA (and often a register copy).
+        config.fold_address_offsets = jit_on("fold");
+        // The per-block %rbp frame is three instructions per block that nothing reads.
+        config.omit_block_frame = jit_on("frame");
+        // Fast dispatch table of 2^16 entries, 4-way set associative: 1 MiB per core instead of
+        // the 16 MiB direct-mapped 2^20 table.
+        if (jit_on("dispatch")) { config.fast_dispatch_table_bits = 16; }
+        config.fast_dispatch_set_associative = jit_on("dispatch");
+        // A 32-entry return stack buffer: returns from deeper call chains skip the dispatcher.
+        if (jit_on("rsb")) { config.rsb_size = 32; }
+        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
+        // 22/23 bytes plus an inline exit stub.
+        config.compact_block_exits = jit_on("compact");
+        // Fault/abort paths, atomic fallbacks and exit stubs go to a cold region at the end of
+        // the code cache, so hot blocks sit densely.
+        config.far_code = jit_on("far");
+        // Branches, CSEL and CBZ/TBZ read the host flags left by the instruction before them
+        // instead of reloading NZCV from the guest state.
+        config.reuse_host_flags = jit_on("flags") && !config.enable_cycle_counting;
+        // Halt checks on links to lower PCs and on indirect branches instead of every linked
+        // branch (multicore only: dynarmic counts no cycles there).
+        config.halt_check_on_back_edges = jit_on("backedge") && !config.enable_cycle_counting;
+        // BL/BLR as host calls and RET as a host return checked against the guest return
+        // address: the CPU's return predictor predicts guest returns instead of one shared
+        // indirect jump through the return stack buffer (multicore only, no cycle counter).
+        config.host_call_return = jit_on("callret") && !config.enable_cycle_counting;
+    }
+#endif
     static const bool shared_jit_on = [] {
         const char* v = std::getenv("EDEN_NX2_SHARED_JIT");
         return v == nullptr || *v != '0';
