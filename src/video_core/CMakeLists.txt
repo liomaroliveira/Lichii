@@ -581,7 +581,8 @@ file(GLOB_RECURSE emission_sources CONFIGURE_DEPENDS RELATIVE "${lowering_source
      "${lowering_source_dir}/shader_recompiler/*.inc")
 list(FILTER emission_sources EXCLUDE REGEX "^shader_recompiler/backend/(glasm|glsl)/")
 list(APPEND emission_sources ${lowering_sources}
-     video_core/renderer_vulkan/pipeline_shader_emission.h video_core/shader_environment.cpp
+     video_core/renderer_vulkan/pipeline_shader_emission.h
+     video_core/renderer_vulkan/vk_pipeline_cache.cpp video_core/shader_environment.cpp
      video_core/shader_environment.h)
 list(REMOVE_DUPLICATES emission_sources)
 list(SORT emission_sources)
