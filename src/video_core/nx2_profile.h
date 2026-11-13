@@ -652,10 +652,87 @@ inline void Report(const char* thread_name = "GPU thread", bool report_all_conte
             const u64 count = all.count.exchange(0, std::memory_order_relaxed);
             const u64 ns = all.ns.exchange(0, std::memory_order_relaxed);
             const u64 sleeps = all.sleeps.exchange(0, std::memory_order_relaxed);
-            line += fmt::format(", all threads {:.0f}/s {:.1f} ms ({:.0f} sleeps/s)",
+            std::string all_locks;
+            for (size_t lock = 0; lock < Common::g_spin_contention_by_lock.size(); ++lock) {
+                auto& entry = Common::g_spin_contention_by_lock[lock];
+                const u64 lc = entry.count.exchange(0, std::memory_order_relaxed);
+                const u64 lns = entry.ns.exchange(0, std::memory_order_relaxed);
+                entry.sleeps.exchange(0, std::memory_order_relaxed);
+                if (lc != 0) {
+                    all_locks += fmt::format(" {} {:.1f} ms ({:.0f}/s),", lock_names[lock],
+                                             static_cast<double>(lns) / 1e6 * 1e9 / window,
+                                             static_cast<double>(lc) * 1e9 / window);
+                }
+            }
+            if (!all_locks.empty()) {
+                all_locks.pop_back();
+            }
+            line += fmt::format(", all threads {:.0f}/s {:.1f} ms ({:.0f} sleeps/s){}",
                                 static_cast<double>(count) * 1e9 / window,
                                 static_cast<double>(ns) / 1e6 * 1e9 / window,
-                                static_cast<double>(sleeps) * 1e9 / window);
+                                static_cast<double>(sleeps) * 1e9 / window,
+                                all_locks.empty() ? std::string{} : " [by lock:" + all_locks + "]");
+
+            std::string cpu_cores;
+            for (size_t core = 0; core < Common::g_cpu_contention_by_core.size(); ++core) {
+                u64 core_count = 0;
+                u64 core_ns = 0;
+                u64 core_sleeps = 0;
+                std::string core_locks;
+                for (size_t lock = 0; lock < Common::g_cpu_contention_by_core[core].size(); ++lock) {
+                    auto& entry = Common::g_cpu_contention_by_core[core][lock];
+                    const u64 lc = entry.count.exchange(0, std::memory_order_relaxed);
+                    const u64 lns = entry.ns.exchange(0, std::memory_order_relaxed);
+                    const u64 ls = entry.sleeps.exchange(0, std::memory_order_relaxed);
+                    core_count += lc;
+                    core_ns += lns;
+                    core_sleeps += ls;
+                    if (lc != 0) {
+                        core_locks += fmt::format(" {} {:.1f} ms ({:.0f}/s),", lock_names[lock],
+                                                  static_cast<double>(lns) / 1e6 * 1e9 / window,
+                                                  static_cast<double>(lc) * 1e9 / window);
+                    }
+                }
+                if (core_count != 0) {
+                    if (!core_locks.empty()) {
+                        core_locks.pop_back();
+                    }
+                    cpu_cores += fmt::format(" CPUCore_{} {:.0f}/s {:.1f} ms ({:.0f} sleeps/s;{}),",
+                                             core, static_cast<double>(core_count) * 1e9 / window,
+                                             static_cast<double>(core_ns) / 1e6 * 1e9 / window,
+                                             static_cast<double>(core_sleeps) * 1e9 / window, core_locks);
+                }
+            }
+            std::vector<std::tuple<u64, u64, size_t, size_t>> cpu_holders;
+            for (size_t lock = 0; lock < Common::g_cpu_contention_by_holder.size(); ++lock) {
+                for (size_t holder = 0; holder < Common::g_cpu_contention_by_holder[lock].size(); ++holder) {
+                    auto& entry = Common::g_cpu_contention_by_holder[lock][holder];
+                    const u64 hc = entry.count.exchange(0, std::memory_order_relaxed);
+                    const u64 hns = entry.ns.exchange(0, std::memory_order_relaxed);
+                    entry.sleeps.exchange(0, std::memory_order_relaxed);
+                    if (hc != 0) {
+                        cpu_holders.emplace_back(hns, hc, lock, holder);
+                    }
+                }
+            }
+            if (!cpu_cores.empty()) {
+                cpu_cores.pop_back();
+                std::ranges::sort(cpu_holders, std::greater{});
+                std::string cpu_held;
+                for (size_t i = 0; i < (std::min)(cpu_holders.size(), size_t{8}); ++i) {
+                    const auto [hns, hc, lock, holder] = cpu_holders[i];
+                    const char* name = Common::g_contention_holder_names[holder].load(std::memory_order_acquire);
+                    cpu_held += fmt::format(" {}/{} {:.1f} ms ({:.0f}/s),", lock_names[lock],
+                                            name != nullptr ? name : "unnamed",
+                                            static_cast<double>(hns) / 1e6 * 1e9 / window,
+                                            static_cast<double>(hc) * 1e9 / window);
+                }
+                if (!cpu_held.empty()) {
+                    cpu_held.pop_back();
+                }
+                line += " | CPU cores contention:" + cpu_cores +
+                        (cpu_held.empty() ? std::string{} : ", held by:" + cpu_held);
+            }
         }
     }
     if (cpu_now && data.cpu_start_ns && *cpu_now >= *data.cpu_start_ns) {

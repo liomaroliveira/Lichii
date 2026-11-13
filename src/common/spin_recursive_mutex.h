@@ -43,6 +43,18 @@ inline thread_local std::array<std::array<SpinMutexContention, MaxContentionHold
 /// Names the calling thread as a lock holder (SetCurrentThreadName calls it).
 void NameContentionHolder(const char* name);
 
+/// EDEN_NX2_GPU_PROFILE: contention totals by lock (all threads) and per-core / per-holder on CPU cores.
+inline constexpr std::size_t MaxWatchedCpuCores = 8;
+inline thread_local std::uint8_t t_watched_cpu_core{0xFF};
+inline std::array<SharedSpinMutexContention, static_cast<std::size_t>(ContentionLock::Count)>
+    g_spin_contention_by_lock{};
+inline std::array<std::array<SharedSpinMutexContention, static_cast<std::size_t>(ContentionLock::Count)>,
+                  MaxWatchedCpuCores>
+    g_cpu_contention_by_core{};
+inline std::array<std::array<SharedSpinMutexContention, MaxContentionHolders>,
+                  static_cast<std::size_t>(ContentionLock::Count)>
+    g_cpu_contention_by_holder{};
+
 /// One busy-wait step: tells the core this thread spins (less power, more for its sibling).
 inline void SpinPause() {
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -128,14 +140,26 @@ private:
             ++t_spin_contention.count;
             t_spin_contention.ns += ns;
             t_spin_contention.sleeps += slept ? 1 : 0;
-            auto& by_holder = t_contention_by_holder[static_cast<std::size_t>(contention_lock)]
-                                                    [held_by < MaxContentionHolders ? held_by : 0];
+            const auto lock_idx = static_cast<std::size_t>(contention_lock);
+            const auto held_idx = held_by < MaxContentionHolders ? held_by : 0;
+            const std::uint64_t sleep_add = slept ? 1 : 0;
+            auto& by_holder = t_contention_by_holder[lock_idx][held_idx];
             ++by_holder.count;
             by_holder.ns += ns;
-            by_holder.sleeps += slept ? 1 : 0;
-            g_spin_contention.count.fetch_add(1, std::memory_order_relaxed);
-            g_spin_contention.ns.fetch_add(ns, std::memory_order_relaxed);
-            g_spin_contention.sleeps.fetch_add(slept ? 1 : 0, std::memory_order_relaxed);
+            by_holder.sleeps += sleep_add;
+            auto add_shared = [ns, sleep_add](SharedSpinMutexContention& dst) {
+                dst.count.fetch_add(1, std::memory_order_relaxed);
+                dst.ns.fetch_add(ns, std::memory_order_relaxed);
+                if (sleep_add != 0) {
+                    dst.sleeps.fetch_add(sleep_add, std::memory_order_relaxed);
+                }
+            };
+            add_shared(g_spin_contention);
+            add_shared(g_spin_contention_by_lock[lock_idx]);
+            if (t_watched_cpu_core < MaxWatchedCpuCores) {
+                add_shared(g_cpu_contention_by_core[t_watched_cpu_core][lock_idx]);
+                add_shared(g_cpu_contention_by_holder[lock_idx][held_idx]);
+            }
             return;
         }
         Acquire();

@@ -681,7 +681,21 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+static void BindWatchedCpuCore(const char* name) {
+    if (std::strcmp(name, "CPUThread") == 0) {
+        t_watched_cpu_core = 0;
+        return;
+    }
+    if (std::strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' &&
+        name[8] < '0' + static_cast<int>(MaxWatchedCpuCores) && name[9] == '\0') {
+        t_watched_cpu_core = static_cast<std::uint8_t>(name[8] - '0');
+        return;
+    }
+    t_watched_cpu_core = 0xFF;
+}
+
 void NameContentionHolder(const char* name) {
+    BindWatchedCpuCore(name);
     // Threads of a pool share their name, and so an id.
     static std::array<std::array<char, 32>, MaxContentionHolders> names{};
     static std::uint32_t used = 1;
