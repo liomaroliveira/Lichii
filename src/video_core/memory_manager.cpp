@@ -15,6 +15,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
@@ -335,8 +336,17 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+        // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+        if (const auto address = GpuToCpuAddress(addr);
+            address && VideoCommon::GpuSplit::WatchCovers(*address, sizeof(T))) {
+            LOG_INFO(HW_GPU, "Semaphore watch: MemoryManager::Write {:#x} at {:#x} on {}, was {:#x}",
+                     static_cast<u64>(data), *address, VideoCommon::GpuSplit::ThreadRole(),
+                     Read<u32>(addr & ~GPUVAddr{3}));
+        }
+    }
     // A download for a guest read not yet in guest memory would land over this write later.
-    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) [[unlikely]] {
         if (const auto address = GpuToCpuAddress(addr);
             address && rasterizer != nullptr &&
             VideoCore::ReadDownloadsMayCover(*address, sizeof(T))) {
@@ -568,9 +578,22 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
+    // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+    const auto watch_write = [&](DAddr dev_addr, std::size_t amount) {
+        if (const u64 watch = VideoCommon::GpuSplit::WatchCovers(dev_addr, amount); watch != 0) [[unlikely]] {
+            u32 value{};
+            if (watch + 4 <= dev_addr + amount) {
+                std::memcpy(&value, static_cast<const u8*>(src_buffer) + (watch - dev_addr), 4);
+            }
+            LOG_INFO(HW_GPU, "Semaphore watch: MemoryManager::WriteBlock{} {:#x} at {:#x} ({:#x} bytes at {:#x}) on {}",
+                     unsafe ? "Unsafe" : "", value, watch, amount, dev_addr,
+                     VideoCommon::GpuSplit::ThreadRole());
+        }
+    };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
         FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
+        watch_write(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -588,6 +611,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
         FinishReadsBefore(dev_addr_base, copy_amount, unsafe);
+        watch_write(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }

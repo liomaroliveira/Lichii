@@ -48,6 +48,8 @@ Fence FenceManagerOpenGL::CreateFence(bool is_stubbed) {
 
 void FenceManagerOpenGL::QueueFence(Fence& fence) {
     fence->Queue();
+    // Vulkan's fences submit when queued; here the commands before the fence are flushed.
+    rasterizer.FlushCommands();
 }
 
 bool FenceManagerOpenGL::IsFenceSignaled(Fence& fence) const {

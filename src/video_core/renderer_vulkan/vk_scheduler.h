@@ -28,6 +28,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_read_trace.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -42,11 +43,32 @@ namespace Vulkan {
 class CommandPool;
 class Device;
 class Framebuffer;
+class GpuCost;
 class GraphicsPipeline;
+class ReorderedUploadBatch;
 class StateTracker;
 class UploadBatch;
 
 struct QueryCacheParams;
+
+/// TEST (EDEN_NX2_GPU_COST, vk_gpu_cost.h): the source line that recorded a command. A render
+/// pass's end carries the line that ended it, its begin the line that ended the pass before.
+struct RecordSite {
+    enum Role : u8 {
+        Own,
+        PassEnd,
+        PassBegin,
+        Submit,
+    };
+    enum Flags : u8 {
+        PassHadStores = 1 << 0, ///< PassEnd: a draw in the pass wrote storage buffers or images
+    };
+    const char* file;
+    const char* function;
+    u32 line;
+    Role role;
+    u8 flags;
+};
 
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
@@ -116,6 +138,19 @@ public:
         work();
         cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
     }
+
+    /// TEST (EDEN_NX2_READ_TRACE, nx2_read_trace.h), recording thread: a device timestamp written
+    /// once the work recorded so far is done. Returns its handle for TraceRead, 0 when off.
+    u64 TraceMark();
+    /// Recording thread: the draws, dispatches and render passes recorded so far.
+    [[nodiscard]] VideoCommon::ReadTrace::Counts TraceCounts() const noexcept {
+        return trace_counts;
+    }
+    void TraceCountWork(bool dispatch) noexcept {
+        ++(dispatch ? trace_counts.dispatches : trace_counts.draws);
+    }
+    /// A reading thread's step of a guest read that waits.
+    void TraceRead(VideoCommon::ReadTrace::Read& read, VideoCommon::ReadTrace::Step step);
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -205,42 +240,45 @@ public:
         on_submit = std::move(func);
     }
 
-    /// Consecutive in-order staging uploads share barriers until their destinations overlap,
-    /// a source depends on a pending copy, or the batch is full. Call outside a render pass.
-    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
+    /// An upload in order: copies into dst after the work recorded before them and before the
+    /// work recorded after them (the barriers of an in-order buffer copy). Uploads with no other
+    /// command between them share one command and one pair of barriers, unless one would write
+    /// bytes another writes, or a buffer another reads. Call outside a render pass.
+    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies,
+                      std::source_location location = std::source_location::current());
+
+    /// An upload ahead of all the work of this submission's main command buffer: it runs in the
+    /// upload command buffer, which the submission's reordered uploads are recorded into as one
+    /// command when it is submitted. The caller guarantees that no work recorded in this
+    /// submission uses the bytes it writes, nor work of an earlier submission after prior_tick
+    /// (0: of any). Unless the host GPU has finished submission prior_tick by then, the upload
+    /// command buffer begins with a barrier on the work of earlier submissions.
+    void RecordReorderedUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies,
+                               u64 prior_tick);
 
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
-    void RecordWithUploadBuffer(T&& command) {
-        if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
-            VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
-        }
-        if (uploads_pending) {
-            // Pending uploads precede every other recorded command, including upload-buffer work.
-            FlushUploads();
-        }
-        ++record_serial;
-        if (chunk->Record(command)) {
-            return;
-        }
-        DispatchWork();
-        (void)chunk->Record(command);
+    void RecordWithUploadBuffer(T&& command,
+                                std::source_location location = std::source_location::current()) {
+        RecordAs(std::forward<T>(command), location, RecordSite::Own, 0);
     }
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
-        this->RecordWithUploadBuffer(
+    void Record(T&& c, std::source_location location = std::source_location::current()) {
+        RecordAs(
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
-            });
+            },
+            location, RecordSite::Own, 0);
     }
 
     /// Whether anything was recorded since the last Flush or Finish, or waits to be: batched
-    /// uploads and a deferred clear reach the command buffer only at the next record or submit.
+    /// and reordered uploads and a deferred clear reach the command buffer only at the next
+    /// record or submit.
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        return record_serial != submitted_serial || uploads_pending ||
+        return record_serial != submitted_serial || uploads_pending || reordered_uploads_pending ||
                deferred_clear.framebuffer != nullptr;
     }
     /// Counts a flush skipped because nothing was recorded (GPU profile).
@@ -401,12 +439,20 @@ private:
 
     class CommandChunk final {
     public:
-        void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf);
+        /// cost: the TEST GPU cost trace when this chunk is in a submission it samples.
+        void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf, GpuCost* cost);
+
+        /// TEST (EDEN_NX2_GPU_COST): the site of each command, in order.
+        void NoteSite(const RecordSite& site) {
+            sites.push_back(site);
+        }
 
         template <typename T>
         bool Record(T& command) {
             using FuncType = TypedCommand<T>;
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
+            // The offset is aligned within data, so data itself must be aligned at least as much.
+            static_assert(alignof(FuncType) <= DataAlignment, "Lambda needs more alignment");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
             if (command_offset > sizeof(data) - sizeof(FuncType)) {
@@ -442,8 +488,35 @@ private:
 
         size_t command_offset = 0;
         bool submit = false;
-        alignas(std::max_align_t) std::array<u8, 0x8000> data{};
+        std::vector<RecordSite> sites;
+        /// Commands are constructed in data at offsets aligned for their type. Some hold
+        /// alignas(16) members (the ASTC decoder pass's BlockLinearSwizzle2DParams), and
+        /// std::max_align_t is only 8 on MSVC and clang-cl, so data asks for 16 itself rather
+        /// than depending on where the members before it happen to end.
+        static constexpr size_t DataAlignment =
+            alignof(std::max_align_t) > 16 ? alignof(std::max_align_t) : 16;
+        alignas(DataAlignment) std::array<u8, 0x8000> data{};
     };
+
+    template <typename T>
+    void RecordAs(T&& command, std::source_location location, RecordSite::Role role, u8 flags) {
+        if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (uploads_pending) {
+            // Uploads recorded before this command go before it.
+            FlushUploads();
+        }
+        ++record_serial;
+        if (!chunk->Record(command)) {
+            DispatchWork();
+            (void)chunk->Record(command);
+        }
+        if (record_sites) [[unlikely]] {
+            chunk->NoteSite({location.file_name(), location.function_name(), location.line(), role,
+                             flags});
+        }
+    }
 
     struct State {
         VkRenderPass renderpass{};
@@ -481,13 +554,21 @@ private:
     void ReportWorkTimes();
     void TraceShader(u64 hash, u32 stage);
 
-    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
+    struct ReadTraceState;
+    void CreateReadTrace();
+    [[nodiscard]] VideoCommon::ReadTrace::Timeline PlaceRead(
+        const VideoCommon::ReadTrace::Read& read) const;
+
+    /// cause: the line that asked for the submission, which ends a render pass still open.
+    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                        std::source_location cause);
 
     void AllocateNewContext();
 
-    void EndPendingOperations();
+    void EndPendingOperations(std::source_location cause);
 
-    void EndRenderPass();
+    /// cause: the line that needs the render pass ended (TEST EDEN_NX2_GPU_COST's site of it).
+    void EndRenderPass(std::source_location cause = std::source_location::current());
 
     void AcquireNewChunk();
 
@@ -501,11 +582,6 @@ private:
     bool graphics_pipeline_missing{};
     u64 render_pass_serial{};
     std::unique_ptr<CommandPool> command_pool;
-
-    std::unique_ptr<UploadBatch> upload_batch;
-    bool uploads_pending{};
-    /// Records pending uploads before another command, worker handoff, or submission tick.
-    void FlushUploads();
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;
@@ -557,6 +633,28 @@ private:
     mutable std::mutex gpu_busy_mutex;
     std::optional<GpuBusySample> gpu_busy;
 
+    /// TEST: EDEN_NX2_READ_TRACE
+    std::unique_ptr<ReadTraceState> read_trace;
+    VideoCommon::ReadTrace::Counts trace_counts{};
+
+    /// TEST: EDEN_NX2_GPU_COST. record_sites: every command notes its RecordSite.
+    std::unique_ptr<GpuCost> gpu_cost;
+    bool record_sites{};
+
+    /// RecordUpload's copies not recorded yet; uploads_pending while it holds any.
+    std::unique_ptr<UploadBatch> upload_batch;
+    std::source_location upload_batch_site{};
+    bool uploads_pending{};
+    /// Records the pending uploads as one command.
+    void FlushUploads();
+    /// RecordReorderedUpload's copies, recorded when the submission is.
+    std::unique_ptr<ReorderedUploadBatch> reordered_uploads;
+    bool reordered_uploads_pending{};
+    /// Records the reordered uploads into the upload command buffer as one command.
+    void FlushReorderedUploads();
+    /// The line that ended the last render pass: the site of the next pass's begin.
+    std::source_location last_pass_end{};
+
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
     vk::CommandBuffer current_cmdbuf;
@@ -581,6 +679,8 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    /// work_queue's size, set under queue_mutex: the worker watches it before it sleeps.
+    std::atomic<size_t> queued_chunks{};
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

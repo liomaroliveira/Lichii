@@ -19,6 +19,7 @@
 #include "common/event_wait.h"
 #include "common/logging.h"
 #include "common/assert.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/thread.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -680,7 +681,29 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+void NameContentionHolder(const char* name) {
+    // Threads of a pool share their name, and so an id.
+    static std::array<std::array<char, 32>, MaxContentionHolders> names{};
+    static std::uint32_t used = 1;
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    for (std::uint32_t id = 1; id < used; ++id) {
+        if (std::strncmp(names[id].data(), name, names[id].size() - 1) == 0) {
+            t_contention_holder = id;
+            return;
+        }
+    }
+    if (used >= MaxContentionHolders) {
+        return;
+    }
+    const std::uint32_t id = used++;
+    std::strncpy(names[id].data(), name, names[id].size() - 1);
+    g_contention_holder_names[id].store(names[id].data(), std::memory_order_release);
+    t_contention_holder = id;
+}
+
 void SetCurrentThreadName(const char* name) {
+    NameContentionHolder(name);
 #ifdef _WIN32
     // Sets the debugger-visible name of the current thread (Windows 10+). Looked up at run time,
     // which also covers MinGW, whose headers may not declare it.

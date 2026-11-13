@@ -252,6 +252,12 @@ TOOLS = [
                        "on or off; read it with log_tail. Returns the previous and current state.",
         "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
     },
+    {
+        "name": "speed_limit",
+        "description": "Turns the emulation speed limit on or off (on: false runs unlimited). "
+                       "Returns the previous and current state.",
+        "inputSchema": {"type": "object", "properties": {"on": {"type": "boolean"}}},
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}

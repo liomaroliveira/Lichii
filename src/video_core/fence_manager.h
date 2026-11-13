@@ -133,9 +133,6 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
-        if (should_flush) {
-            rasterizer.FlushCommands();
-        }
         if constexpr (can_async_check) {
             // The fencing thread waits for the host GPU while it has fences: it needs waking (a
             // system call) only when it waits for fences to be made.

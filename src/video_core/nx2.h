@@ -567,6 +567,15 @@ public:
     static constexpr u32 AcquireMask = 0x8;
     /// One per channel suspended at once.
     static constexpr size_t MaxWaiters = 64;
+    /// TEST (EDEN_NX2_ACQUIRE_STATS): the writer that latched a waiter.
+    enum class Source : u8 {
+        Unknown,
+        PayloadRelease,
+        QueryResult,
+        QmdReduction,
+        QmdMax,
+        Count,
+    };
 
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
@@ -583,13 +592,13 @@ public:
             const void* const current = slot.owner.load(std::memory_order_relaxed);
             if (current == owner) {
                 slot.owner.store(nullptr, std::memory_order_relaxed);
-                count.fetch_sub(1, std::memory_order_relaxed);
             }
             if ((current == nullptr || current == owner) && free_slot == nullptr) {
                 free_slot = &slot;
             }
         }
         if (free_slot == nullptr) {
+            Publish();
             return false;
         }
         free_slot->address = device_address;
@@ -599,8 +608,9 @@ public:
         free_slot->seen =
             word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
         free_slot->latched.store(false, std::memory_order_relaxed);
+        free_slot->source = Source::Unknown;
         free_slot->owner.store(owner, std::memory_order_relaxed);
-        count.fetch_add(1, std::memory_order_release);
+        Publish();
         return true;
     }
 
@@ -612,13 +622,14 @@ public:
         for (Slot& slot : slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 slot.owner.store(nullptr, std::memory_order_relaxed);
-                count.fetch_sub(1, std::memory_order_relaxed);
             }
         }
+        Publish();
     }
 
     [[nodiscard]] bool Latched(const void* owner) const {
-        if (count.load(std::memory_order_acquire) == 0) {
+        if (count.load(std::memory_order_acquire) == 0 ||
+            latched.load(std::memory_order_acquire) == 0) {
             return false;
         }
         for (const Slot& slot : slots) {
@@ -628,6 +639,17 @@ public:
             }
         }
         return false;
+    }
+
+    [[nodiscard]] Source LatchSource(const void* owner) {
+        std::scoped_lock lk{mutex};
+        for (const Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) == owner &&
+                slot.latched.load(std::memory_order_relaxed)) {
+                return slot.source;
+            }
+        }
+        return Source::Unknown;
     }
 
     /// GPU thread: whether a watched word changed in memory since it was added or since the last
@@ -651,22 +673,38 @@ public:
     }
 
     /// A GPU write of value to the u32 at device_address.
-    void OnWrite(u64 device_address, u32 value) {
-        if (count.load(std::memory_order_acquire) == 0) {
+    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown) {
+        const size_t waiting = count.load(std::memory_order_acquire);
+        if (waiting == 0) {
             return;
         }
-        bool latched = false;
+        // Report writes come by the thousand a frame while a channel waits on another address:
+        // only a watched address takes the lock the polling GPU thread also takes. As with
+        // `count`, a waiter added meanwhile is seen at its next poll of memory.
+        if (waiting <= WatchedSlots) {
+            bool watched_here = false;
+            for (size_t i = 0; i < waiting; ++i) {
+                watched_here |= watched[i].load(std::memory_order_relaxed) == device_address;
+            }
+            if (!watched_here) {
+                return;
+            }
+        }
+        bool notify = false;
         {
             std::scoped_lock lk{mutex};
             for (Slot& slot : slots) {
                 if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
-                    slot.address == device_address && Matches(slot, value)) {
+                    slot.address == device_address &&
+                    !slot.latched.load(std::memory_order_relaxed) && Matches(slot, value)) {
+                    slot.source = source;
                     slot.latched.store(true, std::memory_order_release);
-                    latched = true;
+                    latched.fetch_add(1, std::memory_order_release);
+                    notify = true;
                 }
             }
         }
-        if (latched) {
+        if (notify) {
             Nx2PendingWake::Get().Notify();
         }
     }
@@ -680,7 +718,29 @@ private:
         u32* word{}; ///< The semaphore in host memory, or null
         u32 seen{};  ///< *word when last looked at (WordStored)
         std::atomic<bool> latched{};
+        Source source{Source::Unknown};
     };
+
+    static constexpr size_t WatchedSlots = 8;
+
+    /// Under `mutex`: the waiters' addresses, latched count and count for the unlocked checks.
+    void Publish() {
+        size_t active = 0;
+        size_t latched_waiters = 0;
+        for (const Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) != nullptr) {
+                if (active < WatchedSlots) {
+                    watched[active].store(slot.address, std::memory_order_relaxed);
+                }
+                ++active;
+                if (slot.latched.load(std::memory_order_relaxed)) {
+                    ++latched_waiters;
+                }
+            }
+        }
+        latched.store(latched_waiters, std::memory_order_release);
+        count.store(active, std::memory_order_release);
+    }
 
     static bool Matches(const Slot& slot, u32 current) {
         switch (slot.operation) {
@@ -695,9 +755,11 @@ private:
         }
     }
 
-    std::mutex mutex; ///< Held to fill, empty and latch slots
+    std::mutex mutex;
     std::array<Slot, MaxWaiters> slots{};
     std::atomic<size_t> count{};
+    std::atomic<size_t> latched{}; ///< Latched waiters
+    std::array<std::atomic<u64>, WatchedSlots> watched{}; ///< The first waiters' addresses
 };
 
 } // namespace Tegra

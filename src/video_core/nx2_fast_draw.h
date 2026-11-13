@@ -19,9 +19,11 @@ class MemoryManager;
 
 /// A draw that follows a draw of the same pipeline with only light state changes in between takes
 /// the delta path. It keeps the previous draw's pipeline, image views, samplers and texture buffer
-/// bindings, and resolves and binds every buffer (index, vertex, uniform, storage, texture) again
-/// as a full resolve does, so guest memory written without a notification is streamed as in a
-/// full resolve.
+/// bindings. Buffers are resolved and bound again, except small streamed uniforms whose ranges
+/// were not rebound or written: those can keep the previous stream allocation in the same command
+/// buffer. This assumes no unsynchronized guest CPU writes unknown to the caches between draws;
+/// EDEN_NX2_UBO_KEEP_VERIFY checks that assumption. Kept image descriptors and rescaling words are
+/// replayed while the views remain valid; EDEN_NX2_DELTA_DESCRIPTORS_VERIFY checks the replay.
 /// Light changes are draw parameters, index buffer and vertex stream registers, constant buffer
 /// binds and inline constant buffer data (collected in g_delta: the rasterizer resolves in full
 /// when they reach the pipeline's texture handles at their GPU addresses or through another
@@ -32,7 +34,10 @@ class MemoryManager;
 /// GpuSplit::FastDrawNeutral), GPU::TickWork requests, texture cache writes, unmaps and
 /// deletions, shader removals, fence releases, HLE macros and frames. The rasterizer takes the
 /// delta path only while the serial, the GPU memory map, the command buffer, the render pass and
-/// the bound pipeline are the ones the previous draw left.
+/// the bound pipeline are the ones the previous draw left. A draw of another pipeline (or after a
+/// draw that can't be followed) takes it with what that pipeline kept at its own last draw while
+/// the memory serial, the map, the command buffer, the render pass and the texture pool registers
+/// are the ones that draw left, reading every texture handle again (the rasterizer's RevisitDraw).
 /// EDEN_NX2_FAST_DRAW_VERIFY=1 resolves those draws in full and counts where the pipeline, views,
 /// samplers or kept buffer bindings differ.
 namespace VideoCommon::Nx2FastDraw {
@@ -67,6 +72,10 @@ inline std::atomic<bool> g_enabled{true};
 /// then the vertex attribute formats are draw parameters, as only each attribute's type class is
 /// in the pipeline key. Set by the pipeline cache before the GPU threads run, read on the back.
 inline std::atomic<bool> g_dynamic_vertex_input{};
+/// Whether vertex stream strides and enables are dynamic state (extended dynamic state and
+/// dynamic vertex input): then no pipeline depends on them and they are draw parameters. Set
+/// by the pipeline cache.
+inline bool g_vertex_streams_dynamic{};
 
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
@@ -88,19 +97,22 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
-/// On its own cache line, away from what every thread reads (g_enabled).
+/// On their own cache lines, away from what every thread reads (g_enabled).
 alignas(64) inline std::atomic<u64> g_serial{1};
-/// The last break's reason and, for Register and Method, its 3D method (diagnostics). Stored by
-/// every break, also those that skip the add below, so a register block's one break names what
-/// its writes one by one would.
+/// Bumped by every break but a 3D register change: register writes change no memory, so draws
+/// with only those in between can keep uniforms as delta draws do (MemorySerial).
+inline std::atomic<u64> g_memory_serial{1};
+/// The reason of the break that bumped g_serial last and, for Register and Method, its 3D method
+/// (diagnostics; on the thread that draws, the first break since it read the serial).
 inline std::atomic<u32> g_last_break{};
 
-/// The thread that draws reads the serial before each draw (Serial). Once one of its breaks
-/// bumped the serial since that read, more change nothing it compares, so they skip the locked
-/// add (every changed 3D register breaks). Threads that never read it (the front's puller, guest
-/// CPU write traps, unmaps) always bump. From lucastaonline's 865afaa4f3 (#1161).
-inline thread_local bool t_reads_serial{};
+/// The thread that draws reads the serials before each draw (Serial, MemorySerial). Once one of
+/// its breaks bumped a serial since it last read it, more change nothing it compares: they skip
+/// the atomic add (~1.4 million other engine methods a second in Ocarina of Time's water). Other
+/// threads always bump.
+inline thread_local bool t_reads_serials{};
 inline thread_local bool t_serial_bumped{};
+inline thread_local bool t_memory_serial_bumped{};
 
 /// Bumped where the guest CPU may have synchronised with the GPU: fences, semaphores, syncpoints,
 /// reports, frames, other engines and requests from other threads. After one the guest may have
@@ -123,22 +135,31 @@ inline void Break(Reason reason, u32 method = 0) {
         reason != Reason::TextureHeaders && reason != Reason::Invalidation) {
         NoteSync();
     }
-    if (!Enabled()) {
-        return;
-    }
-    g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
-    if (!(t_reads_serial && t_serial_bumped)) {
-        g_serial.fetch_add(1, std::memory_order_relaxed);
-        t_serial_bumped = t_reads_serial;
+    if (Enabled()) {
+        if (reason != Reason::Register && !(t_reads_serials && t_memory_serial_bumped)) {
+            g_memory_serial.fetch_add(1, std::memory_order_relaxed);
+            t_memory_serial_bumped = t_reads_serials;
+        }
+        if (!(t_reads_serials && t_serial_bumped)) {
+            g_serial.fetch_add(1, std::memory_order_relaxed);
+            g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+            t_serial_bumped = t_reads_serials;
+        }
     }
 }
 
-/// The thread that draws: what it compares fast draws with (and from then on its next break
+/// The thread that draws: what it compares fast draws with (and, from then on, its next break
 /// bumps the serial again).
 inline u64 Serial() {
-    t_reads_serial = true;
+    t_reads_serials = true;
     t_serial_bumped = false;
     return g_serial.load(std::memory_order_relaxed);
+}
+
+inline u64 MemorySerial() {
+    t_reads_serials = true;
+    t_memory_serial_bumped = false;
+    return g_memory_serial.load(std::memory_order_relaxed);
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the
@@ -324,5 +345,19 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
                                               delta.num_device_writes, begin, end);
     }
 }
+
+/// Inline constant buffer writes left out of the delta because they wrote the words memory
+/// held (EDEN_NX2_GPU_PROFILE logs them).
+inline std::atomic<u64> g_unchanged_writes{};
+
+/// Notes data about to be written to [begin, begin + bytes) in GPU memory: inline constant buffer
+/// `words`, unless memory holds those words already, or with `words` null data not known yet
+/// (reports). Texture and sampler headers are checked by the caller.
+void NoteWrittenData(Tegra::MemoryManager& memory, GPUVAddr begin, const void* words, u64 bytes);
+/// NoteWrittenData for inline constant buffer `words` the caller is about to write: true when
+/// the write changes nothing and can be left out (memory holds the words, and neither the GPU
+/// caches nor a download for a guest read may hold others there). Fast draws off: false.
+[[nodiscard]] bool WriteData(Tegra::MemoryManager& memory, GPUVAddr begin, const void* words,
+                             u64 bytes);
 
 } // namespace VideoCommon::Nx2FastDraw

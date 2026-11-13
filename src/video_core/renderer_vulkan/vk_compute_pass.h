@@ -135,6 +135,25 @@ private:
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
 
+/// Resolves samples query results copied with availability (resolve_query_availability.comp): the
+/// count when the query had landed, 1024 samples (visible) otherwise.
+class QueryAvailabilityResolvePass final : public ComputePass {
+public:
+    explicit QueryAvailabilityResolvePass(const Device& device_, Scheduler& scheduler_,
+                                          DescriptorPool& descriptor_pool_,
+                                          ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
+
+    /// `count` entries: 16 bytes each at `src_offset` in `src_buffer`, 8 bytes each at
+    /// `dst_offset` in `dst_buffer`. Orders the copy that wrote the source before it, and its own
+    /// writes before later transfer and shader reads.
+    void Resolve(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkBuffer src_buffer,
+                 VkDeviceSize src_offset, u32 count);
+
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+};
+
 class QueriesPrefixScanPass final : public ComputePass {
 public:
     explicit QueriesPrefixScanPass(const Device& device_, Scheduler& scheduler_,

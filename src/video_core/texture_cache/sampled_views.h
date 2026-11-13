@@ -12,12 +12,13 @@
 
 namespace VideoCommon {
 
-/// Whether TextureCache::PrepareImageView prepares the view's image. Neither the null view, whose
-/// image has no valid format and stays CpuModified (uploading it ends in UNREACHABLE, #904), nor a
-/// buffer view, which has no image, is prepared.
+/// Whether TextureCache::PrepareImageView prepares the view's image. Neither a view of the null
+/// image (including empty descriptors with their own view ids), whose format is invalid and which
+/// stays CpuModified, nor a buffer view is prepared.
 template <typename ImageViews>
 [[nodiscard]] bool PreparesImage(const ImageViews& image_views, ImageViewId id) noexcept {
-    return id && id != NULL_IMAGE_VIEW_ID && !image_views[id].IsBuffer();
+    return id && id != NULL_IMAGE_VIEW_ID && !image_views[id].IsBuffer() &&
+           image_views[id].image_id != NULL_IMAGE_ID;
 }
 
 /// Whether TextureCache::PrepareImage would change a sampled image: upload it from guest memory

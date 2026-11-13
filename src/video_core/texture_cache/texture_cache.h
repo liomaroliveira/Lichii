@@ -29,6 +29,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -63,6 +64,7 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    Tegra::Texture::PrepareUnswizzleThreads();
     debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
                   Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
 
@@ -1557,6 +1559,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         MarkStaleTransfer(image);
         image.DownloadMemory(map, copies);
         pending_bytes += image.unswizzled_size_bytes;
+        GpuWaitStats::AddDownloadBytes(image.unswizzled_size_bytes);
         pending.push_back(Pending{image_id, map, std::move(copies)});
     }
     flush_pending();

@@ -26,6 +26,9 @@ constexpr u32 SWIZZLE_X_BITS = 0b100101111;
 constexpr u32 SWIZZLE_Y_BITS = 0b011010000;
 
 /// Unswizzles a block linear texture into linear memory.
+/// Starts the threads large unswizzles are split over now, instead of at the first one.
+void PrepareUnswizzleThreads();
+
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,
                       u32 stride_alignment = 1, bool native_tiling = false);

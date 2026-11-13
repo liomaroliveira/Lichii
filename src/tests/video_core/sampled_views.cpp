@@ -94,6 +94,17 @@ TEST_CASE("Buffer views and empty ids are never prepared", "[video_core][texture
     CHECK_FALSE(cache.Change({{buffer}, {ImageViewId{}}}));
 }
 
+TEST_CASE("Empty descriptor views with their own ids never prepare the null image",
+          "[video_core][texture_cache]") {
+    Cache cache;
+    const ImageViewId empty = cache.views.insert(VideoCommon::NullImageViewParams{});
+    REQUIRE(empty != VideoCommon::NULL_IMAGE_VIEW_ID);
+    REQUIRE_FALSE(cache.views[empty].IsBuffer());
+    REQUIRE(cache.views[empty].image_id == VideoCommon::NULL_IMAGE_ID);
+    CHECK_FALSE(VideoCommon::PreparesImage(cache.views, empty));
+    CHECK_FALSE(cache.Change({{empty}, {cache.AddView(cache.AddImage())}}));
+}
+
 TEST_CASE("A sampled image with an upload pending changes", "[video_core][texture_cache]") {
     Cache cache;
     const ImageId image = cache.AddImage();

@@ -8,19 +8,23 @@
 #include <array>
 #include <limits>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
-#include "video_core/buffer_cache/usage_tracker.h"
+#include "video_core/buffer_cache/upload_order.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/nx2_list_slots.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/renderer_vulkan/vk_upload_reorder_check.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -58,19 +62,22 @@ public:
         return buffer.Location();
     }
 
-    [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept {
-        return tracker.IsUsed(offset, size);
+    /// The bytes that work recorded in the current submission uses, and the newest earlier
+    /// submission whose work used the buffer (BufferCacheRuntime::DecideUploadOrder).
+    [[nodiscard]] const VideoCommon::SubmissionUses& Uses() const noexcept {
+        return uses;
     }
 
+    /// TEST (EDEN_NX2_GPU_COST): the newest tick that used any 4 KiB page of the range, 0 when
+    /// none did since the trace started.
+    [[nodiscard]] u64 NewestUseTick(u64 offset, u64 size) const noexcept;
+
+    /// GPU work recorded now reads or writes [offset, offset + size).
     void MarkUsage(u64 offset, u64 size) noexcept;
 
-    void ResetUsageTracking() noexcept {
-        tracker.Reset();
-    }
-
-    [[nodiscard]] u64 LastUsageTick() const noexcept {
-        return last_usage_tick;
-    }
+    /// An upload recorded now writes [offset, offset + size): uploads of these bytes after it in
+    /// this submission run after it (DecideUploadOrder). The check hears of it from the copy.
+    void TrackUploadWrite(u64 offset, u64 size) noexcept;
 
     [[nodiscard]] std::span<const u8> Mapped() const noexcept {
         return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
@@ -92,11 +99,15 @@ private:
     Scheduler* scheduler{};
     vk::Buffer buffer;
     std::vector<BufferView> views;
-    VideoCommon::UsageTracker tracker;
+    VideoCommon::SubmissionUses uses;
     VkDeviceAddress device_address{};
-    u64 last_usage_tick{};
     bool is_null{};
     bool sparse_compatible{};
+    /// TEST (EDEN_NX2_GPU_COST): the tick of each 4 KiB page's last use, and the last ranges
+    /// noted with their tick (draws bind the same ranges again and again).
+    std::vector<u64> use_ticks;
+    std::array<std::array<u64, 3>, 4> noted_uses{};
+    u32 noted_cursor{};
 };
 
 class QuadArrayIndexBuffer;
@@ -155,6 +166,11 @@ public:
     /// to be done.
     [[nodiscard]] bool IsFreeNow(u64 tick);
 
+    /// TEST (EDEN_NX2_READ_TRACE): Scheduler::TraceMark, TraceCounts and TraceCountWork.
+    u64 TraceMark();
+    VideoCommon::ReadTrace::Counts TraceCounts() const;
+    void TraceCountWork(bool dispatch);
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
@@ -172,15 +188,22 @@ public:
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
-    bool CanReorderUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
+    /// Where an upload of `copies` into buffer runs (VideoCommon::DecideUploadOrder): in order
+    /// when work recorded in this submission uses a byte it writes, otherwise in the upload
+    /// command buffer. Tracks the copies as uses of their bytes.
+    [[nodiscard]] VideoCommon::UploadOrder DecideUploadOrder(
+        Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void PreCopyBarrier();
 
+    /// order: where an upload from the stream buffer runs (DecideUploadOrder); other copies run
+    /// in order. location: the caller, which the render pass end and the copy are counted at.
     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                    bool can_reorder_upload = false);
+                    VideoCommon::UploadOrder order = {},
+                    std::source_location location = std::source_location::current());
 
     void PostCopyBarrier();
 
@@ -231,6 +254,22 @@ public:
         return last_stream_uniform;
     }
 
+    /// GPU-written list words the host GPU took over (Nx2ListIndirect), owed in a compute
+    /// dispatch's constant buffer [device_addr, +size) that `buffer` holds at `offset`, filled
+    /// already: the slot words go over the placeholders. `read(device)`: guest memory's word.
+    template <typename Read>
+    void Nx2PatchComputeUniform(DAddr device_addr, u32 size, VkBuffer buffer, u64 offset,
+                                Read&& read) {
+        if (nx2_list_slots.HasOwed()) [[unlikely]] {
+            nx2_list_slots.PatchUniform(device_addr, size, buffer, offset, read);
+        }
+    }
+
+    /// The slots of GPU-written list words (Nx2ListIndirect).
+    [[nodiscard]] Nx2ListSlots& Nx2Slots() noexcept {
+        return nx2_list_slots;
+    }
+
     /// Adds `ref` to the descriptor payload exactly as BindMappedUniformBuffer did when it made
     /// the allocation (it is the very same call). The caller guarantees the allocation is still
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
@@ -256,6 +295,7 @@ public:
     }
 
     void PushMultiRangeSource(const Buffer& buffer, u32 offset, u32 size) {
+        NoteCheckUse(buffer.Handle(), offset, size, UploadReorderCheck::Source::MultiRange);
         const vk::MemoryLocation location = buffer.Location();
         multi_range_sources.push_back(MultiRangeSource{
             .handle = buffer.Handle(),
@@ -294,6 +334,7 @@ public:
         if (format == VideoCore::Surface::PixelFormat::Invalid) {
             format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
+        NoteCheckUse(buffer.Handle(), offset, size, UploadReorderCheck::Source::Texel);
         guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
                                               buffer.DeviceAddress(), offset, size,
                                               TexelBufferFormat(format));
@@ -336,8 +377,16 @@ public:
     [[nodiscard]] std::pair<VkBuffer, VkDeviceSize> KeptGrid(u64 keep_id) const;
 
 private:
+    /// TEST (EDEN_NX2_UPLOAD_REORDER_CHECK): work recorded now uses these bytes.
+    void NoteCheckUse(VkBuffer handle, u64 offset, u64 size, UploadReorderCheck::Source source) {
+        if (reorder_check) [[unlikely]] {
+            reorder_check->NoteUse(handle, offset, size, source);
+        }
+    }
+
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
+        NoteCheckUse(handle, offset, size, UploadReorderCheck::Source::Descriptor);
         if (handle == VK_NULL_HANDLE) {
             guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
         } else {
@@ -346,6 +395,10 @@ private:
     }
 
     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
+
+    /// TEST (EDEN_NX2_GPU_COST): counts an upload by where it ran and why.
+    void TraceUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies,
+                     bool reordered);
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
@@ -388,6 +441,9 @@ private:
 
     StreamUniformRef last_stream_uniform{};
 
+    /// TEST: EDEN_NX2_UPLOAD_REORDER_CHECK
+    std::unique_ptr<UploadReorderCheck> reorder_check;
+
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
 
@@ -397,6 +453,8 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+
+    Nx2ListSlots nx2_list_slots{memory_allocator, scheduler};
 };
 
 struct BufferCacheParams {

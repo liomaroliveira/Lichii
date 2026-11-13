@@ -4,20 +4,154 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
 #include <span>
+#include <thread>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/logging.h"
+#include "common/cpu_features.h"
+#include "common/thread.h"
 #include "video_core/gpu.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Texture {
 namespace {
+
+/// Large unswizzles (new textures while running through Ocarina of Time's Kokiri Forest: ~11% of
+/// the split GPU back thread) are split by lines over helper threads plus the caller, which waits
+/// for all of them: the result is the same, only sooner. A quarter of the host threads, at most 4
+/// (more competed with the guest cores and made busy spots drop harder).
+class LinePool {
+public:
+    static LinePool& Get() {
+        static LinePool pool;
+        return pool;
+    }
+
+    [[nodiscard]] bool Enabled() const {
+        return !workers.empty();
+    }
+
+    /// Calls func(begin, end) over [0, count) in chunks; returns once every chunk is done.
+    void Run(u32 count, const std::function<void(u32, u32)>& func) {
+        std::unique_lock busy{run_mutex, std::try_to_lock};
+        if (!busy || workers.empty()) {
+            func(0, count);
+            return;
+        }
+        {
+            std::scoped_lock lock{mutex};
+            job = &func;
+            total = count;
+            chunk = (std::max)(8U, count / static_cast<u32>((workers.size() + 1) * 4));
+            next.store(0, std::memory_order_relaxed);
+            pending = static_cast<u32>(workers.size());
+            ++generation;
+        }
+        work_cv.notify_all();
+        Work(func);
+        std::unique_lock lock{mutex};
+        done_cv.wait(lock, [this] { return pending == 0; });
+        job = nullptr;
+    }
+
+private:
+    /// At most 4 and a quarter of the host threads, and only the physical cores past the 6 the
+    /// guest cores and the GPU threads keep busy: on a 6-core Ryzen 5 5500, 3 workers competed
+    /// with them (no gain, slower movies). EDEN_NX2_UNSWIZZLE_THREADS sets the count (tests).
+    static u32 WorkerCount() {
+        if (const char* const text = std::getenv("EDEN_NX2_UNSWIZZLE_THREADS")) {
+            return (std::min)(static_cast<u32>(std::max(0, std::atoi(text))), 8U);
+        }
+        const u32 logical = std::thread::hardware_concurrency();
+        u32 physical = logical / 2;
+        if (const auto cores = Common::GetProcessorCount(); cores && *cores > 0) {
+            physical = static_cast<u32>(*cores);
+        }
+        const u32 spare = physical > 6 ? physical - 6 : 0;
+        return (std::min)({4U, logical / 4, spare});
+    }
+
+    LinePool() {
+        const u32 count = WorkerCount();
+        for (u32 i = 0; i < count; ++i) {
+            workers.emplace_back([this](std::stop_token stop) { Loop(stop); });
+        }
+        LOG_INFO(HW_GPU, "Unswizzle helper threads: {}", count);
+    }
+
+    ~LinePool() {
+        {
+            // Under the mutex: a worker between its predicate check and its wait would otherwise
+            // miss the notification and never return to be joined.
+            std::scoped_lock lock{mutex};
+            for (auto& worker : workers) {
+                worker.request_stop();
+            }
+        }
+        work_cv.notify_all();
+        workers.clear();
+    }
+
+    void Work(const std::function<void(u32, u32)>& func) {
+        for (;;) {
+            const u32 begin = next.fetch_add(chunk, std::memory_order_relaxed);
+            if (begin >= total) {
+                return;
+            }
+            func(begin, (std::min)(begin + chunk, total));
+        }
+    }
+
+    void Loop(std::stop_token stop) {
+        Common::SetCurrentThreadName("Unswizzle");
+        u64 seen = 0;
+        for (;;) {
+            const std::function<void(u32, u32)>* func;
+            {
+                std::unique_lock lock{mutex};
+                work_cv.wait(lock, [&] { return stop.stop_requested() || generation != seen; });
+                if (stop.stop_requested()) {
+                    return;
+                }
+                seen = generation;
+                func = job;
+            }
+            Work(*func);
+            {
+                std::scoped_lock lock{mutex};
+                --pending;
+            }
+            done_cv.notify_one();
+        }
+    }
+
+    std::mutex run_mutex;
+    std::mutex mutex;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    const std::function<void(u32, u32)>* job{};
+    u32 total{};
+    u32 chunk{1};
+    std::atomic<u32> next{};
+    u32 pending{};
+    u64 generation{};
+    std::vector<std::jthread> workers;
+};
+
 constexpr u32 NativeGobOffset(u32 offset, bool native_tiling) {
     if (!native_tiling) return offset;
     const u32 difference = ((offset >> 5) ^ (offset >> 6)) & 1;
@@ -77,19 +211,31 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     const u32 block_depth_mask = (1U << block_depth) - 1;
     const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
-    if constexpr (BYTES_PER_PIXEL == 16 && origin_x == 0 && origin_y == 0 && origin_z == 0) {
-        // 16-byte units (UnswizzleTexture and SwizzleTexture widen to them when a row allows it):
-        // their offsets in a GOB come from a table instead of being computed one by one.
-        const auto unit_offsets = GobUnitOffsets(native_tiling);
-        const u32 gobs_wide = Common::DivCeil(width, 4U);
-        for (u32 slice = 0; slice < depth; ++slice) {
-            const u32 offset_z = (slice >> block_depth) * slice_size +
-                                 ((slice & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
-            for (u32 line = 0; line < height; ++line) {
-                const u32 block_y = line >> GOB_SIZE_Y_SHIFT;
-                const u32 offset_y = (block_y >> block_height) * block_size +
-                                     ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
-                const u32* const row_offsets = &unit_offsets[(line & (GOB_SIZE_Y - 1)) * 4];
+    // 16-byte units (UnswizzleTexture and SwizzleTexture widen to them when a row allows it):
+    // their offsets in a GOB come from a table instead of being computed one by one.
+    static constexpr bool unit_table =
+        BYTES_PER_PIXEL == 16 && origin_x == 0 && origin_y == 0 && origin_z == 0;
+    [[maybe_unused]] const auto unit_offsets = GobUnitOffsets(native_tiling);
+    [[maybe_unused]] const u32 gobs_wide = Common::DivCeil(width, 4U);
+
+    // Each (slice, line) writes its own bytes of the output: lines can go to other threads.
+    const auto lines = [&](u32 first, u32 end) {
+    for (u32 index = first; index < end; ++index) {
+        const u32 slice = index / height;
+        const u32 line = index % height;
+        const u32 z = slice + origin_z;
+        const u32 offset_z = (z >> block_depth) * slice_size +
+                             ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
+        {
+            const u32 y = line + origin_y;
+            const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
+
+            const u32 block_y = y >> GOB_SIZE_Y_SHIFT;
+            const u32 offset_y = (block_y >> block_height) * block_size +
+                                 ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
+
+            if constexpr (unit_table) {
+                const u32* const row_offsets = &unit_offsets[(y & (GOB_SIZE_Y - 1)) * 4];
                 const u32 row_linear = slice * pitch * height + line * pitch;
                 for (u32 gob_x = 0; gob_x < gobs_wide; ++gob_x) {
                     const u32 gob_offset = offset_z + offset_y + (gob_x << x_shift);
@@ -103,22 +249,8 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
                         std::memcpy(dst, src, 16);
                     }
                 }
+                continue;
             }
-        }
-        return;
-    }
-
-    for (u32 slice = 0; slice < depth; ++slice) {
-        const u32 z = slice + origin_z;
-        const u32 offset_z = (z >> block_depth) * slice_size +
-                             ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
-        for (u32 line = 0; line < height; ++line) {
-            const u32 y = line + origin_y;
-            const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
-
-            const u32 block_y = y >> GOB_SIZE_Y_SHIFT;
-            const u32 offset_y = (block_y >> block_height) * block_size +
-                                 ((block_y & block_height_mask) << GOB_SIZE_SHIFT);
 
             u32 swizzled_x = pdep<SWIZZLE_X_BITS>(origin_x * BYTES_PER_PIXEL);
             for (u32 column = 0; column < width;
@@ -138,6 +270,15 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
                 std::memcpy(dst, src, BYTES_PER_PIXEL);
             }
         }
+    }
+    };
+    const u32 total_lines = depth * height;
+    // From 1 MiB: splitting medium textures too (256 KiB) made busy spots drop harder.
+    constexpr u64 min_bytes = u64{1} << 20;
+    if (!TO_LINEAR && LinePool::Get().Enabled() && u64{pitch} * total_lines >= min_bytes) {
+        LinePool::Get().Run(total_lines, lines);
+    } else {
+        lines(0, total_lines);
     }
 }
 
@@ -251,6 +392,10 @@ void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixe
 }
 
 } // Anonymous namespace
+
+void PrepareUnswizzleThreads() {
+    [[maybe_unused]] const bool enabled = LinePool::Get().Enabled();
+}
 
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,

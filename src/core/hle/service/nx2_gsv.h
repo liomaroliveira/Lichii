@@ -46,6 +46,7 @@
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
@@ -2009,6 +2010,7 @@ private:
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
         const u64 present = Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        VideoCommon::GpuWaitStats::NotePresent();
         if (Core::g_nx2_present_time_services.load(std::memory_order_relaxed) != 0) {
             const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())

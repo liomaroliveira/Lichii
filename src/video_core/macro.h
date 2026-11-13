@@ -270,6 +270,8 @@ struct MacroEngine {
     /// writes to other registers are counted in split_unexpected_writes.
     const std::bitset<0xe00>* split_writes{};
     u64 split_unexpected_writes{};
+    /// EDEN_NX2_BACK_MACRO_VERIFY: where such a call records its writes (method, value).
+    std::vector<std::pair<u32, u32>>* split_record{};
 };
 
 struct NativeMacroContext {

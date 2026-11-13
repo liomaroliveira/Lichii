@@ -5,19 +5,27 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
 
 #include "common/common_types.h"
-#include "video_core/nx2_async_readback.h"
 
 namespace VideoCore {
+
+/// The cache that reported a flush area (GetFlushArea), for statistics (GpuWaitStats).
+enum class DownloadAreaSource : u8 {
+    None,
+    TextureCache,
+    BufferCache,
+};
 
 struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
+    DownloadAreaSource source{};
     /// What guest memory lacks there is on its way for an earlier read: nothing to flush, only to
     /// wait for (RasterizerInterface::FinishRead).
     bool in_flight{};
@@ -28,8 +36,6 @@ struct RasterizerDownloadArea {
 /// the GPU's side first finishes those it overlaps (FinishRead), so none lands over it later.
 inline std::atomic<u32> g_read_downloads{};
 
-/// Tegra::Nx2MayBeGpuWritten on Switch 2 titles, true otherwise. Defined in gpu.cpp: nx2.h can't
-/// be included here, since the Qt frontend reaches this header and its `slots` macro breaks it.
 [[nodiscard]] bool MayHoldGpuWrites(DAddr addr, u64 size);
 
 /// Whether such a download may still land over [addr, addr + size): what a write to guest memory
@@ -38,7 +44,8 @@ inline std::atomic<u32> g_read_downloads{};
 /// (Tegra::Nx2MayBeGpuWritten): writes to other pages skip the lock, which the GPU thread holds
 /// for nearly every command.
 [[nodiscard]] inline bool ReadDownloadsMayCover(DAddr addr, u64 size) {
-    return g_read_downloads.load(std::memory_order_acquire) != 0 && MayHoldGpuWrites(addr, size);
+    return g_read_downloads.load(std::memory_order_acquire) != 0 &&
+           MayHoldGpuWrites(addr, size);
 }
 
 /// What DownloadLanding publishes.
@@ -48,6 +55,7 @@ struct DownloadLandingState {
     std::atomic<DAddr> begin{};
     std::atomic<DAddr> end{};
     std::atomic<u64> waits{};
+    std::atomic<u64> wait_ns{}; ///< TEST (EDEN_NX2_READ_CHECK)
 };
 
 /// The buffer cache writing downloaded GPU bytes to guest memory [begin, end). A download keeps the
@@ -81,7 +89,7 @@ public:
     static void Await(DAddr addr, u64 size) noexcept {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const u64 sequence = state.sequence.load(std::memory_order_acquire);
-        if ((sequence & 1) != 0) {
+        if ((sequence & 1) != 0) [[unlikely]] {
             Wait(sequence, addr, size);
         }
     }
@@ -89,6 +97,11 @@ public:
     /// Writes that waited for a landing so far.
     [[nodiscard]] static u64 Waits() noexcept {
         return state.waits.load(std::memory_order_relaxed);
+    }
+
+    /// TEST (EDEN_NX2_READ_CHECK): how long they waited, in total.
+    [[nodiscard]] static u64 WaitNs() noexcept {
+        return state.wait_ns.load(std::memory_order_relaxed);
     }
 
 private:
@@ -103,21 +116,28 @@ private:
             return;
         }
         state.waits.fetch_add(1, std::memory_order_relaxed);
+        const auto start = std::chrono::steady_clock::now();
         while (state.sequence.load(std::memory_order_acquire) == sequence) {
             std::this_thread::yield();
         }
+        state.wait_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count()),
+            std::memory_order_relaxed);
     }
 
     static inline DownloadLandingState state;
 };
 
-/// EDEN_NX2_READ_CHECK: the latest writes from the GPU's side that ReadDownloadsMayCover
+/// TEST (EDEN_NX2_READ_CHECK): the latest writes from the GPU's side that ReadDownloadsMayCover
 /// let through, to name the writer when the check finds newer bytes where an earlier read's
 /// download landed.
 class ReadCheckWrites {
 public:
     [[nodiscard]] static bool Enabled() {
-        return AsyncReadback::ReadCheckEvery() != 0;
+        static const bool enabled = std::getenv("EDEN_NX2_READ_CHECK") != nullptr;
+        return enabled;
     }
 
     static void Note(DAddr addr, u64 size, const char* writer) {

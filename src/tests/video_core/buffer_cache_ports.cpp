@@ -27,8 +27,10 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
+#include "video_core/buffer_cache/upload_order.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_list_stats.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace {
@@ -84,11 +86,9 @@ struct Runtime {
         return submitted_tick + 1;
     }
     void WaitSubmittedTick(u64) {}
-    void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
-        std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
-    }
-    bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
-        return false;
+    VideoCommon::UploadOrder DecideUploadOrder(const Buffer&,
+                                               std::span<VideoCommon::BufferCopy>) const {
+        return {};
     }
     Staging DownloadStagingBuffer(u64 size, bool = false) {
         // Kept until the end: read downloads hold theirs past the next request.
@@ -101,6 +101,22 @@ struct Runtime {
         return DownloadStagingBuffer(size);
     }
     void FreeDeferredStagingBuffer(Staging&) {}
+    /// Buffer to buffer, as when a new buffer takes over the ones it overlaps.
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
+                    bool) {
+        for (const auto& copy : copies) {
+            REQUIRE(copy.src_offset + copy.size <= src.bytes.size());
+            REQUIRE(copy.dst_offset + copy.size <= dst.bytes.size());
+            std::memcpy(dst.bytes.data() + copy.dst_offset, src.bytes.data() + copy.src_offset,
+                        copy.size);
+        }
+    }
+    void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
+        REQUIRE(offset + size <= buffer.bytes.size());
+        for (size_t i = 0; i + sizeof(value) <= size; i += sizeof(value)) {
+            std::memcpy(buffer.bytes.data() + offset + i, &value, sizeof(value));
+        }
+    }
     void CopyBuffer(Buffer* dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
                     bool) {
         for (const auto& copy : copies) {
@@ -113,12 +129,8 @@ struct Runtime {
             ++downloads;
         }
     }
-    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
-                    bool) {
-        CopyBuffer(dst, &src, copies, true, true);
-    }
     void CopyBuffer(Buffer& dst, Buffer* src, std::span<const VideoCommon::BufferCopy> copies, bool,
-                    bool) {
+                    VideoCommon::UploadOrder) {
         for (const auto& copy : copies) {
             REQUIRE(copy.src_offset + copy.size <= src->bytes.size());
             REQUIRE(copy.dst_offset + copy.size <= dst.bytes.size());
@@ -348,6 +360,10 @@ struct BufferCacheTestAccess {
     static void KeepDrawWithout(KeepCache& cache, const Nx2FastDraw::Delta* delta) {
         cache.BeginGraphicsUniforms(delta);
     }
+    /// A dispatch or copy wrote [address, address + size) of buffer `id` (Nx2NoteListWrite).
+    static void ListWrite(Cache& cache, BufferId id, DAddr address, u64 size) {
+        cache.Nx2NoteListWrite(id, address, size);
+    }
     static void KeepDraw(KeepCache& cache, BufferCacheChannelInfo& channel,
                          const Nx2FastDraw::Delta* delta, BufferId id, DAddr address,
                          u32 size) {
@@ -397,16 +413,6 @@ struct BufferCacheTestAccess {
 namespace {
 
 using Access = VideoCommon::BufferCacheTestAccess;
-
-/// EDEN_NX2_READ_CHECK for a test, restored after it.
-struct ReadCheckScope {
-    explicit ReadCheckScope(u64 every)
-        : previous{VideoCore::AsyncReadback::g_read_check_every.exchange(every)} {}
-    ~ReadCheckScope() {
-        VideoCore::AsyncReadback::g_read_check_every = previous;
-    }
-    u64 previous;
-};
 
 template <class R, class C>
 struct BasicFixture {
@@ -463,6 +469,59 @@ struct BasicFixture {
                               bool compute = false) {
         return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute);
     }
+};
+
+/// Hands FinishRead to a buffer cache, as RasterizerVulkan does.
+class ReadRasterizer final : public VideoCore::RasterizerInterface {
+public:
+    explicit ReadRasterizer(Cache& cache_) : cache{cache_} {}
+
+    void FinishRead(DAddr addr, u64 size) override {
+        cache.FinishReadDownloads(addr, size);
+    }
+    void Draw(bool, u32) override {}
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&) override {}
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
+        return false;
+    }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, true};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override {
+        return false;
+    }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
+        std::terminate();
+    }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+
+private:
+    Cache& cache;
 };
 
 using Fixture = BasicFixture<Runtime, Cache>;
@@ -539,59 +598,6 @@ VideoCommon::Nx2FastDraw::Delta Written(DAddr begin, DAddr end) {
     delta.num_device_writes = 1;
     return delta;
 }
-
-/// Hands FinishRead to a buffer cache, as RasterizerVulkan does.
-class ReadRasterizer final : public VideoCore::RasterizerInterface {
-public:
-    explicit ReadRasterizer(Cache& cache_) : cache{cache_} {}
-
-    void FinishRead(DAddr addr, u64 size) override {
-        cache.FinishReadDownloads(addr, size);
-    }
-    void Draw(bool, u32) override {}
-    void DrawTexture() override {}
-    void Clear(u32) override {}
-    void DispatchCompute() override {}
-    void ResetCounter(VideoCommon::QueryType) override {}
-    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
-               u32) override {}
-    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
-    void DisableGraphicsUniformBuffer(size_t, u32) override {}
-    void SignalFence(std::function<void()>&&) override {}
-    void SyncOperation(std::function<void()>&&) override {}
-    void SignalSyncPoint(u32) override {}
-    void SignalReference() override {}
-    void ReleaseFences(bool) override {}
-    void FlushAll() override {}
-    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
-        return false;
-    }
-    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
-        return {addr, addr + size, true};
-    }
-    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    void OnCacheInvalidation(DAddr, u64) override {}
-    bool OnCPUWrite(DAddr, u64) override {
-        return false;
-    }
-    void InvalidateGPUCache() override {}
-    void UnmapMemory(DAddr, u64) override {}
-    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
-    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    void WaitForIdle() override {}
-    void FragmentBarrier() override {}
-    void TiledCacheBarrier() override {}
-    void FlushCommands() override {}
-    void TickFrame() override {}
-    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
-        std::terminate();
-    }
-    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
-
-private:
-    Cache& cache;
-};
 
 } // namespace
 
@@ -848,6 +854,175 @@ TEST_CASE("Command page readers remain ordered during batch completion", "[buffe
     REQUIRE(f.runtime.downloads == 1);
 }
 
+namespace {
+
+/// Makes `page` a command list page for one test (nx2.h keeps them for the session).
+struct ListPage {
+    explicit ListPage(DAddr page) {
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::Nx2MarkCommandListPage(page);
+    }
+    ~ListPage() {
+        Tegra::Nx2ClearGpuWrittenPages();
+    }
+    ListPage(const ListPage&) = delete;
+    ListPage& operator=(const ListPage&) = delete;
+};
+
+bool AllBytes(std::span<const u8> bytes, u8 value) {
+    return std::ranges::all_of(bytes, [value](u8 byte) { return byte == value; });
+}
+
+} // namespace
+
+TEST_CASE("Command lists on words no GPU work wrote read guest memory, not the page's copy",
+          "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x77);
+    std::memset(f.bytes + 0x10000, 0x11, 0x1000);
+    // The page's first list drained the split and flushed the page (FlushGpuWrittenCommands).
+    f.cache->Nx2NoteListSynced(0x20000);
+    // A dispatch writes bytes 0x800-0x900 of the page; the copy taken after it is on its way.
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20800, 0x100);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    using Read = Cache::Nx2ListRead;
+    std::array<u8, 16> list{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20100, list, true) == Read::Synced);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x207f0, list, true) == Read::Synced);
+    // The GPU completes the copy. A list on the dispatch's words reads them from it; one that
+    // starts before them reads its other words from guest memory.
+    f.runtime.Finish();
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20800, list, true) == Read::Copied);
+    REQUIRE(AllBytes(list, 0x77));
+    std::array<u8, 32> spanning{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x207f0, spanning, true) == Read::Copied);
+    REQUIRE(AllBytes(std::span{spanning}.first(16), 0x11));
+    REQUIRE(AllBytes(std::span{spanning}.last(16), 0x77));
+}
+
+TEST_CASE("Command list pages the front has not flushed read every word from the copy",
+          "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x77);
+    std::memset(f.bytes + 0x10000, 0x11, 0x1000);
+    // GPU work may have written the page before it became a command list page: only the first
+    // write since is noted, and guest memory need not hold the rest.
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20800, 0x100);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    f.runtime.Finish();
+    std::array<u8, 32> list{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20100, list, true) == Cache::Nx2ListRead::Copied);
+    REQUIRE(AllBytes(list, 0x77));
+    REQUIRE(f.cache->Nx2ReadListCopy(0x207f0, list, true) == Cache::Nx2ListRead::Copied);
+    REQUIRE(AllBytes(list, 0x77));
+}
+
+TEST_CASE("Host writes give command list words back to guest memory and retire the page's copy",
+          "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->Nx2NoteListSynced(0x20000);
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20800, 0x100);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    f.runtime.Finish();
+    using Read = Cache::Nx2ListRead;
+    std::array<u8, 16> list{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20840, list, true) == Read::Copied);
+    // The CPU, an inline upload or a copy of bytes guest memory holds writes 0x800-0x840 whole,
+    // and two bytes of each of the words at 0x880 and 0x884.
+    f.cache->Nx2NoteListHostWrite(0x20800, 0x40);
+    f.cache->Nx2NoteListHostWrite(0x20882, 4);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20800, list, true) == Read::Synced);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20830, list, true) == Read::Synced);
+    // GPU-written words it did not write whole: the copy no longer holds the page.
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20840, list, true) == Read::Unknown);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20880, list, true) == Read::Unknown);
+}
+
+TEST_CASE("A flushed command list page reads guest memory until GPU work writes it again",
+          "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20000, 0x1000);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    using Read = Cache::Nx2ListRead;
+    std::array<u8, 16> list{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20800, list, true) == Read::Copied);
+    // The front drained the split and flushed the page (DmaPusher::FlushGpuWrittenCommands).
+    f.cache->Nx2NoteListSynced(0x20000);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20800, list, true) == Read::Synced);
+    Access::ListWrite(*f.cache, id, 0x20900, 0x40);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    f.runtime.Finish();
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20800, list, true) == Read::Synced);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20900, list, true) == Read::Copied);
+}
+
+TEST_CASE("Copy engine clears give command list words back to guest memory", "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Tegra::MemoryManager gpu_memory{f.system, f.device, 32, 1ULL << 31, 16};
+    gpu_memory.BindRasterizer(&f.rasterizer);
+    gpu_memory.Map(0x200000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    Access::UseGpuMemory(*f.cache, gpu_memory);
+    f.cache->Nx2NoteListSynced(0x20000);
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20800, 0x100);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    f.runtime.Finish();
+    // 16 words cleared (MaxwellDMA's remapped constant fill writes them to guest memory too).
+    REQUIRE(f.cache->DMAClear(0x200800, 16, 0));
+    REQUIRE(AllBytes(std::span{Access::Get(*f.cache, id).bytes}.subspan(0x800, 0x40), 0));
+    using Read = Cache::Nx2ListRead;
+    std::array<u8, 16> list{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20830, list, true) == Read::Synced);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20840, list, true) == Read::Unknown);
+}
+
+TEST_CASE("EDEN_NX2_LIST_VERIFY reads command lists as before, from the page's whole copy",
+          "[buffer_ports]") {
+    Fixture f;
+    const ListPage list_page{0x20000};
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x77);
+    std::memset(f.bytes + 0x10000, 0x11, 0x1000);
+    f.cache->Nx2NoteListSynced(0x20000);
+    f.cache->Nx2CollectListCopies(true);
+    Access::ListWrite(*f.cache, id, 0x20800, 0x100);
+    REQUIRE(f.cache->Nx2CopyListPages(f.runtime.CurrentTick()));
+    f.cache->Nx2CollectListCopies(false);
+    f.runtime.Finish();
+    using Read = Cache::Nx2ListRead;
+    std::array<u8, 32> list{};
+    {
+        // Whatever words GPU work wrote: once it wrote the page, every list there reads the copy.
+        const Tegra::Nx2ListStats::ReferenceScope reference;
+        REQUIRE(f.cache->Nx2ReadListCopy(0x20100, list, true) == Read::Copied);
+        REQUIRE(AllBytes(list, 0x77));
+        REQUIRE(f.cache->Nx2ReadListCopy(0x207f0, list, true) == Read::Copied);
+        REQUIRE(AllBytes(list, 0x77));
+    }
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20100, list, true) == Read::Synced);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x207f0, list, true) == Read::Copied);
+    REQUIRE(AllBytes(std::span{list}.first(16), 0x11));
+}
+
 TEST_CASE("Native uniform banks upload directly without overwriting GPU-owned bytes",
           "[buffer_ports]") {
     Fixture f;
@@ -986,6 +1161,15 @@ TEST_CASE("Uniform keep ends at CPU writes the caches are told about", "[buffer_
     f.cache->WriteMemory(0x18000, 0x10);
     f.Draw(&unchanged);
     REQUIRE(f.Counts().kept == 2);
+
+    // Losing the write list is conservative even when the recorded ranges are elsewhere.
+    for (u32 write = 0; write < 9; ++write) {
+        f.cache->WriteMemory(0x18000 + write * 0x10, 0x10);
+    }
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 2);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 3);
 }
 
 TEST_CASE("Uniform keep never keeps across command buffers", "[buffer_ports]") {
@@ -1550,6 +1734,29 @@ VideoCore::RasterizerDownloadArea ReadWord(Fixture& f, DAddr address) {
 }
 } // namespace
 
+TEST_CASE("Newer bytes not yet in guest memory land overlapping read downloads first",
+          "[buffer_ports]") {
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x12);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
+    SECTION("indirect dispatch arguments discarded before the GPU writes them") {
+        (void)f.cache->ObtainCPUBuffer(0x20040, 12,
+                                     VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                                     VideoCommon::ObtainBufferOperation::DiscardWrite);
+    }
+    SECTION("a DMA copy destination") {
+        f.cache->ClearDownload(0x20040, 12);
+    }
+    f.cache->FinishReadDownloads(0x20000, 0x1000);
+    REQUIRE(f.bytes[0x10040] == 0x12);
+    REQUIRE(f.bytes[0x1004b] == 0x12);
+    REQUIRE(f.bytes[0x10fff] == 0x12);
+    REQUIRE(f.runtime.host_read_waits == 1);
+    REQUIRE(VideoCore::g_read_downloads == 0);
+}
+
 TEST_CASE("Pages read after each GPU write get their downloads right behind the writes",
           "[buffer_ports]") {
     Fixture f;
@@ -1729,6 +1936,23 @@ TEST_CASE("A query result older than a GPU write it lands over leaves the write 
     REQUIRE_FALSE(ReadWord(f, 0x20040).preemtive);
     REQUIRE(f.bytes[0x10040] == 3);
     REQUIRE(f.bytes[0x10043] == 3);
+}
+
+TEST_CASE("A synced payload does not end an older deferred report's tracking",
+          "[buffer_ports]") {
+    Fixture f;
+    const Nx2TitleScope nx2_title;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    ReportOnReadBackPage(f, id);
+    WriteByDispatch(f, id, 0x20000, 0x100, 3);
+    // #874's synced payload runs now, ahead of the older report. CounterReport does not
+    // register or finish tracking for this callback, just as for an immediate payload.
+    WriteReportResult(f, 0x11111111, false);
+    REQUIRE_FALSE(ReadWord(f, 0x20040).preemtive);
+    REQUIRE(f.bytes[0x10040] == 3);
+    WriteReportResult(f, 0x22222222, true);
+    REQUIRE_FALSE(ReadWord(f, 0x20040).preemtive);
+    REQUIRE(f.bytes[0x10040] == 3);
 }
 
 TEST_CASE("A query result newer than the GPU writes under it stays in guest memory",
@@ -2351,122 +2575,6 @@ TEST_CASE("Read download check leaves out early downloaded bytes an upload repla
     REQUIRE(Access::ReadChecks(*f.cache).compared != 0);
     REQUIRE(Access::ReadChecks(*f.cache).mismatched == 0);
     REQUIRE(Access::ReadChecks(*f.cache).uncovered == 0);
-}
-
-TEST_CASE("EDEN_NX2_READ_CHECK values select how many read downloads are checked",
-          "[buffer_ports]") {
-    using VideoCore::AsyncReadback::ParseReadCheck;
-    REQUIRE(ParseReadCheck(nullptr) == 0);
-    REQUIRE(ParseReadCheck("") == 0);
-    REQUIRE(ParseReadCheck("0") == 0);
-    REQUIRE(ParseReadCheck("1") == 1);
-    REQUIRE(ParseReadCheck("16") == 16);
-}
-
-TEST_CASE("EDEN_NX2_READ_CHECK=1 compares every read download", "[buffer_ports]") {
-    Fixture f;
-    const ReadCheckScope check{1};
-    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
-    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x12);
-    for (u32 read = 1; read <= 3; ++read) {
-        Access::MarkWritten(*f.cache, id, 0x20000, 0x100);
-        f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-        f.cache->FinishReadDownloads(0x20000, 0x1000);
-        REQUIRE(Access::ReadChecks(*f.cache).checked == read);
-    }
-    REQUIRE(Access::ReadChecks(*f.cache).compared == 0x300);
-    REQUIRE(Access::ReadChecks(*f.cache).mismatched == 0);
-    REQUIRE(Access::ReadChecks(*f.cache).uncovered == 0);
-}
-
-namespace {
-/// Two read downloads, and a GPU write nothing records into the first one's bytes: the second
-/// download's check finds 0x10 bytes outdated once both land.
-VideoCommon::BufferId OutdatedReadDownloads(Fixture& f) {
-    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
-    auto& buffer = Access::Get(*f.cache, id);
-    std::ranges::fill(buffer.bytes, 0x12);
-    Access::MarkWritten(*f.cache, id, 0x20000, 0x100);
-    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-    f.runtime.pending.push_back(
-        [&buffer] { std::fill_n(buffer.bytes.begin() + 0x40, 0x10, u8{0x56}); });
-    Access::MarkWritten(*f.cache, id, 0x20800, 0x10);
-    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-    return id;
-}
-
-/// The guest thread whose read waits for its downloads (GPU::OnCPURead).
-struct ReadingThreadScope {
-    ReadingThreadScope() {
-        VideoCore::AsyncReadback::t_reading = true;
-    }
-    ~ReadingThreadScope() {
-        VideoCore::AsyncReadback::t_reading = false;
-    }
-};
-
-u64 MismatchedBy(Fixture& f, VideoCore::AsyncReadback::Landing landing) {
-    return Access::ReadChecks(*f.cache).mismatched_by_landing[static_cast<size_t>(landing)];
-}
-} // namespace
-
-TEST_CASE("The read check names who wrote a differing download to guest memory",
-          "[buffer_ports]") {
-    using VideoCore::AsyncReadback::Landing;
-    Fixture f;
-    const ReadCheckScope check{1};
-    OutdatedReadDownloads(f);
-    SECTION("the reading thread") {
-        const ReadingThreadScope reading;
-        f.cache->FinishReadDownloads(0x20000, 0x1000);
-        REQUIRE(MismatchedBy(f, Landing::Reader) == 0x10);
-    }
-    SECTION("a write to guest memory from the GPU's side") {
-        f.cache->FinishReadDownloads(0x20800, 4);
-        REQUIRE(MismatchedBy(f, Landing::GpuSideWrite) == 0x10);
-    }
-    SECTION("the next read download, once the host GPU ran them") {
-        f.runtime.Complete(f.runtime.submitted_tick);
-        f.cache->DownloadMemoryForRead(0x30000, 0x1000);
-        REQUIRE(MismatchedBy(f, Landing::Completed) == 0x10);
-    }
-    REQUIRE(Access::ReadDownloads(*f.cache) == 0);
-    REQUIRE(Access::ReadChecks(*f.cache).checked == 2);
-    REQUIRE(Access::ReadChecks(*f.cache).mismatched == 0x10);
-}
-
-TEST_CASE("Async read-back counts the reading thread's and the GPU side's waits apart",
-          "[buffer_ports]") {
-    auto& counters = VideoCore::AsyncReadback::g_counters;
-    Fixture f;
-    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
-    const u64 reader_waits = counters.reader_waits.load();
-    const u64 gpu_side_waits = counters.gpu_side_waits.load();
-    // The reading thread waits for a download the host GPU hasn't run.
-    Access::MarkWritten(*f.cache, id, 0x20000, 0x100);
-    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-    {
-        const ReadingThreadScope reading;
-        f.cache->FinishReadDownloads(0x20000, 0x1000);
-    }
-    REQUIRE(counters.reader_waits.load() - reader_waits == 1);
-    REQUIRE(counters.gpu_side_waits.load() == gpu_side_waits);
-    // A semaphore release over one falls back to a host GPU wait on the GPU's side.
-    Access::MarkWritten(*f.cache, id, 0x20000, 0x100);
-    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-    f.cache->FinishReadDownloads(0x20040, 4);
-    REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
-    // Run by the host GPU before the read: nothing waits.
-    Access::MarkWritten(*f.cache, id, 0x20000, 0x100);
-    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
-    f.runtime.Complete(f.runtime.submitted_tick);
-    {
-        const ReadingThreadScope reading;
-        f.cache->FinishReadDownloads(0x20000, 0x1000);
-    }
-    REQUIRE(counters.reader_waits.load() - reader_waits == 1);
-    REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
-    REQUIRE(f.runtime.host_read_waits == 2);
 }
 
 TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buffer_ports]") {

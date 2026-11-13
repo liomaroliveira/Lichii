@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -28,9 +30,26 @@ class MemoryManager;
 
 namespace Tegra::Engines {
 class EngineInterface;
+enum class EngineTypes : u32;
 }
 
 namespace VideoCommon {
+
+/// TEST (EDEN_NX2_ACQUIRE_STATS): what sent the last write the front could not place
+/// (GpuSplit::TagUnplaced), for why the QMD view could not value a signal.
+enum class UnplacedKind : u8 {
+    Other,      ///< A deferred call nobody tagged
+    RunCommand, ///< A function the CPU queued in order (unmaps, events)
+    Engine,     ///< An engine method the front sends as it is (blits)
+    Oversized,  ///< A placed write longer than the coarse slots take
+    QmdLaunch,  ///< A QMD launch the view could not value
+    InlineQmd,  ///< An inline QMD behind a change of the mappings
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(UnplacedKind::Count)>
+    unplaced_kind_names{"other",        "CPU functions", "engines", "oversized writes",
+                        "QMD launches", "inline QMDs"};
 
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
 enum class DrainSite : u32 {
@@ -49,9 +68,10 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
-    RingFull,       ///< The ring is full: the front waits for the back to make room
     BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
     BackCode,       ///< The macro code changes under the macros the back has yet to run
+    ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
+    RingFull,       ///< The front waits for room in the split ring
     Count,
 };
 
@@ -109,7 +129,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
     "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
-    "ring full",       "back register", "back code",
+    "back register",   "back code",     "list copy writers", "ring full",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -144,7 +164,6 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
-    /// Marks the calling thread as the GPU thread (the front, or the only one without the split).
     static void MarkGpuThread() {
         on_gpu_thread = true;
     }
@@ -156,6 +175,23 @@ public:
     /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
     [[nodiscard]] static bool OwnsScheduler() {
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
+    }
+    /// Back thread: the entry it runs, as NoteFencedWrite takes it; elsewhere nothing.
+    [[nodiscard]] std::optional<u64> BackEntry() const {
+        if (!on_back_thread) {
+            return std::nullopt;
+        }
+        return EntryTag(back_entry_start);
+    }
+    /// Any thread: the operation of a report the back sent in `entry` (BackEntry) ran with its
+    /// fence, so the report is in memory, and those of the entries before it: fences run their
+    /// operations in order (QueryCacheBase::CounterReport).
+    void NoteFencedWrite(u64 entry) {
+        u64 landed = fenced_landed.load(std::memory_order_relaxed);
+        while (landed <= entry &&
+               !fenced_landed.compare_exchange_weak(landed, entry + 1, std::memory_order_release,
+                                                    std::memory_order_relaxed)) {
+        }
     }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
@@ -172,6 +208,25 @@ public:
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+    /// Run on the back when a thread asks for it (RequestTick): the GPU's sync operations.
+    void SetTickHook(void (*hook)(void*), void* argument) {
+        tick_hook = hook;
+        tick_argument = argument;
+    }
+    /// Any thread, after queueing a sync operation it waits for: has the back run the tick hook
+    /// after the entry it is running, or at once if it waits for work. Otherwise the operation runs
+    /// after the back's next draw, or after the front sent everything it had queued before it.
+    void RequestTick() {
+        if (!back_running.load(std::memory_order_acquire)) {
+            return;
+        }
+        // The back checks tick_requested after setting back_waiting: one of the two sees the other.
+        tick_requested.store(true, std::memory_order_seq_cst);
+        if (back_waiting.load(std::memory_order_seq_cst)) {
+            wake.fetch_add(1, std::memory_order_seq_cst);
+            wake.notify_one();
+        }
+    }
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
     /// commands read without cache flushes). Called by the front between commands.
@@ -179,10 +234,18 @@ public:
     void Stop();
 
     /// What the sender of an entry tells about the guest memory the back writes running it, for
-    /// the front's reads of guest memory (WaitForWrites).
+    /// the front's reads of guest memory (WaitForWrites, MemoryWritesTarget).
     enum class Writes : u8 {
-        Anywhere, ///< Unknown: a read anywhere waits for the entry
-        Noted,    ///< Nothing, or what the sender notes right after sending it (NoteWrite)
+        /// Unknown: a read anywhere waits for the entry, and it may change the GPU's mappings
+        /// (unmaps; GPU maps drain the split)
+        Anywhere,
+        /// Guest memory anywhere, the mappings not: engine work whose writes nobody placed
+        Unplaced,
+        /// The GPU caches anywhere (shader stores, copies into buffers), guest memory only through
+        /// them, where GPU work wrote (Nx2MayBeGpuWritten): a read of the caches waits for it, a
+        /// read of other guest memory not (MemoryWritesTarget)
+        Caches,
+        Noted, ///< Nothing, or what the sender notes right after sending it (NoteWrite)
     };
 
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
@@ -199,9 +262,10 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
+        if (log_methods) [[unlikely]] {
+            LogMethod(engine, method); // TEST
         }
+        NoteWrites(writes);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
@@ -214,9 +278,10 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
+        if (log_methods) [[unlikely]] {
+            LogMethod(engine, method); // TEST
         }
+        NoteWrites(writes);
     }
 
     /// A Maxwell3D state register write (not in execution_mask) from the front, shadow RAM
@@ -249,7 +314,7 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func, u64 flags = 0, Writes writes = Writes::Anywhere) {
+    void Defer(const Func& func, Writes writes = Writes::Anywhere, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
@@ -257,19 +322,17 @@ public:
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
-    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>). `flags` as Defer's.
     template <typename Func>
     void DeferWords(const Func& func, std::span<const u32> words,
-                    Writes writes = Writes::Anywhere) {
+                    Writes writes = Writes::Anywhere, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         const size_t payload = function_words + 1 + (words.size() + 1) / 2;
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         entry[2 + function_words] = words.size();
@@ -278,11 +341,9 @@ public:
             std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
         }
         Commit(2 + payload);
-        if (writes == Writes::Anywhere) {
-            NoteAnyWrite();
-        }
+        NoteWrites(writes);
     }
-    void DeferFunction(std::function<void()>&& func);
+    void DeferFunction(std::function<void()>&& func, Writes writes = Writes::Anywhere);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
@@ -320,16 +381,42 @@ public:
     }
     /// Logs g_acquire_stats every 10 s (front, while they count).
     void ReportAcquire();
+    /// The front waited for the back, which may run out of work soon: publish the next words
+    /// after a few, as after a drain, not after PublishEvery.
+    void PublishSoon() {
+        publish_every = PublishAfterWait;
+    }
+    /// Keeps the entries the front sends unpublished while it notes what they write from guest
+    /// memory as the back will find it running them (the QMD view: descriptors, and the words
+    /// maxima and reductions combine with). An idle back gets a published entry at once and may
+    /// run it before the front reads, which then reads what the entry wrote. While `hold`, Commit
+    /// publishes nothing; Publish (drains, waits, a full ring) still does.
+    class PublishHold {
+    public:
+        PublishHold(GpuSplit& split_, bool hold) : split{split_}, was_held{split_.publish_held} {
+            if (hold) {
+                split.publish_held = true;
+            }
+        }
+        ~PublishHold() {
+            if (split.publish_held != was_held) {
+                split.publish_held = was_held;
+                split.PublishIfDue();
+            }
+        }
+        PublishHold(const PublishHold&) = delete;
+        PublishHold& operator=(const PublishHold&) = delete;
+
+    private:
+        GpuSplit& split;
+        bool was_held;
+    };
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
-    /// The ring position after the entries sent so far, for WaitUntil.
-    [[nodiscard]] u64 Position() {
-        FlushState();
-        return write_position;
-    }
     /// Waits until the back executed the entries sent before `position`. Returns whether any of
     /// them was still queued.
     bool WaitUntil(u64 position, DrainSite site) {
+        FlushState();
         return WaitFor((std::min)(position, write_position), site);
     }
 
@@ -341,36 +428,225 @@ public:
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
-    /// bit; semaphore acquires drain, or note it when a release still queued meets them): the
-    /// guest's GPU work before it is complete before the commands after it are fetched.
+    /// bit; semaphore acquires note it when a release still queued meets them): the guest's GPU
+    /// work before it is complete before the commands after it are fetched.
     void NoteSync() {
         last_sync_position = write_position;
         synced_writer_position = last_writer_position;
     }
+    /// The position after everything sent so far, for Ran and WaitForPosition.
+    [[nodiscard]] u64 Position() {
+        FlushState();
+        return write_position;
+    }
+    /// Ring position written so far, without flushing buffered state writes.
+    [[nodiscard]] u64 WrittenPosition() const {
+        return write_position;
+    }
+    /// Last ring position observed as consumed by the back thread.
+    [[nodiscard]] u64 ConsumedPosition() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// Whether the back executed everything sent before `position`. It may tell so a little
+    /// late: the back stores its position every few thousand words and when it runs out of work.
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
+    /// The position after the last compute or copy work sent (NoteWriter).
+    [[nodiscard]] u64 LastWriterPosition() const {
+        return (std::min)(last_writer_position, write_position);
+    }
+    /// Waits until the back executed everything sent before `position`, not what came after.
+    /// Returns whether any of it was still queued.
+    bool WaitForPosition(u64 position, DrainSite site) {
+        return WaitFor((std::min)(position, write_position), site);
+    }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
-    /// A semaphore release was just sent: once the back ran it, the word at `device_address` holds
-    /// `payload`, or a value the front can't tell (`known` false: a reduction, a counter report).
-    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known);
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued. `site`: whose wait it is, for EDEN_NX2_GPU_PROFILE.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// When a release the back runs reaches memory.
+    enum class Landing : u8 {
+        AtRun,  ///< As the back runs it: payload reports without a fence, reductions, maxima
+        Fenced, ///< Once the fence signaled after it ran (QueryCacheBase::CounterReport):
+                ///< fence-flagged reports, counter reports
+    };
+    /// When a fence-flagged payload release reaches memory. Below High GPU accuracy with Default
+    /// fences, CounterReport keeps it synchronized (is_synced): its operation runs as the back
+    /// runs it, without waiting for the fence.
+    static Landing FencedPayloadLanding();
+    /// A semaphore release was just sent: once it landed (`landing`), the word at
+    /// `device_address` holds `payload`, or a value the front can't tell (`known` false: a
+    /// reduction, a counter report), or `payload` at least (`at_least`: a maximum with a value the
+    /// front can't tell).
+    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least = false,
+                            Landing landing = Landing::AtRun);
     struct QueuedSemaphoreWrite {
         u32 payload;
         bool known;
+        bool at_least; ///< Known only as a lower bound (unsigned)
+        /// It lands once a fence ran, at no position the front can wait for; or an earlier write
+        /// that does may still land after it.
+        bool fenced;
+        u64 position; ///< Once the back ran this (Ran), the word holds the write, unless `fenced`
     };
-    /// The last write sent to the semaphore word at `device_address`, if the back may not have run
-    /// it yet.
+    /// The last write sent to the semaphore word at `device_address`, if it may not be in memory
+    /// yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
-    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
-    /// the writers a command list fetched now is ordered after. Returns whether any of it was
-    /// still queued.
-    bool WaitForSyncedWriters();
+    /// Whether compute or copy work sent so far is still queued (EDEN_NX2_DRAIN_CHECK).
+    [[nodiscard]] bool WritersPending() const;
+    /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<device address>): whether releases to the semaphore word
+    /// at `device_address` are logged.
+    [[nodiscard]] static u64 SemaphoreWatch() {
+        return WatchRanges()[0].first;
+    }
+    /// TEST: where the entry the back runs starts in the ring.
+    [[nodiscard]] static u64 EntryStart() {
+        return Get().back_entry_start;
+    }
+    [[nodiscard]] static bool WatchesSemaphore(u64 device_address) {
+        if (SemaphoreWatch() == 0) [[likely]] {
+            return false;
+        }
+        for (const auto& [start, size] : WatchRanges()) {
+            if (start != 0 && device_address >= start && device_address < start + size) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// TEST: the first watched word [device_address, +size) covers, or 0.
+    [[nodiscard]] static u64 WatchCovers(u64 device_address, u64 size) {
+        if (SemaphoreWatch() == 0) [[likely]] {
+            return 0;
+        }
+        for (const auto& [start, length] : WatchRanges()) {
+            if (start != 0 && device_address < start + length && start < device_address + size) {
+                return std::max(start, device_address);
+            }
+        }
+        return 0;
+    }
+    /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<hex device address>[:<size>],...): up to four ranges.
+    [[nodiscard]] static const std::array<std::pair<u64, u64>, 4>& WatchRanges() {
+        static const std::array<std::pair<u64, u64>, 4> ranges = [] {
+            std::array<std::pair<u64, u64>, 4> parsed{};
+            const char* text = std::getenv("EDEN_NX2_SEM_WATCH_DEVICE");
+            for (size_t i = 0; text != nullptr && *text != '\0' && i < parsed.size(); ++i) {
+                char* end{};
+                parsed[i].first = std::strtoull(text, &end, 16) & ~u64{3};
+                parsed[i].second = 4;
+                if (*end == ':') {
+                    parsed[i].second = std::max<u64>(4, std::strtoull(end + 1, &end, 0));
+                }
+                text = *end == ',' ? end + 1 : nullptr;
+            }
+            return parsed;
+        }();
+        return ranges;
+    }
+    /// TEST: the calling thread's part in the split, for watch logs.
+    [[nodiscard]] static const char* ThreadRole() {
+        return on_back_thread ? "back" : "other";
+    }
+    /// Front thread, diagnostics: the ring's positions on both sides, with what was last sent to
+    /// the semaphore word at `device_address`.
+    [[nodiscard]] std::string DescribeState(u64 device_address) const;
+    /// TEST (EDEN_NX2_ACQUIRE_STATS): the engine and method of the method entry that ends at
+    /// `end`, among the last LoggedMethods sent, as "KeplerCompute 0x6d"; empty if none.
+    [[nodiscard]] std::string MethodEndingAt(u64 end) const;
+    /// Front thread: the ring words sent that the back had not run when it last stored its
+    /// position (every 4096 words of a batch and at its end) (EDEN_NX2_LIST_STATS).
+    [[nodiscard]] u64 Backlog() const {
+        return write_position - consumed.load(std::memory_order_acquire);
+    }
+    /// Front thread: the ring words sent that the back does not see yet (EDEN_NX2_LIST_STATS).
+    [[nodiscard]] u64 Unpublished() const {
+        return write_position - published_local;
+    }
 
-    /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`.
+    /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`, as
+    /// mapped now. Up to MaxNotedBytes by 256-byte granule, up to MaxCoarseNotedBytes by 64 KiB
+    /// granule, longer writes count as unplaced.
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
-    /// The entry just sent may write guest memory anywhere.
+    /// NoteWrite for the entry sent at `position` (the one before it ends there), placed late: the
+    /// front's QMD view values a launch once the back ran what it waited for.
+    void NoteWriteAt(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size, u64 position);
+    /// The entry just sent may write guest memory anywhere and change the GPU's mappings
+    /// (Writes::Anywhere).
     void NoteAnyWrite() {
+        NoteUnplacedWrite();
+        last_mapping_change = write_position;
+        last_mapping_kind = UnplacedKind::Other; // TEST
+    }
+    /// The entry just sent may write guest memory anywhere (Writes::Unplaced).
+    void NoteUnplacedWrite() {
         last_any_write = write_position;
+        last_unplaced_write = write_position;
+        last_unplaced_kind = UnplacedKind::Other; // TEST
+    }
+    /// TEST: what sent the entry just sent, if it may write anywhere or change the mappings.
+    void TagUnplaced(UnplacedKind kind) {
+        if (last_unplaced_write == write_position) {
+            last_unplaced_kind = kind;
+        }
+        if (last_mapping_change == write_position) {
+            last_mapping_kind = kind;
+        }
+    }
+    /// TEST: what sent the last entry that may write anywhere (LastUnplacedWrite), and the last
+    /// that may change the mappings (LastMappingChange).
+    [[nodiscard]] UnplacedKind LastUnplacedKind() const {
+        return last_unplaced_kind;
+    }
+    [[nodiscard]] UnplacedKind LastMappingKind() const {
+        return last_mapping_kind;
+    }
+    /// The entry just sent may write the GPU caches anywhere (Writes::Caches).
+    void NoteCacheWrite() {
+        last_any_write = write_position;
+    }
+    void NoteWrites(Writes writes) {
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        } else if (writes == Writes::Unplaced) {
+            NoteUnplacedWrite();
+        } else if (writes == Writes::Caches) {
+            NoteCacheWrite();
+        }
+    }
+    /// The position after the last entry sent that may write guest memory where the front does
+    /// not know (NoteAnyWrite, NoteUnplacedWrite), outside what the caches hold.
+    [[nodiscard]] u64 LastUnplacedWrite() const {
+        return (std::min)(last_unplaced_write, write_position);
+    }
+    /// The position after the last entry sent that may change the GPU's mappings (NoteAnyWrite):
+    /// once the back ran it, what is mapped now is what the back finds mapped.
+    [[nodiscard]] u64 LastMappingChange() const {
+        return (std::min)(last_mapping_change, write_position);
+    }
+    /// Once the back ran everything before the position returned, no entry sent so far writes
+    /// guest memory in [address, address + size) of `memory` but through the GPU caches
+    /// (Writes::Caches): what the back reads there without them, as the QMD scheduler does, is in
+    /// memory then. Placed as WaitForWrites places writes.
+    [[nodiscard]] u64 MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                         u64 size) const;
+    /// As MemoryWritesTarget, counting only the writes the front placed (NoteWrite): not the ones
+    /// that may land anywhere.
+    [[nodiscard]] u64 PlacedWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                         u64 size) const;
+    /// PlacedWritesTarget by the exact ranges of the placed writes the back may not have run: the
+    /// latest position of those that write [address, address + size), 0 if none. Empty when some
+    /// of them were dropped from the log (PlacedLogSize writes sent since).
+    [[nodiscard]] std::optional<u64> ExactPlacedTarget(const Tegra::MemoryManager& memory,
+                                                       GPUVAddr address, u64 size) const;
+    /// The position after the compute and copy work sent before the last NoteSync.
+    [[nodiscard]] u64 SyncedWriterPosition() const {
+        return (std::min)(synced_writer_position, write_position);
     }
     /// Waits until the back executed every entry sent so far that can write guest memory in
     /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
@@ -401,20 +677,53 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
-    /// Words a back waiting for work gets without a publish_every (Commit).
     static constexpr size_t PublishAfterWait = 8;
 
-    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long
-    /// (longer ones count as anywhere), in write_positions slots hashed by granule: granules that
-    /// share a slot share its position, so a read may wait for a write elsewhere, never miss one.
+    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long,
+    /// in sets of WriteWays slots hashed by granule. Writes up to MaxCoarseNotedBytes (copies,
+    /// uploads) go by 64 KiB granule into coarse sets, longer ones count as unplaced. A slot holds
+    /// a granule and the position of its last write; a write to a granule its set lacks takes the
+    /// slot written longest ago, and the set keeps the latest position of the writes it so
+    /// dropped (`evicted`). A read waits for its granule's own last write while the set holds
+    /// it, else for the evicted ones: it may wait for a write elsewhere, never miss one, and the
+    /// writes to other granules hashed there (the constant buffer words of queued draws) hold up
+    /// a read of a QMD only once they pushed it out of its set.
     static constexpr u32 WriteGranuleBits = 8;
     static constexpr u64 MaxNotedBytes = 0x4000;
-    static constexpr u32 WriteSlotBits = 10;
+    static constexpr u32 WriteSlotBits = 12; ///< Sets
+    static constexpr u32 CoarseGranuleBits = 16;
+    static constexpr u64 MaxCoarseNotedBytes = u64{16} << 20;
+    static constexpr u32 CoarseSlotBits = 10;
+    static constexpr size_t WriteWays = 4;
 
+    /// One cache line.
+    struct WriteSet {
+        std::array<u64, WriteWays> positions;
+        /// The granules' low 32 bits: granules that agree in them share a slot.
+        std::array<u32, WriteWays> granules;
+        u64 evicted;
+        u64 unused;
+    };
+    static_assert(sizeof(WriteSet) == 64);
+    /// The set a granule is hashed to.
     static size_t WriteSlot(u64 granule) {
         return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - WriteSlotBits));
     }
-    void NoteDeviceWrite(DAddr address, u64 size);
+    static size_t CoarseSlot(u64 granule) {
+        return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - CoarseSlotBits));
+    }
+    /// A write to `granule` at `position` (the newest, or an earlier one placed late).
+    static void NoteSetWrite(WriteSet& set, u64 granule, u64 position);
+    /// The latest position of the writes to `granule` in its set, at most.
+    [[nodiscard]] static u64 SetTarget(const WriteSet& set, u64 granule);
+    void NoteDeviceWrite(DAddr address, u64 size) {
+        NoteDeviceWriteAt(address, size, write_position);
+    }
+    void NoteDeviceWriteAt(DAddr address, u64 size, u64 position);
+    void NoteCoarseDeviceWrite(DAddr address, u64 size) {
+        NoteCoarseDeviceWriteAt(address, size, write_position);
+    }
+    void NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position);
     /// The position WaitForWrites waits for.
     [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                    u64 size) const;
@@ -452,21 +761,56 @@ private:
     }
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
-        write_position += words;
-        const u64 unpublished = write_position - published_local;
-        if (unpublished >= publish_every) {
-            Publish();
-            return;
+        if (profile_publishes && write_position == published_local) [[unlikely]] {
+            NoteFirstUnpublished(); // TEST
         }
-        // The back waits for work at the last position published (back_idle_at): it gets these
-        // words after a few, not after publish_every. A drain used to restart it like that.
-        if (unpublished >= PublishAfterWait &&
-            back_idle_at.load(std::memory_order_relaxed) == published_local) {
-            Count(g_acquire_stats.early_publishes);
-            Publish();
+        last_entry_start = write_position;
+        write_position += words;
+        if (PublishDue() && !publish_held) {
+            PublishNow();
         }
     }
+    /// Whether Commit publishes now.
+    [[nodiscard]] bool PublishDue() const {
+        const u64 unpublished = write_position - published_local;
+        // The back waits for work at the last position published (it stored it in back_idle_at
+        // before it spun): it gets these words after a few, not after publish_every.
+        return unpublished >= publish_every ||
+               (unpublished >= PublishAfterWait &&
+                back_idle_at.load(std::memory_order_relaxed) == published_local);
+    }
+    void PublishNow() {
+        if (profile_publishes && write_position - published_local < publish_every) [[unlikely]] {
+            NoteEarlyPublish(); // TEST
+        }
+        Publish();
+    }
+    /// What Commit would have published during a PublishHold.
+    void PublishIfDue() {
+        if (PublishDue()) {
+            PublishNow();
+        }
+    }
+    /// TEST (EDEN_NX2_GPU_PROFILE): how long the back waited for work while the front held words
+    /// it could have run (Publish).
+    /// Nx2Profile::Enabled() as the split started (MaybeStart, after VideoCore::CreateGPU read
+    /// the switch).
+    bool profile_publishes{};
+    void NoteFirstUnpublished();
+    void NoteLatePublish();
+    /// TEST: Commit publishes before publish_every, because the back waits for the words.
+    void NoteEarlyPublish();
     void WaitForSpace(size_t words);
+    /// TEST (EDEN_NX2_ACQUIRE_STATS): the engine method entries sent, by the position after them.
+    struct SentMethod {
+        u64 end;
+        std::optional<Tegra::Engines::EngineTypes> engine; ///< The class it was bound as
+        u32 method;
+    };
+    static constexpr size_t LoggedMethods = size_t{1} << 16;
+    /// EDEN_NX2_ACQUIRE_STATS as the split started (MaybeStart).
+    bool log_methods{};
+    void LogMethod(const Tegra::Engines::EngineInterface* engine, u32 method);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         FlushState();
         if (engine != front_engine) [[unlikely]] {
@@ -489,6 +833,14 @@ private:
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    /// The back, between entries: runs the tick hook if a thread asked for it.
+    void MaybeTick() {
+        if (tick_requested.load(std::memory_order_relaxed) &&
+            tick_requested.exchange(false, std::memory_order_acq_rel) && tick_hook != nullptr)
+            [[unlikely]] {
+            tick_hook(tick_argument);
+        }
+    }
 
     Core::System* system{};
     bool active{};
@@ -503,22 +855,65 @@ private:
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
+    u64 last_entry_start{}; ///< Where the last entry sent starts
     struct SemaphoreWrite {
         u64 position; ///< write_position once it was sent
+        /// `fenced`: the entry (EntryTag) whose fenced write must have landed (NoteFencedWrite)
+        u64 entry;
         u32 payload;
         bool known;
+        bool at_least;
+        bool fenced;
     };
     /// The front's NoteSemaphoreWrite, by word address.
     Common::unordered_map<u64, SemaphoreWrite> semaphore_writes;
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
-    /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
-    /// NoteWrite placed, and the last placed write in each slot's granules.
+    /// After the last entry that may write guest memory or the GPU caches anywhere (NoteAnyWrite,
+    /// NoteUnplacedWrite, NoteCacheWrite), the last one that may write guest memory itself
+    /// anywhere (NoteAnyWrite, NoteUnplacedWrite), the last one that may change the GPU's
+    /// mappings (NoteAnyWrite), the last one NoteWrite placed, and the last placed write in each
+    /// slot's granules, fine and coarse.
     u64 last_any_write{};
+    u64 last_unplaced_write{};
+    u64 last_mapping_change{};
+    UnplacedKind last_unplaced_kind{}; ///< TEST: see TagUnplaced
+    UnplacedKind last_mapping_kind{};  ///< TEST
     u64 last_noted_write{};
-    std::array<u64, size_t{1} << WriteSlotBits> write_positions{};
+    alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
+    alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
+    /// The placed writes in the order noted (NoteDeviceWriteAt, NoteCoarseDeviceWriteAt), with
+    /// their exact ranges: what the sets can't tell apart (writes next to a word in its granule,
+    /// other granules hashed to its set) for those the back has not run (ExactPlacedTarget).
+    struct PlacedLogEntry {
+        u64 position; ///< As placed (late QMD releases: before `sent`)
+        u64 sent;     ///< The write position when noted, in log order
+        DAddr begin;
+        DAddr end;
+    };
+    static constexpr size_t PlacedLogSize = size_t{1} << 16;
+    std::unique_ptr<PlacedLogEntry[]> placed_log;
+    u64 placed_log_count{};
+    u64 placed_log_lost{}; ///< The latest `sent` of the entries written over
+    void LogPlacedWrite(DAddr address, u64 size, u64 position) {
+        if (!placed_log) [[unlikely]] {
+            return; // Not started: nothing asks
+        }
+        PlacedLogEntry& entry = placed_log[placed_log_count & (PlacedLogSize - 1)];
+        if (placed_log_count >= PlacedLogSize) {
+            placed_log_lost = (std::max)(placed_log_lost, entry.sent);
+        }
+        entry = {position, write_position, address, address + size};
+        ++placed_log_count;
+    }
     u64 published_local{};
+    /// PublishHold: Commit publishes nothing.
+    bool publish_held{};
     u64 consumed_cache{};
-    /// Words between publishes: small right after a drain, while the back has nothing to do.
+    u64 first_unpublished_ticks{}; ///< TEST: when the first word not published yet was sent
+    std::unique_ptr<SentMethod[]> logged_methods; ///< TEST: see LogMethod
+    u64 logged_method_count{};
+    /// Words between publishes: small right after the front waited for the back (Drain,
+    /// PublishSoon), while the back may have nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
     /// The state writes being gathered (StateWrite).
@@ -532,6 +927,20 @@ private:
 
     // Back side, in its own block.
     alignas(128) Tegra::Engines::EngineInterface* back_engine{};
+    u64 back_entry_start{}; ///< Where the entry the back runs starts (BackEntry)
+
+    /// An entry's position as fenced writes name it: with this start of the split in the high
+    /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions
+    /// stay far below 2^48).
+    [[nodiscard]] u64 EntryTag(u64 position) const {
+        return (u64{starts} << 48) | position;
+    }
+    /// Whether the word holds `write` (as far as no other write changed it since): the back ran
+    /// it, and a fenced one landed.
+    [[nodiscard]] bool InMemory(const SemaphoreWrite& write) const {
+        return write.position <= consumed.load(std::memory_order_acquire) &&
+               (!write.fenced || fenced_landed.load(std::memory_order_acquire) > write.entry);
+    }
 
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
@@ -545,7 +954,10 @@ private:
     static inline thread_local bool on_gpu_thread{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
+    void (*tick_hook)(void*){};
+    void* tick_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
+    std::atomic<bool> tick_requested{};
     std::atomic<bool> back_running{};
     std::atomic<bool> back_quiet{true};
 
@@ -553,6 +965,9 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    /// One past the last entry (EntryTag) whose fenced writes landed (NoteFencedWrite): the
+    /// fencing thread writes it, the front reads it.
+    alignas(128) std::atomic<u64> fenced_landed{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
@@ -560,10 +975,12 @@ private:
     /// The front sleeps in Backoff (#161: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
-    /// The back's position when it last ran out of work, stored before it waits: while
-    /// it equals published_local, the back waits for the words the front holds (Commit). Port of
-    /// the publish part of 62db242b34 (jpkto, PR #805).
+    /// The back's position when it last ran out of work, stored before it waits for more: while
+    /// it equals published_local, the back waits for the words the front holds (Commit). The back
+    /// writes it once per wait, the front reads it at every Commit.
     alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
+    /// TEST (profile_publishes): when the back last ran out of work, 0 while it runs.
+    alignas(128) std::atomic<u64> back_idle_since{};
     std::jthread back_thread;
 };
 

@@ -3293,6 +3293,11 @@ public:
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
+    /// Executable methods whose work leaves what a draw resolves to alone (counter resets, the
+    /// render enable condition): fast draw records nothing for them.
+    static bool IsFastDrawNeutralMethod(u32 method);
+    /// Registers only a report or a macro memory read takes as operands.
+    static bool IsFastDrawReportOperand(u32 method);
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
@@ -3301,6 +3306,9 @@ public:
     /// done nothing, where the general path has to: the buffer isn't one mapped device range, it
     /// can reach the texture or sampler headers, or the write lands on Switch 2 sparse memory.
     bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
+    /// Whether data written to [begin, end) reaches the texture or sampler headers, which ends
+    /// fast draw reuse (it breaks it then).
+    bool FastDrawHeaderWrite(GPUVAddr begin, GPUVAddr end);
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
@@ -3333,7 +3341,8 @@ private:
         // The instances after the first are drawn together once their loop ends, and they must see
         // the state they were begun with: NVN's draw macros reset the base instance (and its copy
         // in c[0][0x644]) right after the loop, before the macro returns.
-        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method))
+            [[unlikely]] {
             draw_manager.DrawDeferred(*this, true);
         }
         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
@@ -3360,6 +3369,11 @@ private:
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
+    /// CallMethod after the split's checks: CallMethodFast, or CallMethodSlow where it can't.
+    void DispatchMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
+    /// CallMethod with EDEN_NX2_GPU_PROFILE: DispatchMethod, counted and timed.
+    void ProfiledCallMethod(Core::System& system, u32 method, u32 method_argument,
+                            bool is_last_call);
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.
     void CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
     void CallMethodFast(u32 method, u32 method_argument, bool is_last_call);
@@ -3470,6 +3484,12 @@ private:
     // model). Read per engine, not at static initialization, which runs before the frontend
     // loads nx2_switches.txt.
     const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+    // EDEN_NX2_DMA_READ_VERIFY=1: a macro DMA read the front makes without draining the split
+    // (FrontDmaRead) drains it anyway and has the caches write the words out, as every read
+    // did before, and the macro gets those words. The front counts the reads whose words
+    // differ from the ones it read first and logs the counts every 10 s, the first 16 reads
+    // with their words. The differences must stay 0. Read per engine, as the switch above.
+    const bool dma_read_verify = std::getenv("EDEN_NX2_DMA_READ_VERIFY") != nullptr;
     // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
     // method checks them, so they are members rather than function statics (MSVC reads a
     // thread-local to check a static's initialization on every call).
@@ -3507,6 +3527,8 @@ private:
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);
+    std::vector<std::pair<u32, u32>> FrontRunTheOldWay(VideoCommon::GpuSplit& split,
+                                                       const FrontState& state, u32 start);
     u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);

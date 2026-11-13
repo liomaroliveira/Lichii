@@ -390,6 +390,54 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
+    /// Whether `other` resolves the same image views, samplers and image descriptors from the same
+    /// constant buffer words: the same stages, and the same texture and image descriptors in each
+    /// (the same shaders when a handle is computed at draw time). What one kept for delta draws
+    /// then stands for the other.
+    [[nodiscard]] bool SharesDeltaStateWith(const GraphicsPipeline& other) const noexcept;
+
+    /// Takes what `other` (SharesDeltaStateWith) kept for delta draws; `other` keeps nothing.
+    void TakeDeltaStateFrom(GraphicsPipeline& other) noexcept;
+
+    /// Changes whenever what the pipeline keeps for delta draws changes (a captured Configure,
+    /// RetextureDelta resolving some views, TakeDeltaStateFrom on either side), unique among
+    /// pipelines: a remembered draw of the pipeline stands for what it keeps only while equal.
+    [[nodiscard]] u64 DeltaGeneration() const noexcept {
+        return delta_generation;
+    }
+
+    /// Whether RetextureDelta can bring the kept views up to date: the pipeline samples textures
+    /// only (no texture or image buffers or images), from constant buffer words or handles
+    /// computed at draw time.
+    [[nodiscard]] bool CanRetexture() const noexcept {
+        return (texture_memo_eligible || retexture_eligible) && TakesDeltaDraws();
+    }
+    /// Whether a texture handle is computed at draw time (ComputedHandlesChanged).
+    [[nodiscard]] bool HasComputedHandles() const noexcept {
+        return has_computed_handles;
+    }
+    /// ConfigureDelta keeps the texture buffers bound, which a draw of another pipeline may have
+    /// left in this one's stages (the rasterizer's RevisitDraw). CanRetexture pipelines bind
+    /// none: unbinds them, as Configure does.
+    void UnbindStageTextureBuffers() {
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (configured_stages[stage]) {
+                buffer_cache.UnbindGraphicsTextureBuffers(stage);
+            }
+        }
+    }
+    /// Delta draws after texture handle writes or rebinds, and revisits: reads (or computes) every
+    /// handle again and resolves the views and samplers of those that changed, keeping the others;
+    /// the next ConfigureDelta pushes their descriptors again. Returns how many it resolved, or
+    /// nothing (the draw resolves in full) when the handles can't be read or resolving deleted or
+    /// rescaled images the kept views may sample.
+    std::optional<u32> RetextureDelta();
+    /// RetextureDelta for a delta draw after which only handles computed at draw time can have
+    /// changed (no constant buffer of handles was bound or written): evaluates those once and
+    /// resolves only their descriptors' views. Returns how many views it resolved (0 when none
+    /// changed), or nothing when the draw must resolve in full.
+    std::optional<u32> RetextureComputed();
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -405,6 +453,11 @@ private:
     bool ConfigureImpl(bool is_indexed);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
+
+    /// Appends the texture handles of the configured stages (CanRetexture pipelines) as
+    /// ConfigureImpl reads or computes them, and the computed ones to `computed` too. False when
+    /// a constant buffer a handle is read from isn't bound.
+    bool ReadRawHandles(std::vector<u32>& out, std::vector<u32>* computed = nullptr) const;
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
@@ -438,6 +491,9 @@ private:
     std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    /// Stages with a shader, and whether a handle is computed at draw time (SharesDeltaStateWith).
+    std::array<bool, NUM_STAGES> stage_enabled{};
+    bool has_computed_handles{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
@@ -450,10 +506,18 @@ private:
     /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
     /// resolve them from texture_memo.
     bool texture_memo_eligible{};
+    /// Textures only, their handles read or computed (CanRetexture).
+    bool retexture_eligible{};
     VideoCommon::SampledTextureMemo texture_memo;
     bool writes_images{};
 
     DeltaBlocker delta_blocker{};
+    /// DeltaGeneration, from a counter all pipelines share (only the drawing thread bumps it).
+    void NextDeltaGeneration() noexcept {
+        delta_generation = ++delta_generations;
+    }
+    inline static u64 delta_generations{};
+    u64 delta_generation{};
     bool delta_views_valid{};
     bool capture_delta{};
     bool verify_delta{};
@@ -469,6 +533,11 @@ private:
         handle_word_index{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// The handles delta_views and delta_samplers were resolved from (CanRetexture pipelines,
+    /// RetextureDelta), and RetextureDelta's scratch.
+    std::vector<u32> delta_raw_handles;
+    std::vector<u32> retexture_handles;
+    std::vector<u32> retexture_computed;
     /// A descriptor whose handles the captured Configure computed at draw time: the descriptor
     /// (stage, kind as ComputedHandleKind, index in its list) and its elements' values, count of
     /// them from delta_computed_values[first_value].
@@ -482,6 +551,13 @@ private:
     enum ComputedHandleKind : u8 { TextureBuffer, ImageBuffer, Texture, Image };
     std::vector<ComputedHandle> delta_computed_handles;
     std::vector<u32> delta_computed_values;
+    /// Appends each element's computed handle value for `handle` (in element order), as
+    /// ConfigureImpl computes it.
+    void EvaluateComputedHandle(const ComputedHandle& handle, std::vector<u32>& out) const;
+    /// Resolves the views and samplers of the raw handles `raws` for delta_views' `elements`
+    /// and keeps them (the next ConfigureDelta pushes their descriptors again). False when
+    /// resolving deleted or rescaled images (the fast draw serial changed): nothing kept.
+    bool ResolveChangedViews(std::span<const u32> elements, std::span<const u32> raws);
     /// Delta draws: the image descriptor entries (first entry and count per
     /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
     /// image changed its scale (TextureCache::ScaleEpoch).

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -105,6 +107,88 @@ public:
 
     std::vector<VkBufferCopy> copies;
     std::vector<Group> groups;
+};
+
+/// Uploads that run in the upload command buffer, ahead of all the work of their submission's
+/// main command buffer (Scheduler::RecordReorderedUpload). They are recorded as one command when
+/// the submission is: a copy per source and destination. Nothing orders them against each other
+/// and nothing has to: the buffer cache keeps an upload in order when work recorded before it in
+/// the submission, an earlier upload included, uses a byte it writes (DecideUploadOrder).
+class ReorderedUploadBatch {
+public:
+    [[nodiscard]] bool Empty() const noexcept {
+        return entries.empty();
+    }
+
+    /// prior_tick: the newest earlier submission whose work uses bytes the copies write, or a
+    /// later one; 0 if none.
+    void Add(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> new_copies, u64 prior_tick) {
+        for (const VkBufferCopy& copy : new_copies) {
+            entries.push_back(Entry{src, dst, copy});
+        }
+        newest_prior_tick = (std::max)(newest_prior_tick, prior_tick);
+    }
+
+    /// Empties the batch into its copies, grouped by source and destination (in the order they
+    /// were added within a group), and the newest earlier submission they must come after.
+    void Take(std::vector<VkBufferCopy>& copies, std::vector<UploadBatch::Group>& groups,
+              u64& prior_tick) {
+        std::stable_sort(entries.begin(), entries.end(), [](const Entry& lhs, const Entry& rhs) {
+            if (lhs.src != rhs.src) {
+                return std::less<VkBuffer>{}(lhs.src, rhs.src);
+            }
+            return std::less<VkBuffer>{}(lhs.dst, rhs.dst);
+        });
+        copies.clear();
+        groups.clear();
+        for (const Entry& entry : entries) {
+            const u32 index = static_cast<u32>(copies.size());
+            copies.push_back(entry.copy);
+            if (!groups.empty() && groups.back().src == entry.src &&
+                groups.back().dst == entry.dst) {
+                ++groups.back().count;
+            } else {
+                groups.push_back(UploadBatch::Group{entry.src, entry.dst, index, 1});
+            }
+        }
+        prior_tick = newest_prior_tick;
+        entries.clear();
+        newest_prior_tick = 0;
+    }
+
+    /// Records a batch into the upload command buffer. With after_prior_work it begins with a
+    /// barrier whose first scope is all the work submitted before it, earlier submissions' main
+    /// command buffers included: their reads and writes of the bytes the copies write come first.
+    /// The upload command buffer's last barrier (Scheduler::SubmitExecution) orders the copies
+    /// before the main command buffer's work and all later work.
+    static void Record(vk::CommandBuffer upload_cmdbuf, std::span<const VkBufferCopy> batch_copies,
+                       std::span<const UploadBatch::Group> batch_groups, bool after_prior_work) {
+        static constexpr VkMemoryBarrier PRIOR_WORK_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        if (after_prior_work) {
+            upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, PRIOR_WORK_BARRIER);
+        }
+        for (const UploadBatch::Group& group : batch_groups) {
+            upload_cmdbuf.CopyBuffer(
+                group.src, group.dst,
+                vk::Span<VkBufferCopy>(batch_copies.data() + group.first, group.count));
+        }
+    }
+
+private:
+    struct Entry {
+        VkBuffer src;
+        VkBuffer dst;
+        VkBufferCopy copy;
+    };
+
+    std::vector<Entry> entries;
+    u64 newest_prior_tick = 0;
 };
 
 } // namespace Vulkan

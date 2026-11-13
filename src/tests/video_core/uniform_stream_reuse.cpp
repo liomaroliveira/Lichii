@@ -19,9 +19,21 @@ void Check(bool condition, const char* message) {
 
 struct Memory {
     std::array<u8, 8192> bytes{};
+    u32 gathered{}; ///< Reads through ReadBlockUnsafe
+    u32 in_place{}; ///< Ranges GetSpan handed out
     void ReadBlockUnsafe(u64 address, void* destination, u32 size) {
         Check(address + size <= bytes.size(), "read outside guest memory");
         std::memcpy(destination, bytes.data() + address, size);
+        ++gathered;
+    }
+    /// As the device memory manager: a range in one piece of host memory, here one that doesn't
+    /// cross a 4 KiB page (as if the pages after it were mapped elsewhere).
+    u8* GetSpan(u64 address, size_t size) {
+        if (address / 4096 != (address + size - 1) / 4096) {
+            return nullptr;
+        }
+        ++in_place;
+        return bytes.data() + address;
     }
 };
 
@@ -113,6 +125,47 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
         bind(stage, slot, address, size);
         bind(stage, slot, address, size);
     }
+    Check(memory.gathered > 1000 && memory.in_place > 1000,
+          "the reads did not take both the gathered and the in-place path");
+}
+
+TEST_CASE("Uniform stream keeps require the same range and live allocation", "[video_core]") {
+    using VideoCommon::BindSmallUniformReusing;
+    using VideoCommon::RebindKeptUniform;
+    Memory memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 0, 64));
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64));
+    const u32 gathered = memory.gathered;
+    const u32 in_place = memory.in_place;
+    REQUIRE(RebindKeptUniform(runtime, 0, 0, 0, 64));
+    CheckBound(runtime, memory, 0, 64);
+    CHECK(memory.gathered == gathered);
+    CHECK(memory.in_place == in_place);
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 64, 64));
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 0, 32));
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 1, 0, 64));
+    CHECK_FALSE(RebindKeptUniform(runtime, 1, 0, 0, 64));
+    CHECK_FALSE(RebindKeptUniform(runtime, 5, 0, 0, 64));
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 18, 0, 64));
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 0, 0));
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 0, 4097));
+
+    // Equal bytes at a different address reuse the allocation, but update the keep's range.
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 64, 64));
+    CHECK(runtime.allocations.size() == 1);
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 0, 64));
+    REQUIRE(RebindKeptUniform(runtime, 0, 0, 64, 64));
+    CHECK(VideoCommon::KeptUniformHolds<Runtime>(memory, 0, 0, 64, 64));
+    memory.bytes[67] = 9;
+    CHECK_FALSE(VideoCommon::KeptUniformHolds<Runtime>(memory, 0, 0, 64, 64));
+
+    runtime.NextTick();
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 64, 64));
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 64, 64));
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 64, 64));
 }
 
 TEST_CASE("Uniform stream reuse: a slot whose bytes change every bind skips the compare",

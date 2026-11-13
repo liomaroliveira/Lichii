@@ -413,6 +413,56 @@ TEST_CASE("Fast draw keeps base vertex and instance as draw parameters", "[fast_
     CHECK(f.Reusable());
 }
 
+TEST_CASE("Fast draw keeps counter resets and the render enable condition light", "[fast_draw]") {
+    FastDrawFixture f;
+    f.DrawArrays(0, 3);
+    constexpr u32 clear_report = MAXWELL3D_REG_INDEX(clear_report_value);
+    f.Write(clear_report, f.Reg(clear_report) ^ 1);
+    f.DrawArrays(3, 3);
+    CHECK(f.Reusable());
+    f.Write(MAXWELL3D_REG_INDEX(render_enable.mode), 1); // True: the next draws run
+    f.DrawArrays(6, 3);
+    CHECK(f.rasterizer.draws.size() == 3);
+    CHECK(f.Reusable());
+}
+
+TEST_CASE("Fast draw records a report's memory write instead of breaking on it", "[fast_draw]") {
+    DeltaFixture f;
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.address_high), 0);
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.address_low), 0x40000);
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.limit), 7);
+    const auto report = [&](u32 address) {
+        f.Write(MAXWELL3D_REG_INDEX(report_semaphore.address_high), 0);
+        f.Write(MAXWELL3D_REG_INDEX(report_semaphore.address_low), address);
+        f.Write(MAXWELL3D_REG_INDEX(report_semaphore.payload),
+                f.Reg(MAXWELL3D_REG_INDEX(report_semaphore.payload)) + 1);
+        f.Write(MAXWELL3D_REG_INDEX(report_semaphore.query), 0); // long release
+    };
+    f.DrawArrays(0, 3);
+    const u64 serial = FastDraw::Serial();
+    FastDraw::g_delta = {};
+    f.Write(0x155, f.Reg(0x155) + 0x40); // SET_MME_MEM_ADDRESS_B
+    report(0x30000);
+    CHECK(FastDraw::Serial() == serial);
+    REQUIRE(FastDraw::g_delta.num_writes == 1);
+    CHECK(FastDraw::g_delta.write_begin[0] == 0x30000);
+    CHECK(FastDraw::g_delta.write_end[0] == 0x30010);
+    f.DrawArrays(3, 3);
+    CHECK(f.Reusable());
+
+    // Into the texture headers a delta draw keeps: a full resolve.
+    report(0x40020);
+    CHECK(FastDraw::Serial() != serial);
+}
+
+TEST_CASE("Fast draw keeps the vertex id base as a draw parameter", "[fast_draw]") {
+    FastDrawFixture f;
+    f.DrawArrays(0, 3);
+    f.Write(MAXWELL3D_REG_INDEX(vertex_id_base), f.Reg(MAXWELL3D_REG_INDEX(vertex_id_base)) + 3);
+    f.DrawArrays(3, 3);
+    CHECK(f.Reusable());
+}
+
 TEST_CASE("Fast draw keeps vertex stream addresses and sizes light", "[fast_draw]") {
     DeltaFixture f;
     const auto stream = [](u32 index, u32 word) {

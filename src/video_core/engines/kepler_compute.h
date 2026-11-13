@@ -37,6 +37,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace Tegra::Nx2ListIndirect {
+class ComputeFront;
+}
+
 namespace VideoCore {
 class RasterizerInterface;
 }
@@ -255,6 +259,12 @@ public:
         return kept_grid;
     }
 
+    /// The slot of GPU-written list words (Nx2ListIndirect) the dispatch being made takes its
+    /// group counts from, indirectly: its QMD's grid is the slot's placeholders.
+    std::optional<u32> GetIndirectListSlot() const {
+        return indirect_list_slot;
+    }
+
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
@@ -288,13 +298,22 @@ public:
     void SetGridMarker(Nx2ListGrid::GridMarker* marker) {
         grid_marker = marker;
     }
+    /// The front, at a GPU-written list of `count` words that are all the parameters of the call
+    /// of macro method `method` about to start: whether the call takes the words as the
+    /// placeholders of `slot` (Nx2ListIndirect), the back's copy of them, instead of the words.
+    bool FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count, u32 slot);
 
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
-    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 argument, bool from_macro);
+    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control,
+                         bool from_macro);
+    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
+    void FrontQmdCheck(VideoCommon::GpuSplit& split); ///< TEST
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
@@ -330,7 +349,9 @@ private:
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
-    std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+    /// The constant buffer 0 offsets of a program's image handles, read and stored: memoized
+    /// per program address, returned by reference (OoT asks for each of ~5,000 dispatches/s).
+    const std::pair<std::vector<u32>, std::vector<u32>>& NativeImageHandles(GPUVAddr program);
     void RememberNativeUpscaleInput();
 
     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
@@ -429,6 +450,9 @@ private:
     /// for a word that is no marker. Set by the QMD read before its dispatch.
     std::array<u64, 3> qmd_grid_lists{};
     Nx2ListGrid::GridMarker* grid_marker{};
+    std::optional<u32> indirect_list_slot{};
+    /// The front's GPU-written list words in this engine's macros (Nx2ListIndirect).
+    std::unique_ptr<Nx2ListIndirect::ComputeFront> list_front;
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

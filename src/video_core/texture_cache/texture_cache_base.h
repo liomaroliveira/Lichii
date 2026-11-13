@@ -128,9 +128,11 @@ public:
     DescriptorTable<TICEntry, ImageViewId> compute_image_table;
     DescriptorTable<TSCEntry, SamplerId> compute_sampler_table;
 
-    // TODO: still relies on bad iterators :(
-    std::unordered_map<TICEntry, ImageViewId> image_views;
-    std::unordered_map<TSCEntry, SamplerId> samplers;
+    // Flat maps, like the other hot texture cache maps: VisitImageView holds the try_emplace
+    // iterator across CreateImageView, which only erases from image_views (erasing never
+    // rehashes, and never removes the new entry: its id is still 0) and never inserts.
+    ::Common::unordered_map<TICEntry, ImageViewId> image_views;
+    ::Common::unordered_map<TSCEntry, SamplerId> samplers;
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -454,7 +456,7 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
-    Common::SpinRecursiveMutex mutex;
+    Common::SpinRecursiveMutex mutex{Common::ContentionLock::TextureCache};
 
 private:
     /// Iterate over all page indices in a range

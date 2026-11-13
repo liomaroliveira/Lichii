@@ -67,7 +67,6 @@ public:
     [[nodiscard]] bool Empty() const {
         return batches.empty();
     }
-
 private:
     struct Batch {
         void* tracker;

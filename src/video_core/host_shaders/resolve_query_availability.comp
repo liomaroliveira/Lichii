@@ -1,0 +1,33 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Samples query results copied with VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+// and no wait: each entry is the 64-bit count followed by a 64-bit availability word. A query
+// whose result has not landed yet resolves to 1024 samples (visible) instead of whatever the copy
+// wrote for it, which the Vulkan spec leaves undefined.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Copied {
+    uvec4 copied[]; // count low, count high, availability low, availability high
+};
+
+layout(std430, binding = 1) writeonly buffer Resolved {
+    uvec2 resolved[]; // 64-bit count
+};
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+};
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= count) {
+        return;
+    }
+    const uvec4 entry = copied[index];
+    const bool available = (entry.z | entry.w) != 0u;
+    resolved[index] = available ? entry.xy : uvec2(1024u, 0u);
+}
