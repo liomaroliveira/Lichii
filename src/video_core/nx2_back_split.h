@@ -16,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/thread.h"
+#include "video_core/gpu_wait_stats.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -157,8 +158,12 @@ public:
 
     /// Stage A: runs fn(arg) on GPUBackB after the ring entries sent so far, and waits for it
     /// (E04.T6 locked mode).
-    void RunOnB(TaskFn fn, void* arg) {
+    void RunOnB(TaskFn fn, void* arg, bool hard = true) {
         EnsureStarted();
+        const u64 wait_start = NowNs();
+        if (hard) {
+            ModelSegmentEnd(wait_start);
+        }
         PublishNow();
         drained_position = write_position;
         task_fn = fn;
@@ -179,6 +184,37 @@ public:
             }
             a_waiting.store(false, std::memory_order_relaxed);
         }
+        const u64 wait_end = NowNs();
+        a_wait_ns += wait_end - wait_start;
+        if (hard) {
+            ModelSegmentClose(wait_end);
+        }
+    }
+
+    /// E04.T6 step 5 model (refutation test before async draws): between two "hard" sync points
+    /// (those that stay synchronous in step 5) stage A and GPUBackB would run side by side, so a
+    /// segment would take max(A busy, B busy) instead of their sum. A busy = wall time minus A's
+    /// waits for B and its idle time; B busy = time GPUBackB spent running packets and calls.
+    void ModelSegmentEnd(u64 now) {
+        const u64 idle = GpuWaitStats::g_back_idle_ns.load(std::memory_order_relaxed);
+        const u64 wall = now - model_last;
+        const u64 excluded = (a_wait_ns - model_a_wait) + (idle - model_idle);
+        model_seg_a = wall > excluded ? wall - excluded : 0;
+    }
+    void ModelSegmentClose(u64 now) {
+        const u64 b = b_busy_ns.load(std::memory_order_acquire);
+        const u64 seg_b = b - model_b;
+        if (model_last != 0) {
+            model_sum += model_seg_a + seg_b;
+            model_max += (std::max)(model_seg_a, seg_b);
+            model_a += model_seg_a;
+            model_bb += seg_b;
+            ++model_hard;
+        }
+        model_last = now;
+        model_a_wait = a_wait_ns;
+        model_idle = GpuWaitStats::g_back_idle_ns.load(std::memory_order_relaxed);
+        model_b = b;
     }
 
     using AsyncFn = void (*)(const u64* payload);
@@ -397,6 +433,16 @@ public:
                  b_bad_state_total.load(std::memory_order_relaxed));
         stat_async = 0;
         stat_drains = 0;
+        LOG_INFO(HW_GPU,
+                 "Nx2BackSplit step 5 model: hard syncs {:.0f}/s, A busy {:.1f} ms/s, B busy {:.1f} "
+                 "ms/s, sum {:.1f} ms/s, max {:.1f} ms/s, ceiling {:+.1f}%",
+                 static_cast<double>(model_hard) / sec, static_cast<double>(model_a) / 1e6 / sec,
+                 static_cast<double>(model_bb) / 1e6 / sec, static_cast<double>(model_sum) / 1e6 / sec,
+                 static_cast<double>(model_max) / 1e6 / sec,
+                 model_max == 0 ? 0.0
+                                : (static_cast<double>(model_sum) / static_cast<double>(model_max) - 1.0) *
+                                      100.0);
+        model_sum = model_max = model_a = model_bb = model_hard = 0;
         stat_guard_drains = {};
         if (report_hook != nullptr) {
             report_hook(sec);
@@ -560,6 +606,8 @@ private:
                     continue;
                 }
             }
+            const u64 busy_start = NowNs();
+            bool busy_counted = false;
             u64 last_store = read_pos;
             while (read_pos != available) {
                 const size_t index = read_pos & RingMask;
@@ -601,10 +649,15 @@ private:
             if (task != done) {
                 task_fn(task_arg);
                 done = task;
+                b_busy_ns.fetch_add(NowNs() - busy_start, std::memory_order_release);
+                busy_counted = true;
                 task_done.store(task, std::memory_order_seq_cst);
                 if (a_waiting.load(std::memory_order_seq_cst)) {
                     task_done.notify_one();
                 }
+            }
+            if (!busy_counted) {
+                b_busy_ns.fetch_add(NowNs() - busy_start, std::memory_order_release);
             }
         }
         consumer_sink.store(sink, std::memory_order_relaxed);
@@ -670,6 +723,11 @@ private:
     u64 stat_run_sleeps = 0;
     u64 stat_async = 0;
     u64 stat_drains = 0;
+    // Step 5 model (A side, but b_busy_ns written by GPUBackB).
+    u64 a_wait_ns = 0;
+    std::atomic<u64> b_busy_ns{0};
+    u64 model_last = 0, model_a_wait = 0, model_idle = 0, model_b = 0, model_seg_a = 0;
+    u64 model_sum = 0, model_max = 0, model_a = 0, model_bb = 0, model_hard = 0;
     std::array<u64, 3> stat_guard_drains{}; ///< step 4d, by GuardRead site
     u64 drained_position = 0; ///< write_position at the last RunOnB
     // Stage A: the engine the deltas belong to, the engines GPUBackB has a shadow of, draws.
@@ -748,8 +806,8 @@ inline void EmitQuery(u64 gpu_addr, u64 payload, u64 meta) {
     g_state.PushQuery(gpu_addr, payload, meta);
 }
 
-inline void RunOnB(RingState::TaskFn fn, void* arg) {
-    g_state.RunOnB(fn, arg);
+inline void RunOnB(RingState::TaskFn fn, void* arg, bool hard = true) {
+    g_state.RunOnB(fn, arg, hard);
 }
 
 inline void DrainAsync() {

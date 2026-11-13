@@ -124,12 +124,39 @@ struct Task {
     }
 };
 
+/// E04.T6 step 5 model: the calls that stay synchronous once draws are asynchronous (the rest
+/// become tasks: draws and clears, queries, fences and syncpoints, the idle hook).
+constexpr bool StaysSyncInStep5(Call call) {
+    switch (call) {
+    case Call::Draw:
+    case Call::DrawIndirect:
+    case Call::DrawTexture:
+    case Call::Clear:
+    case Call::Query:
+    case Call::SignalFence:
+    case Call::SyncOperation:
+    case Call::SignalSyncPoint:
+    case Call::SignalReference:
+    case Call::ReleaseFences:
+    case Call::Hook:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/// Stage A only: hard (step 5) syncs by call, for the report.
+std::array<u64, static_cast<size_t>(Call::Count)> g_hard_counts{};
+
 template <typename F>
 void RunWithContext(Call call, F&& func) {
     ++g_counts[static_cast<size_t>(call)];
+    if (StaysSyncInStep5(call)) {
+        ++g_hard_counts[static_cast<size_t>(call)];
+    }
     using Func = std::remove_reference_t<F>;
     Task<Func> task{&func, Context::Capture(), nullptr};
-    RunOnB(&Task<Func>::Run, &task);
+    RunOnB(&Task<Func>::Run, &task, StaysSyncInStep5(call));
     task.context.Apply();
     if (task.exception) [[unlikely]] {
         std::rethrow_exception(task.exception);
@@ -206,6 +233,15 @@ void ReportCounts(double seconds) {
     }
     LOG_INFO(HW_GPU, "Nx2BackSplit RunOnB by call: {}", line);
     g_counts.fill(0);
+    std::partial_sort(order.begin(), order.begin() + 8, order.end(),
+                      [](size_t a, size_t b) { return g_hard_counts[a] > g_hard_counts[b]; });
+    line.clear();
+    for (size_t i = 0; i < 8 && g_hard_counts[order[i]] != 0; ++i) {
+        line += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", call_names[order[i]],
+                            static_cast<double>(g_hard_counts[order[i]]) / seconds);
+    }
+    LOG_INFO(HW_GPU, "Nx2BackSplit step 5 hard syncs by call (drains not included): {}", line);
+    g_hard_counts.fill(0);
 }
 
 } // Anonymous namespace
