@@ -718,6 +718,7 @@ private:
         }
     }
 
+    static void CountCallSite(u64 thunk);
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);

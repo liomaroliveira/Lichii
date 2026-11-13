@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -786,6 +787,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
             VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
+            CountCallSite(entry[1]);
             // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
             // it was sent without waiting.
             VideoCommon::BackSplit::DrainAsync();
@@ -795,6 +797,59 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     }
     }
     return 1;
+}
+
+namespace {
+/// E04.T6 (night 2026-11-12): Call closures per sender (thunk address), stage A only. Logged as
+/// offsets from ReportBProfile; `nm -C` on the binary names them.
+struct CallSiteCount {
+    u64 thunk;
+    u64 count;
+};
+std::array<CallSiteCount, 64> g_call_sites{};
+u64 g_call_sites_report_ns{};
+
+void ReportCallSites() {
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    if (g_call_sites_report_ns == 0) {
+        g_call_sites_report_ns = now;
+        return;
+    }
+    if (now - g_call_sites_report_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - g_call_sites_report_ns) / 1e9;
+    g_call_sites_report_ns = now;
+    auto sorted = g_call_sites;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.count > b.count; });
+    const u64 base = reinterpret_cast<u64>(&VideoCommon::BackSplit::ReportBProfile);
+    std::string line;
+    for (size_t i = 0; i < 12 && sorted[i].count != 0; ++i) {
+        line += fmt::format(" {:+#x}={:.0f}/s", static_cast<s64>(sorted[i].thunk - base),
+                            static_cast<double>(sorted[i].count) / seconds);
+    }
+    LOG_INFO(HW_GPU, "Nx2BackSplit Call sites (thunk - ReportBProfile):{}", line);
+    for (auto& site : g_call_sites) {
+        site.count = 0;
+    }
+}
+} // Anonymous namespace
+
+void GpuSplit::CountCallSite(u64 thunk) {
+    for (auto& site : g_call_sites) {
+        if (site.thunk == thunk) {
+            ++site.count;
+            break;
+        }
+        if (site.thunk == 0) {
+            site = {thunk, 1};
+            break;
+        }
+    }
+    ReportCallSites();
 }
 
 void GpuSplit::CallHook(void (*hook)(void*), void* argument) {

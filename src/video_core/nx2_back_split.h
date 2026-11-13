@@ -45,6 +45,8 @@ inline bool OnB() noexcept {
 /// GPUBackB, once at its start: marks it as a back thread for GpuSplit (OnBackThread and
 /// OwnsScheduler hold on both stages). Defined in nx2_back_split_rasterizer.cpp.
 void OnBThreadStart();
+/// GPUBackB, between batches: its EDEN_NX2_GPU_PROFILE zones every 10 s (E04.T6).
+void ReportBProfile();
 
 /// Counters the A side keeps for the report (Call entries and deferred map/unmap closures).
 inline std::atomic<u64> g_calls{};
@@ -582,6 +584,7 @@ private:
         u64 sink = 0;
         u64 done = 0;
         while (!stop_token.stop_requested()) {
+            ReportBProfile();
             // The task first: A published its ring entries before posting it.
             u64 task = task_seq.load(std::memory_order_acquire);
             u64 available = published.load(std::memory_order_acquire);
