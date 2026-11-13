@@ -40,23 +40,23 @@ ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
 }
 
 bool ServiceManager::WaitForService(const std::string& name) {
+    // Only for services on host threads (audio, vi). They wait on the host, not with SleepThread:
+    // that sleep ends on the emulated timer, which stops once emulation is suspended at shutdown.
+    // A guest thread must not wait here, it would block its emulated core.
+    DEBUG_ASSERT(Kernel::GetCurrentThread(kernel).IsDummyThread());
     std::unique_lock l{lock};
     ++service_waiters;
     SCOPE_EXIT {
         --service_waiters;
-        waiters_left.notify_all();
+        waiters_changed.notify_all();
     };
     while (registered_services.find(name) == registered_services.end()) {
         if (closing) {
             LOG_INFO(Service_SM, "Gave up waiting for {}: the services are closing", name);
             return false;
         }
-        l.unlock();
-        Kernel::Svc::SleepThread(
-            kernel.System(),
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds{100})
-                .count());
-        l.lock();
+        // Checks again every 100 ms, or at once when Close runs.
+        waiters_changed.wait_for(l, std::chrono::milliseconds{100});
     }
     return true;
 }
@@ -64,10 +64,9 @@ bool ServiceManager::WaitForService(const std::string& name) {
 void ServiceManager::Close() {
     std::unique_lock l{lock};
     closing = true;
-    // Each waiter wakes from its 100 ms sleep: give them a few rounds.
-    if (!waiters_left.wait_for(l, std::chrono::seconds{2}, [this] { return service_waiters == 0; })) {
-        LOG_WARNING(Service_SM, "{} threads still wait for services", service_waiters);
-    }
+    // Waiters wake on the host at once, see closing and leave: no waiter outlives the manager.
+    waiters_changed.notify_all();
+    waiters_changed.wait(l, [this] { return service_waiters == 0; });
 }
 
 ServiceManager::~ServiceManager() {

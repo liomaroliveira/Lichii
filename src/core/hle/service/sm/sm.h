@@ -90,10 +90,11 @@ public:
 
     void InvokeControlRequest(HLERequestContext& context);
 
-    /// Waits until the service is registered, as GetService with block does. Returns false once
-    /// Close ran, the boot having ended before the service could start: the caller gives up.
+    /// Waits until the service is registered, as GetService with block does, from a host thread
+    /// only. Returns false once Close ran, the boot having ended before the service could start:
+    /// the caller gives up.
     bool WaitForService(const std::string& name);
-    /// Ends the waits of WaitForService, and waits a little for the threads in them to leave.
+    /// Ends the waits of WaitForService, and waits for the threads in them to leave.
     void Close();
 
     void SetDeferralEvent(Kernel::KEvent* deferral_event_) {
@@ -112,7 +113,7 @@ private:
     /// WaitForService state, guarded by lock
     bool closing{};
     u32 service_waiters{};
-    std::condition_variable waiters_left;
+    std::condition_variable waiters_changed; ///< Close ran, or a waiter left
 
     /// Kernel context
     Kernel::KernelCore& kernel;
