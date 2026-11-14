@@ -828,13 +828,17 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             continue;
         }
         if (patch.dlss_quality) {
+            // DLSS's quality picks the scale when DLSS is on; otherwise FSR's render resolution.
 #ifdef EGLANTINE_STREAMLINE
-            const bool wanted = Settings::OcarinaDlssRenderScale() == patch.dlss_quality &&
+            const auto scale = Settings::values.nvidia_dlss.GetValue()
+                                   ? Settings::OcarinaDlssRenderScale()
+                                   : Settings::OcarinaFsrRenderScale();
+#else
+            const auto scale = Settings::OcarinaFsrRenderScale();
+#endif
+            const bool wanted = scale == patch.dlss_quality &&
                                 std::find(disabled.cbegin(), disabled.cend(),
                                           MAX_RESOLUTION_NAME) == disabled.cend();
-#else
-            constexpr bool wanted = false;
-#endif
             if (!wanted) {
                 continue;
             }

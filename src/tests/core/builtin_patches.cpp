@@ -9,6 +9,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -779,4 +780,48 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
     for (const auto& patch : context.Manager().GetPatches()) {
         CHECK(patch.name.find("render scale") == std::string::npos);
     }
+}
+
+TEST_CASE("Built-in render scale follows Ocarina's FSR render resolution", "[patch_manager]") {
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    struct SettingsGuard {
+        ~SettingsGuard() {
+            Settings::values.ocarina_fsr.SetValue(false);
+            Settings::values.ocarina_fsr_render.SetValue(Settings::OcarinaFsrRender::Render1440p);
+            Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+        }
+    } guard;
+    PatchManagerTestContext context;
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(ScaleOffset + sizeof(u32));
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    const auto scale = [&] { return WordAt(context.Manager().PatchNSO(nso, "main"), ScaleOffset); };
+
+    using Render = Settings::OcarinaFsrRender;
+    using Quality = Settings::NvidiaDlssQuality;
+    Settings::values.ocarina_fsr.SetValue(true);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    for (const auto& [render, word, quality] :
+         std::array<std::tuple<Render, u32, std::optional<Quality>>, 3>{{
+             {Render::Render1440p, ScaleOne, std::nullopt},
+             {Render::Render1080p, 0x52A7E809, Quality::Performance},
+             {Render::Render720p, 0x52A7E009, Quality::UltraPerformance},
+         }}) {
+        Settings::values.ocarina_fsr_render.SetValue(render);
+        CHECK(scale() == word);
+        CHECK(Settings::AppliedOcarinaRenderScale() == quality);
+    }
+
+    Settings::values.ocarina_fsr_render.SetValue(Render::Render1080p);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+    CHECK(scale() == ScaleOne);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    Settings::values.ocarina_fsr.SetValue(false);
+    CHECK(scale() == ScaleOne);
+    Settings::values.ocarina_fsr.SetValue(true);
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    CHECK(scale() == ScaleOne);
+    CHECK_FALSE(Settings::AppliedOcarinaRenderScale());
+    Settings::values.disabled_addons.erase(OcarinaTitleId);
 }

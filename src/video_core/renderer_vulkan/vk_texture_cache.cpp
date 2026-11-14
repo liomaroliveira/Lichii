@@ -4693,8 +4693,23 @@ void CustomBorderColorBudget::Release() noexcept {
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+        // The render height follows the applied render-scale patch, the output FSR's setting.
+        u32 render_height = 1440;
+        if (const auto scale = Settings::AppliedOcarinaRenderScale()) {
+            using Quality = Settings::NvidiaDlssQuality;
+            render_height = *scale == Quality::Balanced      ? 1280
+                            : *scale == Quality::Performance ? 1080
+                            : *scale == Quality::UltraPerformance ? 720
+                                                                  : 1440;
+        }
+        const u32 output_height = Settings::values.ocarina_fsr_output.GetValue() ==
+                                          Settings::OcarinaFsrOutput::Output1440p
+                                      ? 1440
+                                      : 2160;
         ocarina_fsr_lod_bias =
-            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device), render_height,
+                                                     output_height)
+                    : 0.0f;
     }
     return *ocarina_fsr_lod_bias;
 }

@@ -441,6 +441,24 @@ struct Values {
                                                            true,
                                                            true};
     SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // Ocarina's render resolution while FSR upscales it (docked, Max Resolution on). Lower ones
+    // use the DLSS render-scale patches, so this works on every platform, not only with DLSS.
+    SwitchableSetting<OcarinaFsrRender> ocarina_fsr_render{linkage,
+                                                           OcarinaFsrRender::Render1440p,
+                                                           "ocarina_fsr_render",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           false};
+    // The size FSR reconstructs to in Ocarina. Below 4K the result is stretched linearly to the
+    // game's 4K image: FSR 4's INT8 model costs far less at 1440p on GPUs without FP8.
+    SwitchableSetting<OcarinaFsrOutput> ocarina_fsr_output{linkage,
+                                                           OcarinaFsrOutput::Output4K,
+                                                           "ocarina_fsr_output",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           false};
     // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
     SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
@@ -1138,6 +1156,9 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 /// The NVIDIA DLSS quality whose render scale Ocarina of Time's built-in patch applies when the
 /// game starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS on, docked.
 std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
+/// The DLSS render-scale patch Ocarina's FSR render resolution maps to (docked, FSR on): Performance
+/// for 1080p, Ultra Performance for 720p, none for 1440p.
+std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale();
 /// The quality whose render-scale patch the running game's main module got (none: unpatched).
 void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
 std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();

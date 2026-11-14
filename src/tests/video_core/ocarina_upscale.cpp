@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cmath>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/ocarina_upscale.h"
 #include "video_core/fsr.h"
@@ -34,7 +35,13 @@ TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and f
     using enum VideoCommon::OcarinaUpscaleBackend;
     using VideoCommon::KeepOcarinaFsrLodBias;
     using VideoCommon::OcarinaFsrLodBias;
-    CHECK(OcarinaFsrLodBias(Fsr) == -1.58f);
+    const auto near = [](float value, float expected) { return std::abs(value - expected) < 0.01f; };
+    CHECK(near(OcarinaFsrLodBias(Fsr), -1.585f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 1440, 2160), -1.585f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 1080, 2160), -2.0f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 720, 2160), -2.585f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 1080, 1440), -1.415f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 1440, 1440), -1.0f));
     CHECK(OcarinaFsrLodBias(Dlss) == 0.0f);
     CHECK(OcarinaFsrLodBias(Native) == 0.0f);
     CHECK(KeepOcarinaFsrLodBias(true, false, false));

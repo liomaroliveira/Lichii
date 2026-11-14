@@ -110,6 +110,20 @@ std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
     return quality;
 }
 
+std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale() {
+    if (!values.ocarina_fsr.GetValue() || !IsDockedMode()) {
+        return std::nullopt;
+    }
+    switch (values.ocarina_fsr_render.GetValue()) {
+    case OcarinaFsrRender::Render1080p:
+        return NvidiaDlssQuality::Performance;
+    case OcarinaFsrRender::Render720p:
+        return NvidiaDlssQuality::UltraPerformance;
+    default:
+        return std::nullopt;
+    }
+}
+
 void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
     applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
                                        std::memory_order_relaxed);
