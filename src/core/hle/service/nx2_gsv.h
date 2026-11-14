@@ -291,8 +291,8 @@ private:
         request.syncpoint = syncpoint;
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
-        // The action runs on the GPU thread under the manager's lock, or inline if the value is
-        // already reached.
+        // The action runs on the thread that reaches the value, or inline if it is already
+        // reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
             [shared = m_shared, &kernel = system.Kernel(), &request, event] {
