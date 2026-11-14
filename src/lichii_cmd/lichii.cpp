@@ -52,6 +52,7 @@
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include "frontend_common/profile_import.h"
+#include "frontend_common/shader_disk_cache.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -524,6 +525,7 @@ static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
 }
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    FrontendCommon::SetUpShaderDiskCaches();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");

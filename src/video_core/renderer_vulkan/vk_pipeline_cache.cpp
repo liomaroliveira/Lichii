@@ -622,6 +622,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  "NVIDIA shader disk cache: __GL_SHADER_DISK_CACHE_PATH={}, "
                  "__GL_SHADER_DISK_CACHE_SIZE={}",
                  path != nullptr ? path : "unset", size != nullptr ? size : "unset");
+    } else if (driver_id == VK_DRIVER_ID_MESA_RADV ||
+               driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
+               driver_id == VK_DRIVER_ID_MESA_NVK ||
+               driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+        const char* const max_size = std::getenv("MESA_SHADER_CACHE_MAX_SIZE");
+        LOG_INFO(Render_Vulkan, "Mesa shader disk cache: MESA_SHADER_CACHE_MAX_SIZE={}",
+                 max_size != nullptr ? max_size : "unset");
     }
 #endif
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};

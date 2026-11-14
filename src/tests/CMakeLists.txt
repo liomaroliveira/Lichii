@@ -65,6 +65,7 @@ add_executable(tests
     core/nup_validation.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
+    frontend_common/shader_disk_cache.cpp
     core/vfs_vector.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
