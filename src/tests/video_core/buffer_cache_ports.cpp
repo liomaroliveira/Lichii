@@ -289,7 +289,8 @@ struct BufferCacheTestAccess {
         cache.memory_tracker.ForEachUploadRange(address, size, [](auto, auto) {});
         return id;
     }
-    static Buffer& Get(Cache& cache, BufferId id) {
+    template <class C>
+    static Buffer& Get(C& cache, BufferId id) {
         return cache.slot_buffers[id];
     }
     /// Add without the upload: guest memory not yet read into the buffer.
@@ -2663,4 +2664,93 @@ TEST_CASE("Claimed CPU writes keep their bytes when an earlier one downloads the
     REQUIRE(f.bytes[0x10800] == 0xbb);
     REQUIRE(f.bytes[0x1080f] == 0xbb);
     REQUIRE(f.bytes[0x10810] == 0x12);
+}
+
+namespace {
+/// Command list page 0x18000 (GPU 0x108000) of KeepFixture's buffer, read from its copies as the
+/// split's front reads them (DmaPusher::ReadGpuWrittenCommands).
+struct ListPageFixture : KeepFixture {
+    static constexpr DAddr Page = 0x18000;
+    static constexpr GPUVAddr PageGpu = 0x108000;
+
+    ListPageFixture() : KeepFixture{nullptr} {
+        Draw(nullptr); // Binds the channel DMACopy and DMAClear use.
+        Tegra::Nx2MarkCommandListPage(Page);
+    }
+    /// Collects the page writes of a dispatch or DMA operation and has the host GPU make the
+    /// copies taken after it, as the rasterizer does.
+    template <typename Func>
+    void Work(Func&& func) {
+        cache->Nx2CollectListCopies(true);
+        func();
+        if (cache->Nx2CopyListPages(runtime.CurrentTick())) {
+            runtime.Complete(runtime.SubmitForHostRead());
+        }
+        cache->Nx2CollectListCopies(false);
+    }
+    /// A dispatch that writes `value` over [address, address + size).
+    void Dispatch(DAddr address, u32 size, u8 value) {
+        Work([&] {
+            auto& buffer = Access::Get(*cache, id);
+            runtime.pending.push_back([&buffer, address, size, value] {
+                std::fill_n(buffer.bytes.begin() + static_cast<std::ptrdiff_t>(address - 0x10000),
+                            size, value);
+            });
+            Access::GpuWrite(*cache, id, address, size);
+        });
+    }
+    /// Whether the front reads [address, address + 0x20) from a copy that holds `value`.
+    bool CopyHolds(DAddr address, u8 value) {
+        std::array<u8, 0x20> out{};
+        if (cache->Nx2ReadListCopy(address, out, true) != KeepCache::Nx2ListRead::Copied) {
+            return false;
+        }
+        return std::ranges::all_of(out, [value](u8 byte) { return byte == value; });
+    }
+
+    const Nx2TitleScope nx2_title;
+};
+} // namespace
+
+TEST_CASE("A command list page is copied again after a DMA copy of data no GPU work wrote",
+          "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    // The source holds only what the CPU wrote, so none of the copied bytes are GPU-modified.
+    std::memset(f.bytes + 0x4000, 7, 0x20);
+    f.cache->WriteMemory(0x14000, 0x20);
+    f.Work([&] { REQUIRE(f.cache->DMACopy(0x104000, ListPageFixture::PageGpu, 0x20)); });
+    REQUIRE(f.bytes[0x8000] == 7);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 7));
+}
+
+TEST_CASE("A command list page is copied again after a DMA clear", "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    // MaxwellDMA writes guest memory once the cache cleared the buffer.
+    f.Work([&] { REQUIRE(f.cache->DMAClear(ListPageFixture::PageGpu, 8, 0x09090909)); });
+    std::memset(f.bytes + 0x8000, 9, 0x20);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 9));
+}
+
+TEST_CASE("A command list page's copy holds the CPU's bytes the buffer had not taken yet",
+          "[buffer_ports]") {
+    ListPageFixture f;
+    f.Dispatch(ListPageFixture::Page, 0x20, 3);
+    f.cache->DownloadMemory(ListPageFixture::Page, 0x1000);
+    REQUIRE(f.bytes[0x8000] == 3);
+
+    // Later CPU writes to the page reach no cache: only the first is reported.
+    std::memset(f.bytes + 0x8100, 5, 0x20);
+    f.cache->WriteMemory(ListPageFixture::Page + 0x100, 0x20);
+    REQUIRE_FALSE(f.CopyHolds(ListPageFixture::Page, 3));
+
+    f.Work([&] { REQUIRE(f.cache->DMAClear(ListPageFixture::PageGpu, 8, 0x09090909)); });
+    std::memset(f.bytes + 0x8000, 9, 0x20);
+    REQUIRE(f.CopyHolds(ListPageFixture::Page, 9));
+    REQUIRE(f.CopyHolds(ListPageFixture::Page + 0x100, 5));
 }
