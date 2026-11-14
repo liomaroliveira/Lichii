@@ -282,7 +282,9 @@ TEST_CASE("ShaderPrecache: every container the archive walker reads is discovere
                              "Shader/Loose.bnsh.zs", "Shader/Bundle.cgsb", "Shader/Bundle.cgsb.zs",
                              "Shader/Program.shn", "Shader/Program.shn.zs", "Shader/Archive.sharcb",
                              "Shader/Archive.sharcb.zs", "Shader/UPPER.BNSH", "Effect/Fx.bfsha.zs",
-                             "Shaders/Model.bfsha.zst"}) {
+                             "Shaders/Model.bfsha.zst", "Lib/agl/agl_ndsr.pck",
+                             "Lib/agl/agl_ndsr.pck.zs", "Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs",
+                             "Movie/Ndve/Network.pck"}) {
         INFO(path);
         REQUIRE(ClassifyGameFile(path) == GameFileKind::ShaderArchive);
     }
@@ -292,10 +294,11 @@ TEST_CASE("ShaderPrecache: every container the archive walker reads is discovere
     REQUIRE(ClassifyGameFile("Effect/Particle/Magic.ptcl.zst") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Effect/Particle/Magic.ptcl") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Pack/ZsDic.pack.zs") == GameFileKind::ZstdDictionaries);
-    for (const char* path : {"Effect/Sub/Fx.vsetb.byml.zs", "Model/Fx.vsetb.byml.zs",
+    for (const char* path : {"Effect/Sub/Fx.vsetb.byml", "Model/Fx.vsetb.byml.zs",
                              "Effect/Fx.vsetb.byml", "Effect/Sub/Fx.esetb.byml.zs",
                              "Model/Tex.bntx.zs", "Model/Mesh.bfres.zs", "Asset/assets_a000.dat",
-                             "Bin/Nvn2-upper_left.ndsr", "Shader/notes.shn.txt", "Shader/bnsh"}) {
+                             "Audio/Sound.pck", "Bin/Nvn2-upper_left.ndsr", "Shader/notes.shn.txt",
+                             "Shader/bnsh"}) {
         INFO(path);
         REQUIRE(ClassifyGameFile(path) == GameFileKind::Other);
     }
@@ -323,4 +326,152 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     const std::array<u8, 16> no_exit{};
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
+}
+
+namespace {
+
+void PutLe32(std::vector<u8>& buf, size_t offset, u32 value) {
+    std::memcpy(buf.data() + offset, &value, sizeof(value));
+}
+
+std::vector<u8> MakeControl(u32 stage_type, u32 declared, u32 allocation) {
+    std::vector<u8> control(0xe0, 0);
+    constexpr std::array<u8, 8> magic{0x34, 0x12, 0x76, 0x98, 0xc9, 0x00, 0x00, 0x00};
+    std::memcpy(control.data(), magic.data(), magic.size());
+    PutLe32(control, 56, declared);
+    PutLe32(control, 68, allocation);
+    PutLe32(control, 84, stage_type << 16);
+    PutLe32(control, 88, 8);
+    PutLe32(control, 92, 8);
+    PutLe32(control, 96, 1);
+    return control;
+}
+
+std::vector<u8> MakeSampleNdsr() {
+    struct Entry {
+        u32 type;
+        std::vector<u8> control;
+        std::vector<u8> code;
+    };
+    std::vector<Entry> entries;
+    {
+        std::vector<u8> vcode(128 + 32, 0);
+        PutLe32(vcode, 0, 1U << 10); // GraphicsStages[0] = Vertex
+        entries.push_back({0, MakeControl(0, 32, 128 + 32), std::move(vcode)});
+    }
+    {
+        std::vector<u8> fcode(128 + 48, 0);
+        PutLe32(fcode, 0, 5U << 10); // GraphicsStages[4] = Fragment
+        entries.push_back({3, MakeControl(1, 48, 128 + 48), std::move(fcode)});
+    }
+    {
+        std::vector<u8> ccode(64, 0);
+        ccode[0] = 0x19;
+        entries.push_back({6, MakeControl(5, 48, 64), std::move(ccode)});
+    }
+
+    // 1 metadata item (type 11) + 6 control/code items = 7 items
+    const size_t item_count = 1 + entries.size() * 2;
+    const size_t table_end = 0x14 + item_count * 8;
+    std::vector<u8> out(table_end + 16, 0);
+    std::memcpy(out.data(), "NDSR\x00\x01\x01\x00", 8);
+    PutLe32(out, 0x0c, static_cast<u32>(item_count));
+    PutLe32(out, 0x14, static_cast<u32>(table_end));
+    PutLe32(out, 0x18, (16U << 4) | 11U);
+
+    size_t idx = 1;
+    for (const auto& entry : entries) {
+        const u32 ctrl_off = static_cast<u32>(out.size());
+        out.insert(out.end(), entry.control.begin(), entry.control.end());
+        const u32 code_off = static_cast<u32>(out.size());
+        out.insert(out.end(), entry.code.begin(), entry.code.end());
+        PutLe32(out, 0x14 + idx * 8, ctrl_off);
+        PutLe32(out, 0x14 + idx * 8 + 4,
+                (static_cast<u32>(entry.control.size()) << 4) | entry.type);
+        PutLe32(out, 0x14 + (idx + 1) * 8, code_off);
+        PutLe32(out, 0x14 + (idx + 1) * 8 + 4,
+                (static_cast<u32>(entry.code.size()) << 4) | (entry.type + 1));
+        idx += 2;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("ShaderPrecache: NDSR, NDVE and AAMP containers walk cleanly", "[video_core]") {
+    const std::vector<u8> ndsr = MakeSampleNdsr();
+    std::vector<ShaderWarm::ProgramStage> ndsr_stages;
+    std::vector<size_t> ndsr_sizes;
+    size_t errors = 0;
+    ShaderWarm::WalkArchive(
+        ndsr, "agl_ndsr.pck", nullptr,
+        [&](const ShaderWarm::ShaderRecord& r) {
+            ndsr_stages.push_back(r.stage);
+            ndsr_sizes.push_back(r.code.size());
+        },
+        [&](const std::string&) { ++errors; });
+    REQUIRE(errors == 0);
+    REQUIRE(ndsr_stages == std::vector<ShaderWarm::ProgramStage>{
+                               ShaderWarm::ProgramStage::Vertex,
+                               ShaderWarm::ProgramStage::Fragment,
+                               ShaderWarm::ProgramStage::Compute});
+    REQUIRE(ndsr_sizes[2] == 48); // Compute uses declared size (48), not padded allocation (64)
+
+    // Build an NDVE wrapping the NDSR + one table (2 compute shaders) + a 1ALR trailer.
+    std::vector<u8> ndve(0x28, 0);
+    std::memcpy(ndve.data(), "NDVE\x05\x00\xf0\x0f", 8);
+    PutLe32(ndve, 0x0c, static_cast<u32>(ndsr.size()));
+    ndve.insert(ndve.end(), ndsr.begin(), ndsr.end());
+
+    const size_t table_start = ndve.size();
+    const u32 table_hdr_size = 8 + 16 * 1;
+    ndve.resize(table_start + table_hdr_size, 0);
+    PutLe32(ndve, table_start, 1); // 1 stage
+    PutLe32(ndve, table_start + 4, 0);
+    const auto table_ctrl = MakeControl(5, 64, 80);
+    const std::vector<u8> table_code(80, 0x2a);
+    const u32 to_ctrl = static_cast<u32>(ndve.size() - table_start);
+    ndve.insert(ndve.end(), table_ctrl.begin(), table_ctrl.end());
+    const u32 to_code = static_cast<u32>(table_ctrl.size());
+    ndve.insert(ndve.end(), table_code.begin(), table_code.end());
+    PutLe32(ndve, table_start + 8, to_ctrl);
+    PutLe32(ndve, table_start + 12, to_code);
+    PutLe32(ndve, table_start + 16, static_cast<u32>(table_code.size()));
+
+    const u32 rla_rel = static_cast<u32>(ndve.size() - table_start);
+    ndve.resize(ndve.size() + 8, 0);
+    PutLe32(ndve, ndve.size() - 8, rla_rel);
+    std::memcpy(ndve.data() + ndve.size() - 4, "1ALR", 4);
+    PutLe32(ndve, 0x10, static_cast<u32>(ndve.size() - table_start));
+
+    std::vector<ShaderWarm::ProgramStage> ndve_stages;
+    std::vector<size_t> ndve_sizes;
+    ShaderWarm::WalkArchive(
+        ndve, "Ndve-test.dat", nullptr,
+        [&](const ShaderWarm::ShaderRecord& r) {
+            ndve_stages.push_back(r.stage);
+            ndve_sizes.push_back(r.code.size());
+        },
+        [&](const std::string&) { ++errors; });
+    REQUIRE(errors == 0);
+    REQUIRE(ndve_stages.size() == 4);
+    REQUIRE(ndve_stages[3] == ShaderWarm::ProgramStage::Compute);
+    REQUIRE(ndve_sizes[3] == 64);
+
+    // AAMP parameter files are skipped quietly.
+    std::vector<u8> aamp(32, 0);
+    std::memcpy(aamp.data(), "AAMP\x02\x00\x00\x00", 8);
+    size_t aamp_records = 0;
+    ShaderWarm::WalkArchive(
+        aamp, "gsys.bgmsconf", nullptr, [&](const ShaderWarm::ShaderRecord&) { ++aamp_records; },
+        [&](const std::string&) { ++errors; });
+    REQUIRE(aamp_records == 0);
+    REQUIRE(errors == 0);
+
+    // Truncated NDSR header throws ArchiveError cleanly.
+    REQUIRE_THROWS_AS(
+        ShaderWarm::WalkArchive(
+            std::vector<u8>{'N', 'D', 'S', 'R', 0, 0, 0, 0}, "bad.pck", nullptr,
+            [&](const ShaderWarm::ShaderRecord&) {}, [&](const std::string&) {}),
+        ShaderWarm::ArchiveError);
 }

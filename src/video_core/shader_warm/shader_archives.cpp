@@ -766,6 +766,147 @@ std::vector<Record> ParseBahs(Bytes data) {
     return records;
 }
 
+/// Every stage program in an NDSR archive (AGL's neural/upscaler networks, magic "NDSR",
+/// standalone or embedded inside NDVE). Items are {u32 offset, u32 bytes << 4 | type}, pairing
+/// control items (types 0=vertex, 3=fragment, 6=compute) with the next code item (type + 1).
+std::vector<Record> ParseNdsr(Bytes data, u64 base = 0) {
+    Extent(data, base, 0x14);
+    if (!Is(data, base, "NDSR")) {
+        throw ArchiveError("invalid NDSR header");
+    }
+    const u64 count = Le<u32>(data, base + 0x0c);
+    Extent(data, base + 0x14, count * 8);
+    std::vector<Record> records;
+    for (u64 index = 0; index + 1 < count; ++index) {
+        const u64 item_offset = Le<u32>(data, base + 0x14 + 8 * index);
+        const u32 item_meta = Le<u32>(data, base + 0x14 + 8 * index + 4);
+        const u32 type = item_meta & 15;
+        if (type != 0 && type != 3 && type != 6) {
+            continue;
+        }
+        const u64 next_offset = Le<u32>(data, base + 0x14 + 8 * (index + 1));
+        const u32 next_meta = Le<u32>(data, base + 0x14 + 8 * (index + 1) + 4);
+        if ((next_meta & 15) != type + 1) {
+            continue;
+        }
+        const u64 item_bytes = item_meta >> 4;
+        const u64 ctrl_size = item_bytes != 0 ? item_bytes : 0xd8;
+        if (ctrl_size < 0xd8) {
+            throw ArchiveError("truncated NDSR control section");
+        }
+        const Bytes control = Extent(data, base + item_offset, ctrl_size);
+        const u32 expected_stage_type = type == 0 ? 0U : (type == 3 ? 1U : 5U);
+        if (!IsControlMagic(control) || (Le<u32>(control, 84) >> 16) != expected_stage_type) {
+            throw ArchiveError("NDSR control section disagrees with stage or magic");
+        }
+        const u64 declared = Le<u32>(control, 56);
+        const u64 allocation = Le<u32>(control, 68);
+        const u64 next_bytes = next_meta >> 4;
+        if (type == 6) {
+            if (declared == 0 || declared % 16 || (next_bytes != 0 && declared > next_bytes)) {
+                throw ArchiveError("invalid NDSR compute code extent");
+            }
+            records.push_back(
+                {ProgramStage::Compute, Extent(data, base + next_offset, declared), control});
+        } else {
+            const u64 gfx_size = allocation != 0 ? allocation : next_bytes;
+            if (next_bytes != 0 && gfx_size > next_bytes) {
+                throw ArchiveError("invalid NDSR graphics code extent");
+            }
+            const auto item = GraphicsRecord(Extent(data, base + next_offset, gfx_size), control);
+            const ProgramStage expected_stage =
+                type == 0 ? ProgramStage::Vertex : ProgramStage::Fragment;
+            if (item.stage != expected_stage) {
+                throw ArchiveError("NDSR record disagrees with the graphics header stage");
+            }
+            records.push_back(item);
+        }
+        ++index;
+    }
+    return records;
+}
+
+/// Video upscaler shader bundle ("NDVE"): an embedded NDSR at +0x28 followed by sequential
+/// stage tables ({u32 stage_count, u32 blob_count} -> blobs -> {u32 to_ctrl, u32 to_code,
+/// u32 code_span, u32 zero}) and an optional "1ALR" relocation trailer.
+std::vector<Record> ParseNdve(Bytes data) {
+    Extent(data, 0, 0x28);
+    if (!Is(data, 0, "NDVE")) {
+        throw ArchiveError("invalid NDVE header");
+    }
+    std::vector<Record> records;
+    if (data.size() >= 0x2c && Is(data, 0x28, "NDSR")) {
+        auto embedded = ParseNdsr(data, 0x28);
+        records.insert(records.end(), embedded.begin(), embedded.end());
+    }
+    const u64 ndsr_section = Le<u32>(data, 0x0c);
+    const u64 tail_section = Le<u32>(data, 0x10);
+    if (ndsr_section == 0 || tail_section == 0) {
+        return records;
+    }
+    const u64 table_base = 0x28 + ndsr_section;
+    if (table_base > data.size() || tail_section > data.size() - table_base) {
+        throw ArchiveError("invalid NDVE section extent");
+    }
+    u64 cursor_end = table_base + tail_section;
+    if (tail_section >= 8 && Is(data, cursor_end - 4, "1ALR")) {
+        const u64 rla_offset = Le<u32>(data, cursor_end - 8);
+        if (rla_offset <= tail_section) {
+            cursor_end = table_base + rla_offset;
+        }
+    }
+    u64 cursor = table_base;
+    while (cursor < cursor_end) {
+        Extent(data, cursor, 8);
+        const u64 stage_count = Le<u32>(data, cursor);
+        const u64 blob_count = Le<u32>(data, cursor + 4);
+        const u64 stages_offset = cursor + 8 + 8 * blob_count;
+        if (stage_count == 0 || stage_count >= 256 || blob_count >= 16 ||
+            stages_offset + stage_count * 16 > cursor_end) {
+            throw ArchiveError("invalid NDVE table header");
+        }
+        u64 next_cursor = stages_offset + stage_count * 16;
+        for (u64 b = 0; b < blob_count; ++b) {
+            const u64 blob_off = Le<u32>(data, cursor + 8 + 8 * b);
+            const u64 blob_size = Le<u32>(data, cursor + 8 + 8 * b + 4);
+            next_cursor = std::max(next_cursor, cursor + blob_off + blob_size);
+        }
+        for (u64 s = 0; s < stage_count; ++s) {
+            const u64 entry = stages_offset + 16 * s;
+            const u64 to_ctrl = Le<u32>(data, entry);
+            const u64 to_code = Le<u32>(data, entry + 4);
+            const u64 code_span = Le<u32>(data, entry + 8);
+            const u64 ctrl_off = cursor + to_ctrl;
+            const u64 code_off = ctrl_off + to_code;
+            const Bytes control = Extent(data, ctrl_off, 0xd8);
+            if (!IsControlMagic(control)) {
+                throw ArchiveError("invalid NDVE control header");
+            }
+            const u32 stage_type = Le<u32>(control, 84) >> 16;
+            const u64 declared = Le<u32>(control, 56);
+            const u64 allocation = Le<u32>(control, 68);
+            if (stage_type == 5) {
+                if (declared == 0 || declared % 16 || declared > code_span) {
+                    throw ArchiveError("invalid NDVE compute code extent");
+                }
+                records.push_back({ProgramStage::Compute, Extent(data, code_off, declared), control});
+            } else {
+                const u64 gfx_size = allocation != 0 ? allocation : code_span;
+                if (gfx_size > code_span) {
+                    throw ArchiveError("invalid NDVE graphics code extent");
+                }
+                records.push_back(GraphicsRecord(Extent(data, code_off, gfx_size), control));
+            }
+            next_cursor = std::max(next_cursor, code_off + code_span);
+        }
+        if (next_cursor <= cursor || next_cursor > cursor_end) {
+            throw ArchiveError("invalid NDVE table advance");
+        }
+        cursor = next_cursor;
+    }
+    return records;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Walker
 
@@ -835,6 +976,13 @@ struct Walker {
             Emit(ParseShn(data, metadata, code));
         } else if (Is(data, 0, "BAHS")) {
             Emit(ParseBahs(data));
+        } else if (Is(data, 0, "NDSR")) {
+            Emit(ParseNdsr(data));
+        } else if (Is(data, 0, "NDVE")) {
+            Emit(ParseNdve(data));
+        } else if (Is(data, 0, "AAMP")) {
+            // Engine parameter binary (gsys.*) embedded alongside shaders inside ApplicationPackage.
+            return;
         } else {
             const auto lower = Lower(name);
             for (const std::string_view skip :
@@ -911,6 +1059,10 @@ GameFileKind ClassifyGameFile(std::string_view path) {
         if (EndsWith(lower, extension)) {
             return GameFileKind::ShaderArchive;
         }
+    }
+    if ((path.starts_with("Movie/Ndve/") && (EndsWith(lower, ".dat") || EndsWith(lower, ".pck"))) ||
+        (path.starts_with("Lib/agl/") && EndsWith(lower, ".pck"))) {
+        return GameFileKind::ShaderArchive;
     }
     if (path.starts_with("Effect/") && path.find('/', 7) == std::string_view::npos &&
         (EndsWith(Lower(path), ".vsetb.byml.zs") || EndsWith(Lower(path), ".esetb.byml.zs"))) {

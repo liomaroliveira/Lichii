@@ -23,8 +23,8 @@ constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is built again at launch (WarmFilesStale). 2: Mario Kart World's .esetb
-/// effects. 3: .ptcl particle effects (Fire Emblem).
-constexpr u32 WarmBuilderVersion = 3;
+/// effects. 3: .ptcl particle effects (Fire Emblem). 4: NDSR and NDVE shader bundles.
+constexpr u32 WarmBuilderVersion = 4;
 
 using ComputeKey = std::array<u8, 24>;
 
