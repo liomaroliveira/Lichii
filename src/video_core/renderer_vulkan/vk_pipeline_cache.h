@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -95,6 +96,12 @@ struct hash<Vulkan::ComputePipelineCacheKey> {
 } // namespace std
 
 namespace Vulkan {
+
+/// Returns true when an environment variable value enables full disk-cache precompilation.
+[[nodiscard]] bool IsPrecompileAllEnv(const char* value) noexcept;
+
+/// Returns true when EDEN_NX2_PRECOMPILE_ALL requests full GPU disk-cache precompilation.
+[[nodiscard]] bool PrecompileAllRequested();
 
 class ComputePipeline;
 class DescriptorPool;
@@ -220,7 +227,15 @@ private:
                          std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback,
                          std::chrono::steady_clock::time_point load_begin, bool precache,
-                         bool build_at_boot);
+                         bool build_at_boot, bool precompile_all = false);
+
+    /// Compiles every compatible compute and graphics pipeline record into driver disk caches
+    /// without retaining VkPipeline handles in RAM, then precompiles warm-compute.bin.
+    void PrecompileAllV2(u64 title_id,
+                         std::span<const VideoCommon::ShaderCacheV2::LogRecord* const> plan,
+                         std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback,
+                         std::chrono::steady_clock::time_point load_begin);
 
     /// Reads a v2 graphics record and translates its pipeline, left for Build(). Null when it
     /// doesn't translate, `incomplete` when the record lacks a value the translation reads.
@@ -261,7 +276,9 @@ private:
     /// are the background prebuild's. Reports progress through `callback` and returns when it is
     /// done, skipped from the loading screen or the load is stopped.
     void PrecacheShaders(u64 title_id, std::stop_token stop_loading,
-                         const VideoCore::DiskResourceLoadCallback& callback);
+                         const VideoCore::DiskResourceLoadCallback& callback,
+                         const std::unordered_set<ComputePipelineCacheKey>* already_built = nullptr,
+                         bool ignore_marker = false);
 
     const Device& device;
     Scheduler& scheduler;

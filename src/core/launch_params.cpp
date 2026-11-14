@@ -50,6 +50,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"clear-nup-icon", no_argument, 0, 0x105},
         {"clear-nup-version", no_argument, 0, 0x106},
         {"clear-nup-publisher", no_argument, 0, 0x107},
+        {"precompile-all", no_argument, 0, 0x108},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -105,6 +106,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             case 0x107:
                 p.edit_nup_publisher = std::string{};
+                break;
+            case 0x108:
+                p.precompile_all = true;
                 break;
             case 'i': {
                 p.input_profile = std::string(optarg);
@@ -223,6 +227,10 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
     if (lp.force_null_render) {
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
     }
+    if (lp.precompile_all) {
+        Settings::values.use_disk_shader_cache = true;
+        Settings::values.use_vulkan_driver_pipeline_cache = true;
+    }
 
     if (lp.print_version) {
         LOG_INFO(Frontend, "Eden {} {}", Common::g_scm_branch, Common::g_scm_desc);
@@ -248,7 +256,9 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--edit-nup <file.nup> [--nup-name NAME --nup-icon PATH --nup-version VER"
             " --nup-publisher NAME --clear-nup-name --clear-nup-icon --clear-nup-version"
             " --clear-nup-publisher]"
-            " Rewrite default-language NUP metadata in place and exit\n",
+            " Rewrite default-language NUP metadata in place and exit\n"
+            "--precompile-all"
+            " Warm shaders and precompile 100% of cached pipelines to GPU disk cache, then exit\n",
             lp.argv0
         );
     }

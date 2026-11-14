@@ -38,6 +38,7 @@ struct LaunchParams {
     bool fullscreen = false;
     bool force_null_render = false;
     bool force_single_core = false;
+    bool precompile_all = false;
     // print
     bool print_version = false;
     bool print_help = false;

@@ -1253,11 +1253,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     auto boot_lock_path = boot_marker;
     boot_lock_path += ".lock";
     const Common::FS::FileLock boot_lock{boot_lock_path};
+    const bool precompile_all = PrecompileAllRequested() && !boot_lock.Busy();
     const bool build_at_boot =
-        boot_lock.Held() ? !Common::FS::Exists(boot_marker) : !boot_lock.Busy();
+        boot_lock.Held() ? (!Common::FS::Exists(boot_marker) || precompile_all) : !boot_lock.Busy();
     if (boot_lock.Busy()) {
         LOG_WARNING(Render_Vulkan, "Shader cache v2: another emulator is loading this title's "
                                    "cache; building none at boot this time");
+    } else if (precompile_all && Common::FS::Exists(boot_marker)) {
+        LOG_INFO(Render_Vulkan,
+                 "Shader cache v2: ignoring stale boot marker for EDEN_NX2_PRECOMPILE_ALL run");
     } else if (!build_at_boot) {
         LOG_WARNING(Render_Vulkan, "Shader cache v2: the last boot ended while building cached "
                                    "pipelines; building none at boot this time");
@@ -1307,9 +1311,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const bool precache =
-        ShaderWarm::PrecacheBeforeStart(Settings::values.precache_shaders.GetValue(),
-                                        ShaderWarm::TakeWarmBeforeStart()) &&
-        build_at_boot;
+        precompile_all ||
+        (ShaderWarm::PrecacheBeforeStart(Settings::values.precache_shaders.GetValue(),
+                                         ShaderWarm::TakeWarmBeforeStart()) &&
+         build_at_boot);
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
@@ -1328,7 +1333,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     Common::FS::PathToUTF8String(boot_marker));
     }
     LoadPipelinesV2(title_id, std::move(log_v2), stop_loading, callback, load_begin, precache,
-                    build_at_boot);
+                    build_at_boot, precompile_all);
     if (boot_lock.Held()) {
         Common::FS::RemoveFile(boot_marker);
     }
@@ -1435,12 +1440,37 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::TranslateCachedGraphics(
     return pipeline;
 }
 
+bool IsPrecompileAllEnv(const char* value) noexcept {
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const std::string_view text{value};
+    const auto iequals = [text](std::string_view candidate) {
+        if (text.size() != candidate.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < text.size(); ++i) {
+            const char c =
+                text[i] >= 'A' && text[i] <= 'Z' ? static_cast<char>(text[i] - 'A' + 'a') : text[i];
+            if (c != candidate[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    return text == "1" || iequals("true") || iequals("yes") || iequals("on");
+}
+
+bool PrecompileAllRequested() {
+    return IsPrecompileAllEnv(std::getenv("EDEN_NX2_PRECOMPILE_ALL"));
+}
+
 void PipelineCache::LoadPipelinesV2(u64 title_id,
                                     std::shared_ptr<const VideoCommon::ShaderCacheV2::LogFile> log,
                                     std::stop_token stop_loading,
                                     const VideoCore::DiskResourceLoadCallback& callback,
                                     std::chrono::steady_clock::time_point load_begin, bool precache,
-                                    bool build_at_boot) {
+                                    bool build_at_boot, bool precompile_all) {
     namespace CacheV2 = VideoCommon::ShaderCacheV2;
     namespace StutterTrace = VideoCommon::StutterTrace;
     using CacheV2::RecordKind;
@@ -1575,6 +1605,12 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     }
     for (const CacheV2::LogRecord& record : relinked_records) {
         plan.push_back(&record);
+    }
+
+    if (precompile_all) {
+        PrecompileAllV2(title_id, plan, stop_loading, callback, load_begin);
+        scheduled_prebuild.reset();
+        return;
     }
 
     size_t graphics_records = 0;
@@ -1918,6 +1954,293 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     }
 }
 
+void PipelineCache::PrecompileAllV2(
+    u64 title_id, std::span<const VideoCommon::ShaderCacheV2::LogRecord* const> plan,
+    std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback,
+    std::chrono::steady_clock::time_point load_begin) {
+    namespace CacheV2 = VideoCommon::ShaderCacheV2;
+    using CacheV2::RecordKind;
+    using VideoCommon::ShaderJobPriority;
+
+    if (use_vulkan_pipeline_cache) {
+        size_t size = 0;
+        vulkan_pipeline_cache.Read(&size, nullptr);
+        last_cache_size.store(size, std::memory_order_relaxed);
+        last_flush = std::chrono::steady_clock::now();
+    }
+
+    ::Common::unordered_map<ComputePipelineCacheKey, std::vector<const CacheV2::LogRecord*>>
+        compute_keys;
+    std::vector<std::pair<GraphicsPipelineCacheKey, const CacheV2::LogRecord*>> graphics_jobs;
+    size_t compute_records = 0;
+    size_t graphics_records = 0;
+    size_t unfit_graphics = 0;
+    size_t duplicate_graphics = 0;
+    size_t invalid_records = 0;
+
+    for (const CacheV2::LogRecord* const planned : plan) {
+        if (stop_loading.stop_requested()) {
+            break;
+        }
+        const CacheV2::LogRecord& record = *planned;
+        if (record.kind == RecordKind::Compute) {
+            ++compute_records;
+            const auto key = PipelineRecordKey<ComputePipelineCacheKey>(record.payload);
+            if (!key) {
+                ++invalid_records;
+                LOG_WARNING(Render_Vulkan, "Precompile-all: compute record {:016x} has no key",
+                            record.key);
+                continue;
+            }
+            compute_keys[*key].push_back(&record);
+            continue;
+        }
+        if (record.kind != RecordKind::Graphics) {
+            continue;
+        }
+        ++graphics_records;
+        const auto key = PipelineRecordKey<GraphicsPipelineCacheKey>(record.payload);
+        if (!key) {
+            ++invalid_records;
+            LOG_WARNING(Render_Vulkan, "Precompile-all: graphics record {:016x} has no key",
+                        record.key);
+            continue;
+        }
+        if (!KeyFitsDevice(*key)) {
+            ++unfit_graphics;
+            continue;
+        }
+        if (!disk_pipelines.insert(key->Hash()).second) {
+            ++duplicate_graphics;
+            continue;
+        }
+        graphics_jobs.emplace_back(*key, &record);
+    }
+
+    const size_t total = compute_keys.size() + graphics_jobs.size();
+    LOG_INFO(Render_Vulkan,
+             "Precompile-all: starting {:016x} ({} compute jobs from {} records, {} graphics jobs "
+             "from {} records, {} duplicate, {} unfit for device, {} unreadable)",
+             title_id, compute_keys.size(), compute_records, graphics_jobs.size(),
+             graphics_records, duplicate_graphics, unfit_graphics, invalid_records);
+
+    struct PrecompileState {
+        std::mutex mutex;
+        std::atomic<size_t> done{};
+        size_t compute_built{};
+        size_t compute_failed{};
+        size_t graphics_built{};
+        size_t graphics_failed{};
+        size_t graphics_incomplete{};
+        std::unordered_set<ComputePipelineCacheKey> built_compute;
+    } state;
+
+    auto& jobs = *shader_jobs;
+    const VideoCommon::ShaderJobBatch batch = jobs.CreateBatch();
+    const std::stop_callback cancel_batch{stop_loading, [&jobs, batch] { jobs.Cancel(batch); }};
+
+    for (auto& [key, key_records] : compute_keys) {
+        u64 bytes = 0;
+        for (const CacheV2::LogRecord* rec : key_records) {
+            bytes = std::max<u64>(bytes, rec->payload.size());
+        }
+        jobs.Submit(
+            {
+                .priority = ShaderJobPriority::Background,
+                .cpu_bytes = TranslationBytes(bytes),
+                .driver_bytes = DriverCompileBytes,
+                .cpu = [this, &state, key, key_records = std::move(key_records)](
+                           VideoCommon::ShaderJobContext& context) -> VideoCommon::ShaderDriverStage {
+                    std::vector<CachedComputeTranslation> candidates;
+                    for (const CacheV2::LogRecord* record : key_records) {
+                        Common::UniqueFunction<void, std::istream&, FileEnvironment> read_compute{
+                            [&](std::istream& file, FileEnvironment env) {
+                                ComputePipelineCacheKey read_key;
+                                file.read(reinterpret_cast<char*>(&read_key), sizeof(read_key));
+                                VideoCommon::CheckComputeRecord(env, read_key.shared_memory_size,
+                                                                read_key.workgroup_size);
+                                candidates.push_back({std::move(env), {}});
+                            }};
+                        Common::UniqueFunction<void, std::istream&, std::vector<FileEnvironment>>
+                            read_graphics{[](std::istream&, std::vector<FileEnvironment>) {
+                                throw std::ios_base::failure(
+                                    "Graphics pipeline in another kind of record");
+                            }};
+                        try {
+                            VideoCommon::ReadPipelinePayload(record->payload, read_compute,
+                                                             read_graphics);
+                        } catch (const std::ios_base::failure& e) {
+                            LOG_DEBUG(Render_Vulkan,
+                                      "Precompile-all: compute record {:016x} read error: {}",
+                                      record->key, e.what());
+                        }
+                    }
+                    OrderComputeTranslations(candidates);
+                    ShaderPools pools;
+                    ComputePipelineCacheEntry entry;
+                    for (size_t chosen = 0;
+                         chosen < candidates.size() && !context.StopRequested(); ++chosen) {
+                        pools.ReleaseContents();
+                        entry = CreateComputePipeline(pools, key, candidates[chosen].env, nullptr,
+                                                      false);
+                        if (entry.pipeline) {
+                            break;
+                        }
+                    }
+                    if (!entry.pipeline) {
+                        {
+                            std::scoped_lock lock{state.mutex};
+                            ++state.compute_failed;
+                        }
+                        state.done.fetch_add(1, std::memory_order_relaxed);
+                        return {};
+                    }
+                    return [key, &state,
+                            pipeline = std::move(entry.pipeline)]() mutable {
+                        bool ok = false;
+                        try {
+                            pipeline->Build();
+                            ok = pipeline->IsBound();
+                        } catch (const std::exception& e) {
+                            LOG_DEBUG(Render_Vulkan,
+                                      "Precompile-all: compute build {:016x} failed: {}",
+                                      key.Hash(), e.what());
+                        }
+                        pipeline.reset();
+                        {
+                            std::scoped_lock lock{state.mutex};
+                            if (ok) {
+                                ++state.compute_built;
+                                state.built_compute.insert(key);
+                            } else {
+                                ++state.compute_failed;
+                            }
+                        }
+                        state.done.fetch_add(1, std::memory_order_relaxed);
+                    };
+                },
+            },
+            &batch);
+    }
+    compute_keys.clear();
+
+    for (const auto& [key, record] : graphics_jobs) {
+        jobs.Submit(
+            {
+                .priority = ShaderJobPriority::Background,
+                .cpu_bytes = TranslationBytes(record->payload.size()),
+                .driver_bytes = DriverCompileBytes,
+                .cpu = [this, &state, key, record](VideoCommon::ShaderJobContext& context)
+                    -> VideoCommon::ShaderDriverStage {
+                    std::unique_ptr<GraphicsPipeline> pipeline;
+                    bool incomplete{};
+                    if (!context.StopRequested()) {
+                        try {
+                            pipeline =
+                                TranslateCachedGraphics(record->payload, key, nullptr, incomplete);
+                        } catch (const std::ios_base::failure& e) {
+                            LOG_DEBUG(Render_Vulkan,
+                                      "Precompile-all: graphics record {:016x} read error: {}",
+                                      record->key, e.what());
+                        }
+                    }
+                    if (!pipeline) {
+                        {
+                            std::scoped_lock lock{state.mutex};
+                            if (incomplete) {
+                                ++state.graphics_incomplete;
+                            } else {
+                                ++state.graphics_failed;
+                            }
+                        }
+                        state.done.fetch_add(1, std::memory_order_relaxed);
+                        return {};
+                    }
+                    return [&state, pipeline = std::move(pipeline)]() mutable {
+                        bool ok = false;
+                        try {
+                            pipeline->Build();
+                            ok = !pipeline->Failed();
+                        } catch (const std::exception& e) {
+                            LOG_DEBUG(Render_Vulkan, "Precompile-all: graphics build failed: {}",
+                                      e.what());
+                        }
+                        pipeline.reset();
+                        {
+                            std::scoped_lock lock{state.mutex};
+                            if (ok) {
+                                ++state.graphics_built;
+                            } else {
+                                ++state.graphics_failed;
+                            }
+                        }
+                        state.done.fetch_add(1, std::memory_order_relaxed);
+                    };
+                },
+            },
+            &batch);
+    }
+
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Build, 0, total);
+    }
+    size_t last_flushed_done = 0;
+    while (!batch.Idle()) {
+        if (stop_loading.stop_requested()) {
+            jobs.Cancel(batch);
+            break;
+        }
+        const size_t done = state.done.load(std::memory_order_relaxed);
+        if (callback) {
+            callback(VideoCore::LoadCallbackStage::Build, done, total);
+        }
+        if (done - last_flushed_done >= VULKAN_CACHE_FLUSH_PIPELINES) {
+            pipelines_since_flush += done - last_flushed_done;
+            last_flushed_done = done;
+            QueueVulkanPipelineCacheFlush();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    batch.Wait();
+    if (callback) {
+        callback(VideoCore::LoadCallbackStage::Build, state.done.load(std::memory_order_relaxed),
+                 total);
+    }
+
+    const double build_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin).count();
+    {
+        std::scoped_lock lock{state.mutex};
+        LOG_INFO(Render_Vulkan,
+                 "Precompile-all cached v2{}: {:.1f} s, compute {} built / {} failed, graphics "
+                 "{} built / {} incomplete / {} failed",
+                 stop_loading.stop_requested() ? " stopped" : "", build_seconds,
+                 state.compute_built, state.compute_failed, state.graphics_built,
+                 state.graphics_incomplete, state.graphics_failed);
+    }
+
+    if (!stop_loading.stop_requested()) {
+        std::unordered_set<ComputePipelineCacheKey> built_compute_copy;
+        {
+            std::scoped_lock lock{state.mutex};
+            built_compute_copy = std::move(state.built_compute);
+        }
+        PrecacheShaders(title_id, stop_loading, callback, &built_compute_copy, true);
+    }
+
+    serialization_thread.WaitForRequests();
+    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                     CACHE_VERSION);
+        size_t size = 0;
+        vulkan_pipeline_cache.Read(&size, nullptr);
+        last_cache_size.store(size, std::memory_order_relaxed);
+        last_flush = std::chrono::steady_clock::now();
+    }
+    LOG_INFO(Render_Vulkan, "Precompile-all finished {:016x} in {:.1f} s", title_id,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin).count());
+}
+
 namespace {
 /// The precache marker's variant: the build's SPIR-V emission stamp and the settings that change
 /// what the driver gets for a precache build. Resolution scaling bakes the scale into the
@@ -1938,8 +2261,9 @@ u64 WarmVariant() {
 }
 } // Anonymous namespace
 
-void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
-                                    const VideoCore::DiskResourceLoadCallback& callback) {
+void PipelineCache::PrecacheShaders(
+    u64 title_id, std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback,
+    const std::unordered_set<ComputePipelineCacheKey>* already_built, bool ignore_marker) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     std::vector<PrecacheJob> jobs;
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
@@ -1956,7 +2280,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
     if (!std::filesystem::exists(warm_file, ec)) {
         LOG_INFO(Render_Vulkan, "Shader precache: no precache file at {}", path);
-    } else if (current && marker && marker->Matches(*current)) {
+    } else if (!ignore_marker && current && marker && marker->Matches(*current)) {
         LOG_INFO(Render_Vulkan, "Shader precache: compute programs already done for this driver");
     } else {
         // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
@@ -1995,7 +2319,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 file.read(reinterpret_cast<char*>(&key), sizeof(key));
                 ++file_entries;
                 // Programs already in the disk cache were built above; leave them out.
-                if (compute_cache.contains(key)) {
+                if (compute_cache.contains(key) ||
+                    (already_built != nullptr && already_built->contains(key))) {
                     continue;
                 }
                 const u64 cpu_bytes = TranslationBytes(env.MemorySize());

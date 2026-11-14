@@ -617,6 +617,19 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+    if (lp.precompile_all) {
+        if (!lp.force_null_render) {
+            Settings::values.renderer_backend = Settings::RendererBackend::Vulkan;
+        }
+        Settings::values.use_disk_shader_cache = true;
+        Settings::values.use_vulkan_driver_pipeline_cache = true;
+#ifdef _WIN32
+        _putenv_s("EDEN_NX2_PRECOMPILE_ALL", "1");
+#else
+        setenv("EDEN_NX2_PRECOMPILE_ALL", "1", 1);
+#endif
+    }
+
     state->network_initialized = Network::Init();
     if (!state->network_initialized) {
         LOG_CRITICAL(Network, "Failed to initialize room networking");
@@ -742,14 +755,89 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
     }
 
+    if (lp.precompile_all) {
+        namespace ShaderWarm = VideoCommon::ShaderWarm;
+        const u64 title_id = state->system.GetApplicationProcessProgramID();
+        const auto warm_path = ShaderWarm::ComputeWarmPath(title_id);
+        if (const auto stale = ShaderWarm::WarmFilesStale(warm_path)) {
+            fmt::print(stderr, "Precompile-all: building warm compute shaders ({})...\n", *stale);
+            std::fflush(stderr);
+            std::string last_stage;
+            auto last_print = std::chrono::steady_clock::now();
+            const auto warm_begin = last_print;
+            const auto on_warm = [&](const ShaderWarm::Progress& progress) {
+                const auto now = std::chrono::steady_clock::now();
+                if (progress.stage == last_stage && now - last_print < std::chrono::seconds{5}) {
+                    return;
+                }
+                last_stage = progress.stage;
+                last_print = now;
+                fmt::print(stderr, "Precompile-all warm [{:6.1f}s] {}: {}/{}\n",
+                           std::chrono::duration<double>(now - warm_begin).count(),
+                           progress.stage, progress.done, progress.total);
+                std::fflush(stderr);
+            };
+            const auto warm_res =
+                ShaderWarm::BuildWarmFiles(state->system, lp.filepath, title_id, on_warm, {});
+            if (!warm_res.ok) {
+                fmt::print(stderr, "Precompile-all: warm build failed: {}\n", warm_res.error);
+                return SDL_APP_FAILURE;
+            }
+            fmt::print(stderr, "Precompile-all: warm build complete ({} compute entries)\n",
+                       warm_res.compute_programs);
+            std::fflush(stderr);
+        }
+    }
+
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
+        std::optional<VideoCore::LoadCallbackStage> last_stage;
+        auto last_progress = std::chrono::steady_clock::now();
+        const auto precompile_begin = last_progress;
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+            [&](VideoCore::LoadCallbackStage stage, size_t value, size_t total) {
+                if (!lp.precompile_all) {
+                    return;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                const bool stage_changed = !last_stage || *last_stage != stage;
+                const bool finished = total > 0 && value >= total;
+                if (!stage_changed && !finished &&
+                    now - last_progress < std::chrono::seconds{2}) {
+                    return;
+                }
+                last_stage = stage;
+                last_progress = now;
+                const char* label = "Prepare";
+                switch (stage) {
+                case VideoCore::LoadCallbackStage::Prepare:
+                    label = "Prepare";
+                    break;
+                case VideoCore::LoadCallbackStage::Build:
+                    label = "Build";
+                    break;
+                case VideoCore::LoadCallbackStage::Warm:
+                    label = "Warm";
+                    break;
+                case VideoCore::LoadCallbackStage::Complete:
+                    label = "Complete";
+                    break;
+                }
+                fmt::print(stderr, "Precompile-all [{:6.1f}s] {}: {}/{}\n",
+                           std::chrono::duration<double>(now - precompile_begin).count(), label,
+                           value, total);
+                std::fflush(stderr);
+            });
+    }
+
+    if (lp.precompile_all) {
+        fmt::print(stderr, "Precompile-all: finished cleanly, shutting down.\n");
+        std::fflush(stderr);
+        return SDL_APP_SUCCESS;
     }
 
     // don't do anything, SDL3 already exists for us :D
