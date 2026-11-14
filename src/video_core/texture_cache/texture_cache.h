@@ -4002,7 +4002,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     } while (has_deleted_images);
     has_deleted_images = delete_state;
     if (!image_id) {
-        return NULL_IMAGE_VIEW_ID;
+        // No attachment rather than the null view: it has no render target view, and a
+        // framebuffer made with it hands the driver a null handle (AMD: access violation).
+        return ImageViewId{};
     }
     Image& image = slot_images[image_id];
     const ImageViewType view_type = RenderTargetImageViewType(info);
