@@ -1032,8 +1032,9 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
         .mixed_dot4_accelerated = properties.integer_dot_product
                                       .integerDotProduct4x8BitPackedMixedSignednessAccelerated !=
                                   VK_FALSE,
-        .descriptor_buffer = extensions.descriptor_buffer && extensions.buffer_device_address &&
-                             features.descriptor_indexing.runtimeDescriptorArray,
+        .descriptor_buffer = VideoCommon::HasFsr4PortDescriptorFeatures(
+            extensions.descriptor_buffer, features.buffer_device_address.bufferDeviceAddress,
+            features.descriptor_indexing.runtimeDescriptorArray),
         .synchronization2 = extensions.synchronization2,
         .compute_wave32 = extensions.subgroup_size_control &&
                           features.subgroup_size_control.computeFullSubgroups &&
