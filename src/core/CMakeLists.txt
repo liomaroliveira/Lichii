@@ -20,6 +20,7 @@ add_library(core STATIC
     game_settings.h
     core_timing.cpp
     core_timing.h
+    host_wait_margin.h
     cpu_manager.cpp
     cpu_manager.h
     launch_params.cpp
