@@ -1949,6 +1949,18 @@ void Device::RemoveUnsuitableExtensions() {
         LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
         extensions.mesh_shader = false;
     }
+    // RADV on RDNA2 (GFX10.3) faults on native task/mesh draws: TCP read faults at one fixed
+    // address per machine, then a ring timeout and often a MODE1 reset (#489, #1275, #1699), while
+    // the compute fallback ran for an hour. RADV exposes mesh shaders from GFX10.3 on and reports
+    // accelerated 16-bit dot products only before GFX11, which singles out GFX10.3 here.
+    const bool radv_rdna2_mesh =
+        extensions.mesh_shader && properties.driver.driverID == VK_DRIVER_ID_MESA_RADV &&
+        properties.integer_dot_product.integerDotProduct16BitUnsignedAccelerated;
+    if (radv_rdna2_mesh) {
+        LOG_INFO(Render_Vulkan, "RADV on RDNA2: task/mesh draws use the compute fallback, because "
+                                "native mesh draws fault the GPU there");
+        extensions.mesh_shader = false;
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
