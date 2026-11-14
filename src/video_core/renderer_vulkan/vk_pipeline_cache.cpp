@@ -538,6 +538,24 @@ struct DeferredCompute {
     std::vector<u32> reference_spirv;
 };
 
+/// EDEN_NX2_PREBUILD_STAGES=<n> runs at most n Background shader stages (prebuild, precache) at
+/// once; 0 or unset: no limit.
+size_t BackgroundShaderStages() {
+    const char* const value = std::getenv("EDEN_NX2_PREBUILD_STAGES");
+    return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : 0;
+}
+
+/// Skipped cached graphics pipelines the background prebuild may take. None by default in
+/// Ocarina of Time (0400486024DEC000), where prebuilding ~18k-25k unused pipelines across every
+/// worker adds severe CPU contention; EDEN_NX2_PREBUILD_MAX=<n> sets the cap for any title.
+size_t PrebuildMax(u64 title_id) {
+    constexpr u64 OcarinaTitleId = 0x0400486024DEC000ULL;
+    if (const char* const value = std::getenv("EDEN_NX2_PREBUILD_MAX")) {
+        return static_cast<size_t>(std::strtoull(value, nullptr, 10));
+    }
+    return title_id == OcarinaTitleId ? 0 : std::numeric_limits<size_t>::max();
+}
+
 struct DeferredStages {
     std::unique_ptr<QueuedIrBudget::Reservation> reservation;
     std::shared_ptr<ShaderPools> pools;
@@ -887,6 +905,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
         .cpu_threads = cpu_threads,
         .driver_threads = driver_threads,
+        .max_background_stages = BackgroundShaderStages(),
         .name = "VkShader",
     });
 }
@@ -1691,9 +1710,10 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         u64 payload_size;
         std::vector<u8> payload;
     };
+    const size_t prebuild_limit =
+        std::min(PrebuildLimit(kept_pipelines, queued_graphics), PrebuildMax(title_id));
     std::vector<PrebuildRecord> prebuild;
-    for (const auto& [index, key] : NewestFirst(std::move(skipped_graphics),
-                                                PrebuildLimit(kept_pipelines, queued_graphics))) {
+    for (const auto& [index, key] : NewestFirst(std::move(skipped_graphics), prebuild_limit)) {
         const CacheV2::LogRecord& record = *records[index];
         prebuild.push_back({
             .key = key,
@@ -1888,7 +1908,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             queued_graphics, chosen,
             build_all ? fmt::format(", {} more by build_all_cached_shaders", queued_spare) : "",
             skipped_pipelines, deferred_pipelines, skipped_pipelines - deferred_pipelines,
-            PrebuildLimit(kept_pipelines, queued_graphics));
+            prebuild_limit);
     }
 
     std::vector<DuplicateGraphicsRecord> no_duplicates;
