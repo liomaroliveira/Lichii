@@ -296,7 +296,7 @@ private:
                   StartGameType with_config = StartGameType::Normal);
     void BootGameFromList(const QString& filename, StartGameType with_config);
     void ShutdownGame();
-    void TerminateEmulationThread();
+    void ExitIfEmulationThreadStuck();
 
     void SetDiscordEnabled(bool state);
     void LoadAmiibo(const QString& filename);

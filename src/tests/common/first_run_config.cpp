@@ -306,7 +306,69 @@ TEST_CASE("Missing per-game and input profiles are not seeded", "[config]") {
     CheckFreshProfile();
 }
 
+namespace {
+
+std::string ReadText(const std::filesystem::path& path) {
+    std::ifstream file{path};
+    return {std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+}
+
+/// Temporary files a save left in the directory (qt-config.ini.tmp.<pid>.<n>).
+size_t SaveTemporaries(const std::filesystem::path& directory) {
+    return static_cast<size_t>(std::ranges::count_if(
+        std::filesystem::directory_iterator{directory}, [](const auto& entry) {
+            return entry.path().filename().string().starts_with("qt-config.ini.tmp.");
+        }));
+}
+
+constexpr const char* SharpeningConfig =
+    "[Renderer]\nfsr_sharpening_slider=83\nfsr_sharpening_slider\\default=false\n";
+
+} // namespace
+
+TEST_CASE("A config save replaces the file and ignores a leftover temporary file", "[config]") {
+    ConfigDirectory directory;
+    directory.Write("qt-config.ini", SharpeningConfig);
+    directory.Write("qt-config.ini.tmp", "left by a save that was killed");
+    FileConfig config{std::string{"qt-config"}};
+    config.SaveValues();
+    CHECK(ReadText(directory.path / "qt-config.ini").find("fsr_sharpening_slider=83") !=
+          std::string::npos);
+    CHECK(ReadText(directory.path / "qt-config.ini.tmp") == "left by a save that was killed");
+    CHECK(SaveTemporaries(directory.path) == 0);
+}
+
 #ifndef _WIN32
+TEST_CASE("A config save writes through a symlink and keeps it", "[config]") {
+    ConfigDirectory directory;
+    directory.Write("target.ini", SharpeningConfig);
+    std::filesystem::create_symlink("target.ini", directory.path / "qt-config.ini");
+    FileConfig config{std::string{"qt-config"}};
+    config.SaveValues();
+    CHECK(std::filesystem::is_symlink(directory.path / "qt-config.ini"));
+    CHECK(ReadText(directory.path / "target.ini").find("fsr_sharpening_slider=83") !=
+          std::string::npos);
+}
+
+TEST_CASE("A config save keeps a read-only config", "[config]") {
+    ConfigDirectory directory;
+    const auto filename = directory.path / "qt-config.ini";
+    directory.Write("qt-config.ini", SharpeningConfig);
+    std::filesystem::permissions(filename, std::filesystem::perms::owner_read);
+    if (std::ofstream{filename, std::ios::app}.is_open()) {
+        std::filesystem::permissions(filename, std::filesystem::perms::owner_read |
+                                                   std::filesystem::perms::owner_write);
+        SKIP("This user can write files despite restrictive permissions");
+    }
+    FileConfig config{std::string{"qt-config"}};
+    Settings::values.fsr_sharpening_slider.SetValue(20);
+    config.SaveValues();
+    std::filesystem::permissions(filename, std::filesystem::perms::owner_read |
+                                               std::filesystem::perms::owner_write);
+    CHECK(ReadText(filename) == SharpeningConfig);
+    CHECK(SaveTemporaries(directory.path) == 0);
+}
+
 TEST_CASE("A dangling config symlink is not a new user", "[config]") {
     ConfigDirectory directory;
     std::filesystem::create_symlink(directory.path / "target.ini",
