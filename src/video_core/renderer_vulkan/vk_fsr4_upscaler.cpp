@@ -6,6 +6,7 @@
 // and records into our command buffer. Picking the FSR 4 provider by version follows
 // CheezerWheezer's FSR 4 integration for CheezyEmu.
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -239,7 +240,22 @@ void Fsr4Upscaler::DestroyContext() {
 bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size) {
     DestroyContext();
     ffxCreateBackendVKDesc backend{};
+#if defined(__linux__)
+    // The pinned fsr4-vk community port recognizes the legacy Vulkan backend descriptor
+    // type (3). The current SDK puts the same three device fields in a nested struct.
+    static_assert(sizeof(ffxCreateBackendVKDesc) == sizeof(ffxCreateBackendVKDesc_DEPRECATED));
+    static_assert(offsetof(ffxCreateBackendVKDesc, deviceContext) ==
+                  offsetof(ffxCreateBackendVKDesc_DEPRECATED, vkDevice));
+    static_assert(offsetof(ffxCreateBackendVKDesc, deviceContext) +
+                      offsetof(VkDeviceContext, vkPhysicalDevice) ==
+                  offsetof(ffxCreateBackendVKDesc_DEPRECATED, vkPhysicalDevice));
+    static_assert(offsetof(ffxCreateBackendVKDesc, deviceContext) +
+                      offsetof(VkDeviceContext, vkDeviceProcAddr) ==
+                  offsetof(ffxCreateBackendVKDesc_DEPRECATED, vkDeviceProcAddr));
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
+#else
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+#endif
     backend.header.pNext = nullptr;
     backend.deviceContext = DeviceContext(device);
     ffxOverrideVersion version_override{};
