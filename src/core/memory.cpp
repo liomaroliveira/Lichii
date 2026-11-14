@@ -329,29 +329,22 @@ struct Memory::Impl {
         });
     }
 
-    [[nodiscard]] inline const u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
-        const auto first = current_page_table->entries[addr >> LICHII_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> LICHII_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
-        }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+    /// Returns a host pointer to [addr, addr + size) if the whole range is backed by one linear
+    /// host range, nullptr otherwise. Every page of such a range stores the same offset; block ids
+    /// can't prove it, since equal ids at the ends say nothing about a page remapped in between.
+    [[nodiscard]] u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
+        if (!AddressSpaceContains(*current_page_table, addr, size)) {
             return nullptr;
         }
-        return GetContiguousSpan(addr, size);
-    }
-    [[nodiscard]] inline u8* GetSpan(const VAddr addr, const std::size_t size) noexcept {
-        const auto first = current_page_table->entries[addr >> LICHII_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> LICHII_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
+        const u64 first_page = addr >> LICHII_PAGEBITS;
+        const u64 last_page = (addr + (size != 0 ? size - 1 : 0)) >> LICHII_PAGEBITS;
+        const uintptr_t offset = current_page_table->entries[first_page].Pointer(true);
+        for (u64 page = first_page + 1; page <= last_page; ++page) {
+            if (current_page_table->entries[page].Pointer(true) != offset) {
+                return nullptr;
+            }
         }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-            return nullptr;
-        }
-        return GetContiguousSpan(addr, size);
+        return GetPointerSilent(addr);
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
@@ -738,10 +731,6 @@ struct Memory::Impl {
             }
             const u16 current_block =
                 Common::PageTable::PageEntryData::BlockIdForMapping(mapping_id);
-            if (mapping_id == Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-                LOG_WARNING(HW_Memory,
-                            "Page table block ids are exhausted; validating spans page by page");
-            }
 
             page_table.entries.CommitRegion(base, end);
             while (base != end) {
@@ -806,24 +795,6 @@ struct Memory::Impl {
     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr), []() {}, []() {});
-    }
-
-    [[nodiscard]] u8* GetContiguousSpan(VAddr addr, std::size_t size) const noexcept {
-        u8* const base = GetPointerSilent(addr);
-        if (base == nullptr) {
-            return nullptr;
-        }
-
-        const VAddr end = addr + size;
-        const VAddr first_page = ((addr >> LICHII_PAGEBITS) + 1) << LICHII_PAGEBITS;
-        const std::uintptr_t base_ptr = reinterpret_cast<std::uintptr_t>(base);
-        for (VAddr page = first_page; page < end; page += LICHII_PAGESIZE) {
-            const std::uintptr_t expected = base_ptr + (page - addr);
-            if (reinterpret_cast<std::uintptr_t>(GetPointerSilent(page)) != expected) {
-                return nullptr;
-            }
-        }
-        return base;
     }
 
     /// @brief Reads a particular data type out of memory at the given virtual address.
