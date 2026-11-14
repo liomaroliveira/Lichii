@@ -838,6 +838,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
 
     LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(Settings::values.dyna_state.GetValue()));
+    const char* const mesa_max = std::getenv("MESA_SHADER_CACHE_MAX_SIZE");
+    const char* const nv_max = std::getenv("__GL_SHADER_DISK_CACHE_SIZE");
+    LOG_INFO(Render_Vulkan,
+             "Shader disk cache limits: MESA_SHADER_CACHE_MAX_SIZE={}, __GL_SHADER_DISK_CACHE_SIZE={}",
+             mesa_max != nullptr ? mesa_max : "(unset)",
+             nv_max != nullptr ? nv_max : "(unset)");
 
     dynamic_features = {};
     // Keys without the driver, so that a driver update keeps the recorded pipelines
