@@ -789,6 +789,7 @@ TEST_CASE("Built-in render scale follows Ocarina's FSR render resolution", "[pat
         ~SettingsGuard() {
             Settings::values.ocarina_fsr.SetValue(false);
             Settings::values.ocarina_fsr_render.SetValue(Settings::OcarinaFsrRender::Render1440p);
+            Settings::values.ocarina_fsr_output.SetValue(Settings::OcarinaFsrOutput::Output4K);
             Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
         }
     } guard;
@@ -798,6 +799,7 @@ TEST_CASE("Built-in render scale follows Ocarina's FSR render resolution", "[pat
     std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
     const auto scale = [&] { return WordAt(context.Manager().PatchNSO(nso, "main"), ScaleOffset); };
 
+    using Output = Settings::OcarinaFsrOutput;
     using Render = Settings::OcarinaFsrRender;
     using Quality = Settings::NvidiaDlssQuality;
     Settings::values.ocarina_fsr.SetValue(true);
@@ -812,6 +814,16 @@ TEST_CASE("Built-in render scale follows Ocarina's FSR render resolution", "[pat
         CHECK(scale() == word);
         CHECK(Settings::AppliedOcarinaRenderScale() == quality);
     }
+
+    // Full HD output caps default 1440p render down to 1080p at boot so FSR never downscales.
+    Settings::values.ocarina_fsr_output.SetValue(Output::Output1080p);
+    Settings::values.ocarina_fsr_render.SetValue(Render::Render1440p);
+    CHECK(scale() == 0x52A7E809);
+    CHECK(Settings::AppliedOcarinaRenderScale() == Quality::Performance);
+    Settings::values.ocarina_fsr_render.SetValue(Render::Render720p);
+    CHECK(scale() == 0x52A7E009);
+    CHECK(Settings::AppliedOcarinaRenderScale() == Quality::UltraPerformance);
+    Settings::values.ocarina_fsr_output.SetValue(Output::Output4K);
 
     Settings::values.ocarina_fsr_render.SetValue(Render::Render1080p);
     Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);

@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <string_view>
+
+#include "common/settings_enums.h"
 
 namespace VideoCommon {
 
@@ -43,6 +46,31 @@ inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend, unsigned render_he
 /// upscaler failed this session (the game's own pass runs again).
 constexpr bool KeepOcarinaFsrLodBias(bool docked, bool upscaler_failed, bool gpu_written) {
     return docked && !upscaler_failed && !gpu_written;
+}
+
+struct OcarinaExtent {
+    unsigned width;
+    unsigned height;
+};
+
+/// Resolves OoT's FSR reconstruction extent for Output4K / Output1440p / Output1080p, clamped so
+/// output is never smaller than the active render extent.
+constexpr OcarinaExtent ResolveOcarinaFsrOutput(Settings::OcarinaFsrOutput output,
+                                                unsigned min_width = 0,
+                                                unsigned min_height = 0) {
+    OcarinaExtent target{3840, 2160};
+    switch (output) {
+    case Settings::OcarinaFsrOutput::Output1440p:
+        target = {2560, 1440};
+        break;
+    case Settings::OcarinaFsrOutput::Output1080p:
+        target = {1920, 1080};
+        break;
+    case Settings::OcarinaFsrOutput::Output4K:
+    default:
+        break;
+    }
+    return {std::max(target.width, min_width), std::max(target.height, min_height)};
 }
 
 } // namespace VideoCommon

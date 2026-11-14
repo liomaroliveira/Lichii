@@ -450,8 +450,9 @@ struct Values {
                                                            Specialization::Default,
                                                            true,
                                                            false};
-    // The size FSR reconstructs to in Ocarina. Below 4K the result is stretched linearly to the
-    // game's 4K image: FSR 4's INT8 model costs far less at 1440p on GPUs without FP8.
+    // The size FSR reconstructs to in Ocarina (4K, 1440p, or 1080p). Below 4K the result is
+    // stretched linearly to the game's 4K image: FSR 4's INT8 model costs far less at 1440p/1080p
+    // on GPUs without FP8.
     SwitchableSetting<OcarinaFsrOutput> ocarina_fsr_output{linkage,
                                                            OcarinaFsrOutput::Output4K,
                                                            "ocarina_fsr_output",

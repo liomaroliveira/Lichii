@@ -204,10 +204,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "2560x1440 and leave FSR more to reconstruct, for more speed on slower GPUs. NVIDIA "
               "DLSS uses its own quality setting instead. Takes effect when a game starts."));
     INSERT(Settings, ocarina_fsr_output, tr("Ocarina FSR output resolution:"),
-           tr("The resolution FSR reconstructs Ocarina of Time to. At 1440p the result is "
-              "stretched to the game's 4K image: FSR 4 without FP8 hardware (its INT8 model on "
-              "RDNA 2 and 3) costs far less there, about 10 ms a frame less at 1080p input on a "
-              "Radeon 8060S. Takes effect when a game starts."));
+           tr("The resolution FSR reconstructs Ocarina of Time to. Below 4K (1440p or 1080p) the "
+              "result is stretched to the game's 4K image: FSR 4 without FP8 hardware (its INT8 "
+              "model on RDNA 2 and 3) costs far less there, and 1080p matches Full HD displays. "
+              "Takes effect when a game starts."));
 #if defined(__linux__) && !defined(__ANDROID__)
     INSERT(Settings, amd_fsr4, tr("Use FSR 4 (fsr4-vk community Vulkan port) in place of FSR 3.1"),
            tr("Uses fsr4-vk, a community Vulkan port of AMD's ML-based FSR 4.1.1 that Lichii's "
@@ -575,7 +575,8 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                            PAIR(OcarinaFsrRender, Render720p, tr("1280x720"))}});
     translations->insert({Settings::EnumMetadata<Settings::OcarinaFsrOutput>::Index(),
                           {PAIR(OcarinaFsrOutput, Output4K, tr("3840x2160")),
-                           PAIR(OcarinaFsrOutput, Output1440p, tr("2560x1440, stretched to 4K"))}});
+                           PAIR(OcarinaFsrOutput, Output1440p, tr("2560x1440, stretched to 4K")),
+                           PAIR(OcarinaFsrOutput, Output1080p, tr("1920x1080, stretched to 4K"))}});
     translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
                           {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (game resolution)")),
                            PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),

@@ -122,6 +122,10 @@ std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale() {
     case OcarinaFsrRender::Render720p:
         return NvidiaDlssQuality::UltraPerformance;
     default:
+        // Don't leave boot render at 1440p when targeting 1080p output (would downscale/fail FSR).
+        if (values.ocarina_fsr_output.GetValue() == OcarinaFsrOutput::Output1080p) {
+            return NvidiaDlssQuality::Performance;
+        }
         return std::nullopt;
     }
 }

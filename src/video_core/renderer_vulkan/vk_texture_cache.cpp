@@ -4702,10 +4702,10 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
                             : *scale == Quality::UltraPerformance ? 720
                                                                   : 1440;
         }
-        const u32 output_height = Settings::values.ocarina_fsr_output.GetValue() ==
-                                          Settings::OcarinaFsrOutput::Output1440p
-                                      ? 1440
-                                      : 2160;
+        const u32 output_height =
+            VideoCommon::ResolveOcarinaFsrOutput(
+                Settings::values.ocarina_fsr_output.GetValue(), 0, render_height)
+                .height;
         ocarina_fsr_lod_bias =
             ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device), render_height,
                                                      output_height)

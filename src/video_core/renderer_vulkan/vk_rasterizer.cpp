@@ -3934,14 +3934,21 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         if (oot_jitter_frame == render_trace_frame) {
             jitter = oot_jitter_offset;
         }
-        // FSR may reconstruct 1440p in place of 4K; the 4K composite stretches it to the game's image.
-        const bool fsr_1440p = oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
-                               Settings::values.ocarina_fsr_output.GetValue() ==
-                                   Settings::OcarinaFsrOutput::Output1440p;
-        const VkExtent2D output_extent = native_resolution ? extent
-                                         : upscale_4k      ? (fsr_1440p ? VkExtent2D{2560, 1440}
-                                                                        : VkExtent2D{3840, 2160})
-                                                           : target_extent;
+        // FSR may reconstruct 1080p/1440p in place of 4K; the 4K composite stretches it to 4K.
+        const VkExtent2D output_extent = [&]() -> VkExtent2D {
+            if (native_resolution) {
+                return extent;
+            }
+            if (!upscale_4k) {
+                return target_extent;
+            }
+            if (oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) {
+                const auto resolved = VideoCommon::ResolveOcarinaFsrOutput(
+                    Settings::values.ocarina_fsr_output.GetValue(), extent.width, extent.height);
+                return {resolved.width, resolved.height};
+            }
+            return {3840, 2160};
+        }();
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
                                                    extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),

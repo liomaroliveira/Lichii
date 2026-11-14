@@ -211,10 +211,12 @@ std::filesystem::path PortLibrary() {
     std::error_code ec;
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec) {
-        const std::filesystem::path bundled =
-            exe.parent_path().parent_path() / "lib" / PORT_LIBRARY;
-        if (std::filesystem::is_regular_file(bundled, ec)) {
-            return bundled;
+        for (const std::filesystem::path& bundled :
+             {exe.parent_path().parent_path() / "lib" / PORT_LIBRARY,
+              exe.parent_path() / "lib" / PORT_LIBRARY}) {
+            if (std::filesystem::is_regular_file(bundled, ec)) {
+                return bundled;
+            }
         }
     }
     const std::filesystem::path user = Folder() / PORT_LIBRARY;

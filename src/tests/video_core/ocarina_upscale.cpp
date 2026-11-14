@@ -42,6 +42,8 @@ TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and f
     CHECK(near(OcarinaFsrLodBias(Fsr, 720, 2160), -2.585f));
     CHECK(near(OcarinaFsrLodBias(Fsr, 1080, 1440), -1.415f));
     CHECK(near(OcarinaFsrLodBias(Fsr, 1440, 1440), -1.0f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 1080, 1080), -1.0f));
+    CHECK(near(OcarinaFsrLodBias(Fsr, 720, 1080), -1.585f));
     CHECK(OcarinaFsrLodBias(Dlss) == 0.0f);
     CHECK(OcarinaFsrLodBias(Native) == 0.0f);
     CHECK(KeepOcarinaFsrLodBias(true, false, false));
@@ -49,6 +51,21 @@ TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and f
     CHECK_FALSE(KeepOcarinaFsrLodBias(true, false, true));
     CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, false));
     CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, true));
+}
+
+TEST_CASE("OoT FSR output extent supports 4K, 1440p, and 1080p with render floor",
+          "[video_core][ocarina]") {
+    using enum Settings::OcarinaFsrOutput;
+    using VideoCommon::ResolveOcarinaFsrOutput;
+    const auto eq = [](VideoCommon::OcarinaExtent e, unsigned w, unsigned h) {
+        return e.width == w && e.height == h;
+    };
+    CHECK(eq(ResolveOcarinaFsrOutput(Output4K, 2560, 1440), 3840, 2160));
+    CHECK(eq(ResolveOcarinaFsrOutput(Output1440p, 1920, 1080), 2560, 1440));
+    CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 1920, 1080), 1920, 1080));
+    CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 1280, 720), 1920, 1080));
+    // Never shrink output below the active render extent.
+    CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 2560, 1440), 2560, 1440));
 }
 
 TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core][fsr][ocarina]") {
