@@ -160,6 +160,7 @@ add_executable(tests
     video_core/ssa_fixed_variables.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
+    video_core/ocarina_camera.cpp
     video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
