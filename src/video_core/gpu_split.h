@@ -19,6 +19,7 @@
 
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
+#include "video_core/nx2_fast_draw.h"
 
 namespace Core {
 class System;
@@ -193,6 +194,10 @@ public:
                                                     std::memory_order_relaxed)) {
         }
     }
+    /// Draw state belongs to the split back thread, or the sole GPU scheduler owner.
+    [[nodiscard]] static bool CanReuseDrawState() {
+        return OnBackThread() || OwnsScheduler();
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;
@@ -350,6 +355,9 @@ public:
     template <typename Func>
     void Run(const Func& func, DrainSite site = DrainSite::Other) {
         if (on_back_thread || !active) {
+            if (!on_back_thread) {
+                Nx2FastDraw::BreakUnsplit(Nx2FastDraw::Reason::Call);
+            }
             func();
             return;
         }

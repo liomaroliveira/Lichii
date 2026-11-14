@@ -261,6 +261,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 last_progress = std::chrono::steady_clock::now();
                 continue;
             }
+            // Match split Call boundaries before callbacks, flushes and invalidations, and
+            // conservatively end reuse at each submitted list, including channel changes.
+            VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
             if (!std::holds_alternative<SubmitListCommand>(next.data)) {
                 Tegra::DmaPusher::WaitForSnapshotCopies();
             }
