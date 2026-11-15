@@ -754,6 +754,22 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
 
     ImGui::Render();
     ImDrawData* draw_data = ImGui::GetDrawData();
+    if (static int logged = 0; logged < 3) {
+        ++logged;
+        int tex_ok = 0, tex_total = 0;
+        if (draw_data && draw_data->Textures) {
+            for (const ImTextureData* t : *draw_data->Textures) {
+                ++tex_total;
+                tex_ok += t->Status == ImTextureStatus_OK ? 1 : 0;
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "OotOverlay: serial {} lists {} vtx {} textures {}/{} ok, {}x{} fmt {} img {}/{}",
+                 present_serial_, draw_data ? draw_data->CmdListsCount : -1,
+                 draw_data ? draw_data->TotalVtxCount : -1, tex_ok, tex_total, extent.width,
+                 extent.height, static_cast<int>(swapchain_format), image_index,
+                 framebuffers_.size());
+    }
     if (!draw_data || draw_data->CmdListsCount == 0) {
         return;
     }

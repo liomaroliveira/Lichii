@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
 #include "common/oot_menu_bridge.h"
+#include "video_core/fsr4_support.h"
 #include "video_core/renderer_vulkan/present/vk_oot_imgui.h"
 #include "video_core/renderer_vulkan/present/vk_oot_menu.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
@@ -730,7 +731,25 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     if (!oot_menu) {
         oot_menu = std::make_unique<OotUi::OotMenuController>();
     }
+    if (oot_bridge.IsOcarina()) {
+        // Telemetry for the menu's FPS readout and the Upscaler row (FSR 4.1 needs fsr4-vk's model).
+        const auto now = std::chrono::steady_clock::now();
+        if (oot_last_present != std::chrono::steady_clock::time_point{}) {
+            oot_bridge.RecordPresentSample(
+                std::chrono::duration<double, std::milli>(now - oot_last_present).count());
+        }
+        oot_last_present = now;
+    }
     if (oot_menu->ShouldDraw(oot_bridge)) {
+        static const VideoCommon::Fsr4PortSupport fsr4 =
+            VideoCommon::CheckFsr4Port(device.Fsr4PortDevice());
+        const bool fsr4_on = Settings::values.amd_fsr4.GetValue() && fsr4.model.has_value();
+        const bool fsr3_on = Settings::values.ocarina_fsr.GetValue();
+        oot_bridge.UpdateRenderStats(
+            frame->width, frame->height, extent.width, extent.height,
+            fsr4_on ? "FSR 4.1" : (fsr3_on ? "FSR 3.1" : "Native"), fsr4.model.has_value(),
+            fsr4.model == VideoCommon::Fsr4PortModel::Int8, false, true,
+            frame->color_space != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
         if (!oot_overlay) {
             oot_overlay = std::make_unique<OotOverlay>(instance, device, memory_allocator, swapchain);
         }

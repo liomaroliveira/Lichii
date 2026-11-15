@@ -172,6 +172,7 @@ private:
     /// In-game OoT menu (E45): drawn on the swapchain image after the copy; nothing runs while closed.
     std::unique_ptr<OotOverlay> oot_overlay;
     std::unique_ptr<OotUi::OotMenuController> oot_menu;
+    std::chrono::steady_clock::time_point oot_last_present{};
 };
 
 } // namespace Vulkan
