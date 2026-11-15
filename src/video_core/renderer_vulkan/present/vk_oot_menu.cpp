@@ -322,8 +322,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
         {T::Graphics, RK::Slider, "rcas_sharp", "Nitidez RCAS (FSR)",
          "Força do filtro de nitidez AMD RCAS aplicado depois do FSR 3.1/4.1, na mesma escala da janela de configurações do Lichii: 0% desliga, 100% é o máximo. Muda ao vivo.",
          false, 0, 200, 10},
-        {T::Graphics, RK::Toggle, "oot_aa", "Antisserrilhamento Jogo",
-         "Remove o sharpening extra original do jogo que cria halos ao redor do texto quando combinado com FSR.",
+        {T::Graphics, RK::Toggle, "oot_aa", "Nitidez do Jogo (Nativo)",
+         "Só vale com o Upscaler em Nativo: mantém a reconstrução com nitidez original do jogo ou a troca por uma versão sem nitidez (sem halos). Com FSR 3.1/4.1 ligado, o FSR substitui esse passo do jogo e a nitidez passa a ser a do RCAS acima.",
          false, 0, 1, 1},
 
         {T::Graphics, RK::Heading, "h_win", "Janela e Pós-Processamento", "", false, 0, 0, 1},
@@ -997,8 +997,12 @@ void OotMenuController::TriggerRowAction(const char* id, Bridge& bridge) {
 
 bool OotMenuController::IsRowDisabled(const char* id, const TelemetrySnapshot& tel) const {
     if (std::strcmp(id, "fsr_output") == 0 || std::strcmp(id, "fsr_render") == 0 ||
-        std::strcmp(id, "rcas_sharp") == 0 || std::strcmp(id, "oot_aa") == 0) {
+        std::strcmp(id, "rcas_sharp") == 0) {
         return !Settings::values.ocarina_fsr.GetValue();
+    }
+    if (std::strcmp(id, "oot_aa") == 0) {
+        // The FSR replaces the game's output pass, so this toggle has no effect with it on (E47)
+        return Settings::values.ocarina_fsr.GetValue();
     }
     if (std::strcmp(id, "fg_mult") == 0) {
         return !Settings::values.frame_gen.GetValue();
@@ -1070,7 +1074,7 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
         return std::to_string(val) + "%";
     }
     if (std::strcmp(id, "oot_aa") == 0) {
-        return Tr(val != 0 ? "Sem Nitidez (Suave)" : "Original do Jogo");
+        return Tr(val != 0 ? "Sem Nitidez" : "Nitidez Original");
     }
     if (std::strcmp(id, "win_aa") == 0) {
         static constexpr std::array<const char*, 3> kLabs{"Nenhum", "FXAA", "SMAA"};
@@ -1843,12 +1847,17 @@ void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
                        static_cast<int>((val - r.lo) * 1000LL / std::max(1, r.hi - r.lo)), true,
                        &tx0, &tx1);
     } else if (r.kind == RowKind::Toggle) {
+        // Same labels as the full menu (E47: the compact bar said Off/On for the game sharpening)
+        const bool oot_aa = std::strcmp(r.id, "oot_aa") == 0;
         const char* lo_l = std::strcmp(r.id, "gpu_acc") == 0
                                ? "Baixa (Normal)"
-                               : (std::strcmp(r.id, "vram") == 0 ? "Conservador" : "Desligado");
+                               : (std::strcmp(r.id, "vram") == 0
+                                      ? "Conservador"
+                                      : (oot_aa ? "Nitidez Original" : "Desligado"));
         const char* hi_l = std::strcmp(r.id, "gpu_acc") == 0
                                ? "Alta"
-                               : (std::strcmp(r.id, "vram") == 0 ? "Agressivo" : "Ligado");
+                               : (std::strcmp(r.id, "vram") == 0 ? "Agressivo"
+                                                                  : (oot_aa ? "Sem Nitidez" : "Ligado"));
         DrawHalvesCell(c, va, vb, lo_l, hi_l, val != 0, true, disabled);
     } else {
         DrawChoiceCell(c, va, vb, val_str, true, !disabled && r.kind != RowKind::Action,
@@ -2117,7 +2126,7 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
                            ? "Conservador"
                            : (std::strcmp(r.id, "docked") == 0
                                   ? "Portátil (720p)"
-                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Original do Jogo"
+                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Nitidez Original"
                                                                       : "Desligado")));
             const char* hi_l =
                 std::strcmp(r.id, "gpu_acc") == 0
@@ -2126,7 +2135,7 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
                            ? "Agressivo"
                            : (std::strcmp(r.id, "docked") == 0
                                   ? "Dock (Alta Res.)"
-                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Sem Nitidez (Suave)"
+                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Sem Nitidez"
                                                                       : "Ligado")));
             DrawHalvesCell(c, va, vb, lo_l, hi_l, val != 0, is_sel, disabled);
         } else {
