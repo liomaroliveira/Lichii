@@ -464,9 +464,17 @@ struct System::Impl {
                         ram.installed ? "installed" : "usable");
         }
 
+        // The home menu (qlaunch) can start a Switch 2 game, which needs the 12 GiB layout from
+        // boot: give it to qlaunch when the host has the RAM. EDEN_QLAUNCH_12GB=0 turns it off.
+        const char* qlaunch_12gb = std::getenv("EDEN_QLAUNCH_12GB");
+        const bool qlaunch_switch2_ready =
+            params.program_id == 0x0100000000001000ull &&
+            !(qlaunch_12gb != nullptr && qlaunch_12gb[0] == '0') &&
+            !Common::IsBelowSwitch2RamMinimum(Common::GetHostRam());
+
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
-        if (switch2_program &&
+        if ((switch2_program || qlaunch_switch2_ready) &&
             Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
             LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
             Settings::values.memory_layout_mode.SetGlobal(false);

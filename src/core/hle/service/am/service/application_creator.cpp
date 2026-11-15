@@ -3,7 +3,12 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/cpu_features.h"
+#include "common/logging.h"
+#include "common/settings.h"
+#include "core/core.h"
 #include "core/file_sys/nca_metadata.h"
+#include "core/hle/kernel/k_system_control.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/am/applet.h"
@@ -30,6 +35,23 @@ Result CreateGuestApplication(SharedPointer<IApplicationAccessor>* out_applicati
 
     // Ensure we retrieved a program NCA.
     R_UNLESS(nca_raw != nullptr, ResultUnknown);
+
+    // A game started by the home menu skips System::Load, where the Switch 2 globals are set
+    // from the booted file. Set them here for a Switch 2 program: the current-program flag, the
+    // application program id the kernel reports, and the 31.25 MHz guest counter its SDK
+    // assumes. The counter only moves forward when raised, so it is left raised on exit.
+    // The 12 GiB memory layout has to be chosen at boot (System::Load does it for qlaunch).
+    if (const auto switch2_id = Core::FindSwitch2Program(nca_raw, program_id, 0)) {
+        LOG_INFO(Service_AM, "home menu start of Switch 2 program {:016X}", *switch2_id);
+        Settings::SetCurrentProgramIsSwitch2(true);
+        Kernel::KSystemControl::SetApplicationProgramId(*switch2_id);
+        if (std::getenv("EDEN_NX2_CNTFRQ") == nullptr) {
+            Common::g_wall_clock.SetGuestCNTFRQ(Common::WallClock::Switch2CNTFRQ);
+        }
+        if (Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
+            LOG_WARNING(Service_AM, "Switch 2 program started without the 12 GiB memory layout");
+        }
+    }
 
     std::vector<u8> control;
     std::unique_ptr<Loader::AppLoader> loader;
