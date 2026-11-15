@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +25,87 @@ using Bridge = Common::OotMenu::Bridge;
 using Key = Common::OotMenu::Key;
 using PcOptions = Common::OotMenu::PcOptions;
 using TelemetrySnapshot = Common::OotMenu::TelemetrySnapshot;
+
+/// E47.T13: CPU time of the emulator's front (guest GPU commands, thread "GPU") and back
+/// (host Vulkan, "GPUBack") threads, the split the harness measures with perf stat. Read from
+/// /proc/self/task/<tid>/schedstat every half second; Linux only, -1 elsewhere or when missing.
+class ThreadCpuSampler {
+public:
+    struct Load {
+        double front = -1.0; ///< fraction of one core, 0..1
+        double back = -1.0;
+    };
+
+    Load Sample() {
+#ifdef __linux__
+        const auto now = std::chrono::steady_clock::now();
+        if (last_.time_since_epoch().count() != 0 && now - last_ < std::chrono::milliseconds(500)) {
+            return load_;
+        }
+        const double wall_ns =
+            last_.time_since_epoch().count() == 0
+                ? 0.0
+                : static_cast<double>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_).count());
+        last_ = now;
+        load_.front = Step(front_, "GPU", wall_ns);
+        load_.back = Step(back_, "GPUBack", wall_ns);
+#endif
+        return load_;
+    }
+
+private:
+    struct Thread {
+        long tid = -1;
+        unsigned long long ns = 0;
+        bool primed = false;
+    };
+
+#ifdef __linux__
+    static long FindTid(const char* name) {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
+            std::ifstream comm(e.path() / "comm");
+            std::string got;
+            if (std::getline(comm, got) && got == name) {
+                return std::strtol(e.path().filename().c_str(), nullptr, 10);
+            }
+        }
+        return -1;
+    }
+
+    static bool ReadNs(long tid, unsigned long long& ns) {
+        std::ifstream f("/proc/self/task/" + std::to_string(tid) + "/schedstat");
+        return static_cast<bool>(f >> ns);
+    }
+
+    double Step(Thread& t, const char* name, double wall_ns) {
+        unsigned long long ns = 0;
+        if (t.tid < 0 || !ReadNs(t.tid, ns)) {
+            // Threads are remade with each game: look the name up again (one directory scan).
+            t = {};
+            t.tid = FindTid(name);
+            if (t.tid < 0 || !ReadNs(t.tid, ns)) {
+                t.tid = -1;
+                return -1.0;
+            }
+        }
+        const bool primed = t.primed;
+        const unsigned long long prev = t.ns;
+        t.ns = ns;
+        t.primed = true;
+        if (!primed || wall_ns <= 0.0 || ns < prev) {
+            return -1.0;
+        }
+        return std::clamp(static_cast<double>(ns - prev) / wall_ns, 0.0, 1.0);
+    }
+#endif
+
+    std::chrono::steady_clock::time_point last_{};
+    Thread front_;
+    Thread back_;
+    Load load_{};
+};
 
 template <typename SettingT, typename ValT>
 void ApplySettingValue(SettingT& s, const ValT& val) {
@@ -2401,6 +2486,26 @@ void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open,
                       static_cast<unsigned long long>(tel.stutters),
                       static_cast<unsigned long long>(tel.total_frames));
         lines.push_back({"Travadas > 50 ms", b, tel.stutters > 0 ? amber : kSoft});
+        // Longshot's "Game / Renderer / GPU" split, in this emulator's terms (E47.T13): CPU ms
+        // per game frame of the front (GPU) and back (GPUBack) threads, then the GPU's own time.
+        static ThreadCpuSampler cpu_sampler;
+        const auto load = cpu_sampler.Sample();
+        const double frame_rate =
+            tel.host_stats_valid && tel.game_fps > 1.0
+                ? tel.game_fps
+                : (tel.base_fps > 1.0 ? tel.base_fps : tel.fps);
+        if (load.front >= 0.0 && load.back >= 0.0 && frame_rate > 1.0) {
+            const double per_frame = 1000.0 / frame_rate;
+            std::snprintf(b, sizeof(b), "%.1f / %.1f ms (%.0f%% / %.0f%%)", load.front * per_frame,
+                          load.back * per_frame, load.front * 100.0, load.back * 100.0);
+            const double busiest = std::max(load.front, load.back);
+            lines.push_back({"Front / back", b,
+                             busiest > 0.92 ? red : (busiest > 0.8 ? amber : kSoft)});
+        }
+        if (tel.gpu_time_ms > 0.0) {
+            std::snprintf(b, sizeof(b), "%.1f ms", tel.gpu_time_ms);
+            lines.push_back({"GPU", b, kSoft});
+        }
         static constexpr std::array<const char*, 4> kVsync{"Imediato", "Mailbox", "FIFO",
                                                           "FIFO relaxado"};
         std::snprintf(
