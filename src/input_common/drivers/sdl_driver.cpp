@@ -20,6 +20,25 @@
 namespace InputCommon {
 
 namespace {
+std::mutex last_active_pad_mutex;
+LastActivePad last_active_pad;
+} // Anonymous namespace
+
+void NoteLastActivePad(std::string guid, int port) {
+    std::scoped_lock lock{last_active_pad_mutex};
+    if (last_active_pad.guid != guid || last_active_pad.port != port) {
+        last_active_pad.guid = std::move(guid);
+        last_active_pad.port = port;
+    }
+    ++last_active_pad.presses;
+}
+
+LastActivePad GetLastActivePad() {
+    std::scoped_lock lock{last_active_pad_mutex};
+    return last_active_pad;
+}
+
+namespace {
 Common::UUID GetGUID(SDL_Joystick* joystick) {
     const SDL_GUID guid = SDL_GetJoystickGUID(joystick);
     std::array<u8, 16> data{};
@@ -738,6 +757,7 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jbutton.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
             SetButton(identifier, event.jbutton.button, true);
+            NoteLastActivePad(joystick->GetGUID().RawString(), joystick->GetPort());
         }
         break;
     }

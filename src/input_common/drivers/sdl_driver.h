@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <string>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -28,6 +29,16 @@ using ButtonBindings =
     std::array<std::pair<Settings::NativeButton::Values, SDL_GamepadButton>, 20>;
 using ZButtonBindings =
     std::array<std::pair<Settings::NativeButton::Values, SDL_GamepadAxis>, 2>;
+
+/// The SDL controller that had a button pressed last (guid and port as in its ParamPackage);
+/// `presses` counts every press so callers can tell a new one from the last they saw.
+struct LastActivePad {
+    std::string guid;
+    int port = 0;
+    u64 presses = 0;
+};
+void NoteLastActivePad(std::string guid, int port);
+[[nodiscard]] LastActivePad GetLastActivePad();
 
 class SDLDriver : public InputEngine {
 public:

@@ -501,6 +501,9 @@ private:
     void UpdateInputDrivers();
     /// EDEN_NX2_AUTOMAP=1: maps a newly connected controller to player 1 when its own is gone.
     void Nx2AutoMapController();
+    /// Player 1 takes the SDL controller that had a button pressed last (EDEN_NX2_AUTOMAP=1).
+    void Nx2AdoptActivePad();
+    void Nx2AdoptController(const Common::ParamPackage& device, const char* why);
     /// OoT in-game menu (E45): Layout preset on player 1's pad, by position (0 Nintendo, 1 Xbox / PC, 2 swapped A/B).
     void OotApplyPadLayout(int layout);
     void RegisterOotMenuCallbacks();
@@ -619,6 +622,8 @@ private:
     QTimer mouse_hide_timer;
     QTimer update_input_timer;
     QTimer nx2_automap_timer;
+    QTimer nx2_active_pad_timer;
+    u64 nx2_active_pad_presses = 0;
     std::optional<std::set<std::string>> nx2_automap_seen; ///< controllers at the last check
 
     QString startup_icon_theme;

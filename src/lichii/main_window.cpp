@@ -8,6 +8,8 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <map>
+#include <fstream>
 #include <QScopeGuard>
 #include <QFile>
 #include <cstdlib>
@@ -17,6 +19,7 @@
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/oot_menu_bridge.h"
+#include "input_common/drivers/sdl_driver.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -537,6 +540,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         nx2_automap_timer.setInterval(2000);
         connect(&nx2_automap_timer, &QTimer::timeout, this, &MainWindow::Nx2AutoMapController);
         nx2_automap_timer.start();
+        nx2_active_pad_timer.setInterval(100);
+        connect(&nx2_active_pad_timer, &QTimer::timeout, this, &MainWindow::Nx2AdoptActivePad);
+        nx2_active_pad_timer.start();
     }
     // EDEN_NX2_KEYBOARD_LAYER=1: the keyboard (Lichii's default keys) also drives player 1 and
     // handheld next to the mapped controller, as in PC games: whichever is pressed takes over.
@@ -5715,6 +5721,88 @@ void MainWindow::Nx2AutoMapController() {
     if (!candidate) {
         return;
     }
+    Nx2AdoptController(*candidate, "its controller was not connected or a new one arrived");
+}
+
+void MainWindow::Nx2AdoptActivePad() {
+    if (!QtCommon::system) {
+        return;
+    }
+    const InputCommon::LastActivePad active = InputCommon::GetLastActivePad();
+    if (active.presses == nx2_active_pad_presses || active.guid.empty()) {
+        return;
+    }
+    nx2_active_pad_presses = active.presses;
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller == nullptr || controller->IsConfiguring()) {
+        return;
+    }
+    const Common::ParamPackage current = controller->GetButtonParam(Settings::NativeButton::A);
+    if (current.Get("engine", "") == "sdl" && current.Get("guid", "") == active.guid &&
+        current.Get("port", 0) == active.port) {
+        return;
+    }
+    for (const auto& device : input_subsystem->GetInputDevices()) {
+        if (device.Get("engine", "") == "sdl" && !device.Has("guid2") &&
+            device.Get("guid", "") == active.guid && device.Get("port", 0) == active.port) {
+            Nx2AdoptController(device, "a button was pressed on it");
+            return;
+        }
+    }
+}
+
+void MainWindow::Nx2AdoptController(const Common::ParamPackage& device, const char* why) {
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller == nullptr || controller->IsConfiguring()) {
+        return;
+    }
+    // A profile saved for this controller (play/tools/controller.py, oot-controles/<guid>.ini)
+    // comes first: its buttons are the ones the player set; else the SDL mapping, by position.
+    const auto profile = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) /
+                         "oot-controles" / (device.Get("guid", "") + ".ini");
+    std::map<std::string, std::string> saved;
+    if (std::ifstream in{profile}; in) {
+        std::string line;
+        while (std::getline(in, line)) {
+            const auto eq = line.find('=');
+            if (line.empty() || line[0] == '#' || eq == std::string::npos) {
+                continue;
+            }
+            std::string value = line.substr(eq + 1);
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+            saved[line.substr(0, eq)] = value;
+        }
+    }
+    const std::string port = std::to_string(device.Get("port", 0));
+    const auto with_port = [&port](std::string value) {
+        // the profile was saved with the port the controller had then
+        if (const auto at = value.find("port:"); at != std::string::npos) {
+            const auto stop = value.find(',', at);
+            value.replace(at, (stop == std::string::npos ? value.size() : stop) - at, "port:" + port);
+        }
+        return value;
+    };
+    if (saved.contains("button_a")) {
+        for (std::size_t i = 0; i < Settings::NativeButton::NumButtons; ++i) {
+            if (const auto it = saved.find(Settings::NativeButton::mapping[i]); it != saved.end()) {
+                controller->SetButtonParam(i, Common::ParamPackage{with_port(it->second)});
+            }
+        }
+        for (std::size_t i = 0; i < Settings::NativeAnalog::NumAnalogs; ++i) {
+            if (const auto it = saved.find(Settings::NativeAnalog::mapping[i]); it != saved.end()) {
+                controller->SetStickParam(i, Common::ParamPackage{with_port(it->second)});
+            }
+        }
+        controller->SaveCurrentConfig();
+        LOG_INFO(Frontend, "Player 1 mapped to {} with its saved profile ({})",
+                 device.Get("display", "?"), why);
+        return;
+    }
+    const std::optional<Common::ParamPackage> candidate = device;
     const auto buttons = input_subsystem->GetButtonMappingForDevice(*candidate);
     if (buttons.empty()) {
         return;
@@ -5738,8 +5826,7 @@ void MainWindow::Nx2AutoMapController() {
         swap(Settings::NativeButton::X, Settings::NativeButton::Y);
     }
     controller->SaveCurrentConfig();
-    LOG_INFO(Frontend, "Player 1 mapped to {} (its controller was not connected)",
-             candidate->Get("display", "?"));
+    LOG_INFO(Frontend, "Player 1 mapped to {} ({})", candidate->Get("display", "?"), why);
 }
 
 void MainWindow::UpdateFrameGenButton() {
