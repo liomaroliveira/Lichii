@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <thread>
 #include "common/logging.h"
+#include "common/oot_menu_bridge.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -241,7 +242,8 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         const char* text = std::getenv("EDEN_NX2_IDLE_SPIN_US");
         return text ? std::strtoll(text, nullptr, 10) : -1LL;
     }();
-    long long spin_us = spin_setting;
+    const int bridge_spin_us = Common::OotMenu::Bridge::Instance().IdleSpinOverrideUs();
+    long long spin_us = bridge_spin_us >= 0 ? static_cast<long long>(bridge_spin_us) : spin_setting;
     if (spin_us < 0) {
 #ifdef __ANDROID__
         spin_us = 0;

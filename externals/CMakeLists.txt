@@ -102,6 +102,10 @@ endif()
 # Vulkan stuff
 AddDependentPackages(vulkan-headers vulkan-utility-libraries)
 
+if (NOT LICHII_STATIC_ROOM)
+    add_subdirectory(imgui)
+endif()
+
 # frozen
 AddJsonPackage(frozen)
 

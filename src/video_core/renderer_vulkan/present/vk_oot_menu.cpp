@@ -1,0 +1,1921 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "video_core/renderer_vulkan/present/vk_oot_menu.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+#include "common/settings.h"
+#include "common/settings_enums.h"
+
+namespace Vulkan::OotUi {
+namespace {
+
+using Bridge = Common::OotMenu::Bridge;
+using Key = Common::OotMenu::Key;
+using PcOptions = Common::OotMenu::PcOptions;
+using TelemetrySnapshot = Common::OotMenu::TelemetrySnapshot;
+
+template <typename SettingT, typename ValT>
+void ApplySettingValue(SettingT& s, const ValT& val) {
+    if constexpr (requires {
+                      s.UsingGlobal();
+                      s.SetGlobal(false);
+                  }) {
+        if (!Settings::IsConfiguringGlobal() && s.UsingGlobal()) {
+            s.SetGlobal(false);
+        }
+    }
+    s.SetValue(val);
+}
+
+constexpr std::array<u16, 7> kNx2FpsChoices{30, 60, 90, 120, 144, 165, 240};
+constexpr std::array<u16, 6> kSpeedChoices{0, 100, 150, 200, 240, 400};
+constexpr std::array<Settings::ResolutionSetup, 7> kResScaleChoices{
+    Settings::ResolutionSetup::Res1_2X, Settings::ResolutionSetup::Res3_4X,
+    Settings::ResolutionSetup::Res1X,   Settings::ResolutionSetup::Res5_4X,
+    Settings::ResolutionSetup::Res3_2X, Settings::ResolutionSetup::Res2X,
+    Settings::ResolutionSetup::Res3X,
+};
+constexpr std::array<Settings::ScalingFilter, 8> kScalingFilterChoices{
+    Settings::ScalingFilter::NearestNeighbor, Settings::ScalingFilter::Bilinear,
+    Settings::ScalingFilter::Bicubic,         Settings::ScalingFilter::Lanczos,
+    Settings::ScalingFilter::ScaleForce,      Settings::ScalingFilter::Fsr,
+    Settings::ScalingFilter::Area,            Settings::ScalingFilter::Sgsr,
+};
+constexpr std::array<int, 6> kIdleSpinChoices{-1, 0, 5, 15, 30, 50};
+constexpr std::array<Settings::OcarinaFsrOutput, 3> kFsrOutputChoices{
+    Settings::OcarinaFsrOutput::Output1080p,
+    Settings::OcarinaFsrOutput::Output1440p,
+    Settings::OcarinaFsrOutput::Output4K,
+};
+constexpr std::array<Settings::OcarinaFsrRender, 3> kFsrRenderChoices{
+    Settings::OcarinaFsrRender::Render720p,
+    Settings::OcarinaFsrRender::Render1080p,
+    Settings::OcarinaFsrRender::Render1440p,
+};
+
+template <typename T, std::size_t N>
+int IndexIn(const std::array<T, N>& arr, const T& val, int fallback = 0) noexcept {
+    for (std::size_t i = 0; i < N; ++i) {
+        if (arr[i] == val) {
+            return static_cast<int>(i);
+        }
+    }
+    return fallback;
+}
+
+const std::array<const char*, 4> kTabTitles{"Gráficos", "Desempenho", "Controles", "Áudio & UI"};
+
+// Switch button order matching PadBindingSnapshot (0..15)
+constexpr std::array<const char*, 16> kSwitchActionLabels{
+    "A (Ação)",     "B (Espada)",   "X (Item E)",  "Y (Item C)",
+    "LS (Analóg.)", "RS (Câmera)",  "L (Esq.)",    "R (Dir.)",
+    "ZL (Mira Z)",  "ZR (Escudo)",  "+ (Pausa)",   "- (Mapa)",
+    "D-Esq.",       "D-Cima",       "D-Dir.",      "D-Baixo",
+};
+
+constexpr int kRowListSize = 37;
+const std::array<const char*, 4>& TabTitles() noexcept {
+    return kTabTitles;
+}
+
+float BannerHeight(const Ctx& c) noexcept {
+    return 56.0f * c.s;
+}
+
+void Columns(const Ctx& c, float* x0, float* x1, float* hx0, float* hx1, bool* narrow) noexcept {
+    const float s = c.s;
+    *x0 = c.safe + 6.0f * s;
+    *x1 = std::min(c.w - c.safe, std::max(c.w * 0.585f, *x0 + 560.0f * s));
+    *hx0 = *x1 + 28.0f * s;
+    *hx1 = c.w - c.safe;
+    *narrow = (*hx1 - *hx0) < 260.0f * s;
+    if (*narrow) {
+        *hx0 = *x0 + 20.0f * s;
+        *hx1 = *x1 - 20.0f * s;
+    }
+}
+
+void DrawColumn(Ctx& c, float x0, float x1, float top) {
+    const float s = c.s;
+    c.d->AddRectFilled(ImVec2(x0, top), ImVec2(x1, c.h), kColumn);
+    c.d->AddLine(ImVec2(x0, top), ImVec2(x0, c.h), Alpha(kEdge, 1.0f), 2.0f * s);
+    c.d->AddLine(ImVec2(x1, top), ImVec2(x1, c.h), Alpha(kEdge, 1.0f), 2.0f * s);
+}
+
+std::string FitEllipsis(const Ctx& c, ImFont* f, float px, float room, const char* text) {
+    const std::string s(text ? text : "");
+    if (room <= 0.0f || SizeOfRaw(f, px, s.c_str()).x <= room) {
+        return s;
+    }
+    std::vector<std::size_t> cut{0};
+    for (std::size_t i = 0; i < s.size();) {
+        ++i;
+        while (i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0u) == 0x80u) {
+            ++i;
+        }
+        cut.push_back(i);
+    }
+    std::size_t lo = 0;
+    std::size_t hi = cut.size() - 1;
+    while (lo < hi) {
+        const std::size_t mid = (lo + hi + 1) / 2;
+        const std::string candidate = s.substr(0, cut[mid]) + "...";
+        if (SizeOfRaw(f, px, candidate.c_str()).x <= room) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return s.substr(0, cut[lo]) + "...";
+}
+
+void DrawNameCell(Ctx& c, ImVec2 a, ImVec2 b, const char* raw_name, bool sel, bool pending_restart,
+                  bool live_tag) {
+    const float s = c.s;
+    const float mid = (a.y + b.y) * 0.5f;
+    c.d->AddRectFilled(a, b, sel ? kCellNameSel : kCellName);
+    c.d->AddRect(a, b, kEdge, 0.0f, std::max(1.0f, s));
+    if (sel) {
+        c.d->AddRectFilled(a, ImVec2(a.x + 4.0f * s, b.y), kGoldHi);
+    }
+    float room = b.x - a.x - 36.0f * s;
+    if (pending_restart) {
+        Diamond(c, ImVec2(b.x - 13.0f * s, mid), 4.2f * s, kGoldHi);
+        room -= 14.0f * s;
+    } else if (live_tag && sel) {
+        c.d->AddCircleFilled(ImVec2(b.x - 13.0f * s, mid), 3.0f * s, kLiveGreen);
+        room -= 12.0f * s;
+    }
+    ImFont* f = sel ? c.f.strong : c.f.body;
+    const std::string shown = FitEllipsis(c, f, 18.0f * s, room, Tr(raw_name));
+    TextMidRaw(c, f, 18.0f * s, a.x + 18.0f * s, mid, sel ? kInkBright : kInk, shown.c_str());
+}
+
+void DrawChoiceCell(Ctx& c, ImVec2 a, ImVec2 b, const std::string& val, bool sel, bool left,
+                    bool right, bool fixed) {
+    const float s = c.s;
+    const float mid = (a.y + b.y) * 0.5f;
+    const float in = 4.0f * s;
+    const float px = 17.5f * s;
+    c.d->AddRectFilled(a, b, kCellDark);
+    c.d->AddRect(a, b, kEdge, 0.0f, std::max(1.0f, s));
+    if (sel && !fixed) {
+        GoldFill(c, a + ImVec2(in, in), b - ImVec2(in, in));
+    }
+    const ImU32 ink = sel && !fixed ? kGoldInk : (fixed ? kDim : kInk);
+    const ImU32 arrow = sel && !fixed ? kGoldInk : kDim;
+    if (left) {
+        Triangle(c, ImVec2(a.x + in + 11.0f * s, mid), 9.0f * s, 0, arrow);
+    }
+    if (right) {
+        Triangle(c, ImVec2(b.x - in - 11.0f * s, mid), 9.0f * s, 1, arrow);
+    }
+    ImFont* f = sel ? c.f.strong : c.f.body;
+    const float text_room = b.x - a.x - 2.0f * in - ((left || right) ? 44.0f : 16.0f) * s;
+    const std::string shown = FitEllipsis(c, f, px, text_room, val.c_str());
+    TextMidCentreRaw(c, f, px, (a.x + b.x) * 0.5f, mid, ink, shown.c_str());
+    if (sel) {
+        Glow(c, a, b);
+    }
+}
+
+void DrawHalvesCell(Ctx& c, ImVec2 a, ImVec2 b, const char* lo_raw, const char* hi_raw, bool high,
+                    bool sel, bool fixed) {
+    const float s = c.s;
+    const float mid = (a.y + b.y) * 0.5f;
+    const float in = 4.0f * s;
+    const float px = 17.5f * s;
+    const float xm = (a.x + b.x) * 0.5f;
+    c.d->AddRectFilled(a, b, kCellDark);
+    c.d->AddRect(a, b, kEdge, 0.0f, std::max(1.0f, s));
+    const ImVec2 fa = high ? ImVec2(xm, a.y + in) : a + ImVec2(in, in);
+    const ImVec2 fb = high ? b - ImVec2(in, in) : ImVec2(xm, b.y - in);
+    if (sel && !fixed) {
+        GoldFill(c, fa, fb);
+    } else {
+        c.d->AddRectFilled(fa, fb, kBronze);
+    }
+    const ImU32 on = sel && !fixed ? kGoldInk : kInk;
+    TextMidCentre(c, high ? c.f.body : c.f.strong, px, (a.x + xm) * 0.5f, mid, high ? kDim : on,
+                  lo_raw);
+    TextMidCentre(c, high ? c.f.strong : c.f.body, px, (xm + b.x) * 0.5f, mid, high ? on : kDim,
+                  hi_raw);
+    if (sel) {
+        Glow(c, a, b);
+    }
+}
+
+void DrawSliderCell(Ctx& c, ImVec2 a, ImVec2 b, const std::string& val, int permille, bool sel,
+                    float* t0, float* t1) {
+    const float s = c.s;
+    const float mid = (a.y + b.y) * 0.5f;
+    const float in = 4.0f * s;
+    const float px = 17.5f * s;
+    c.d->AddRectFilled(a, b, kCellDark);
+    c.d->AddRect(a, b, kEdge, 0.0f, std::max(1.0f, s));
+    if (sel) {
+        GoldFill(c, a + ImVec2(in, in), b - ImVec2(in, in));
+    }
+    const float x0 = a.x + in + 24.0f * s;
+    const float x1 = b.x - in - 24.0f * s;
+    const float frac = std::clamp(static_cast<float>(permille) / 1000.0f, 0.0f, 1.0f);
+    const float xv = x0 + (x1 - x0) * frac;
+    const float ty = b.y - in - 5.5f * s;
+    const ImU32 track = sel ? Rgba(36, 24, 8, 80) : Rgba(255, 255, 255, 40);
+    const ImU32 done = sel ? kGoldInk : kAccent;
+    c.d->AddRectFilled(ImVec2(x0, ty - 1.5f * s), ImVec2(x1, ty + 1.5f * s), track, 1.5f * s);
+    c.d->AddRectFilled(ImVec2(x0, ty - 1.5f * s), ImVec2(xv, ty + 1.5f * s), done, 1.5f * s);
+    Diamond(c, ImVec2(xv, ty), 4.5f * s, done);
+    TextMidCentreRaw(c, c.f.strong, px, (a.x + b.x) * 0.5f, mid - 3.0f * s,
+                     sel ? kGoldInk : kInk, val.c_str());
+    const ImU32 arrow = sel ? kGoldInk : kDim;
+    Triangle(c, ImVec2(a.x + in + 11.0f * s, mid), 9.0f * s, 0, arrow);
+    Triangle(c, ImVec2(b.x - in - 11.0f * s, mid), 9.0f * s, 1, arrow);
+    if (sel) {
+        Glow(c, a, b);
+    }
+    *t0 = x0;
+    *t1 = x1;
+}
+
+void OutlinedText(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col, const char* text) {
+    const float o = std::max(1.0f, c.s);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx != 0 || dy != 0) {
+                c.d->AddText(font, px, ImVec2(x + static_cast<float>(dx) * o,
+                                              y + static_cast<float>(dy) * o),
+                             Rgba(0, 0, 0, 225), text);
+            }
+        }
+    }
+    c.d->AddText(font, px, ImVec2(x, y), col, text);
+}
+
+const std::vector<OotMenuController::RowDef>& AllRows() {
+    using RK = OotMenuController::RowKind;
+    using T = OotMenuController::Tab;
+    static const std::vector<OotMenuController::RowDef> kRows{
+        // Tab 0: Graphics
+        {T::Graphics, RK::Heading, "h_upscale", "Reconstrução e Nitidez", "", false, 0, 0, 1},
+        {T::Graphics, RK::Choice, "upscaler", "Upscaler (OoT)",
+         "Substitui a reconstrução do jogo ao vivo sem reiniciar: Nativo, FSR 3.1 ou AMD FSR 4.1 (INT8/FP8).",
+         false, 0, 2, 1},
+        {T::Graphics, RK::Choice, "fsr_output", "Resolução Saída FSR",
+         "Altera ao vivo a resolução de saída reconstruída pelo FSR 3.1/4.1: Full HD (1080p), 1440p ou 4K.",
+         false, 0, 2, 1},
+        {T::Graphics, RK::Choice, "fsr_render", "Resolução Interna FSR",
+         "Resolução interna renderizada pelo jogo antes do upscaler FSR. 1080p ou 720p aliviam bastante GPU/Templo do Fogo.",
+         true, 0, 2, 1},
+        {T::Graphics, RK::Choice, "res_scale", "Escala de Resolução",
+         "Fator de escala geral do emulador quando o upscaler de cena está desligado ou em jogos gerais.",
+         true, 0, 6, 1},
+        {T::Graphics, RK::Slider, "rcas_sharp", "Nitidez RCAS (FSR)",
+         "Força do filtro de nitidez FidelityFX RCAS após o FSR 3.1/4.1.", false, 0, 200, 5},
+        {T::Graphics, RK::Toggle, "oot_aa", "Antisserrilhamento Jogo",
+         "Remove o sharpening extra original do jogo que cria halos ao redor do texto quando combinado com FSR.",
+         false, 0, 1, 1},
+
+        {T::Graphics, RK::Heading, "h_win", "Janela e Pós-Processamento", "", false, 0, 0, 1},
+        {T::Graphics, RK::Choice, "win_aa", "Antisserrilhamento Janela",
+         "Suavização aplicada na apresentação final da janela (FXAA ou SMAA).", false, 0, 2, 1},
+        {T::Graphics, RK::Choice, "win_filter", "Filtro da Janela",
+         "Filtro usado ao esticar ou reduzir a imagem do emulador até o tamanho da janela.",
+         false, 0, 7, 1},
+        {T::Graphics, RK::Choice, "aniso", "Filtro Anisotrópico",
+         "Qualidade da filtragem de texturas inclinadas no chão e paredes.", false, 0, 5, 1},
+        {T::Graphics, RK::Toggle, "docked", "Modo Console",
+         "Define se o jogo inicia em perfil Dock (alta resolução) ou Portátil (720p).", true, 0,
+         1, 1},
+        {T::Graphics, RK::Choice, "vsync", "Sincronização (VSync)",
+         "Controla a sincronização vertical da janela. Mailbox elimina tearing sem travar em múltiplos inteiros.",
+         false, 0, 3, 1},
+        {T::Graphics, RK::Choice, "hdr", "HDR (Monitor)",
+         "Ativa saída HDR10 na tela quando suportada pelo monitor e compositor.", false, 0, 2, 1},
+        {T::Graphics, RK::Choice, "frame_gen", "Geração de Quadros",
+         "Gera quadros intermediários (LSFG / FSR 3 FG) para fluidez acima do FPS base do emulador.",
+         false, 0, 3, 1},
+        {T::Graphics, RK::Choice, "fg_mult", "Multiplicador FG",
+         "Multiplicador de quadros gerados quando Frame Gen está ativo (2x = dobra o FPS exibido).",
+         false, 2, 4, 1},
+
+        // Tab 1: Performance
+        {T::Performance, RK::Heading, "h_perf", "Taxa de Quadros e GPU", "", false, 0, 0, 1},
+        {T::Performance, RK::Choice, "nx2_fps", "Taxa de Quadros (NX2)",
+         "Teto de FPS do motor NX2 do Switch 2. Define a cadência alvo antes de reiniciar.", true, 0,
+         6, 1},
+        {T::Performance, RK::Choice, "speed_limit", "Limite Velocidade (Live)",
+         "Aplica ou remove o limite de velocidade ao vivo em tempo real durante a gameplay.", false,
+         0, 5, 1},
+        {T::Performance, RK::Toggle, "gpu_acc", "Precisão da GPU",
+         "Precisão da GPU emulada. Baixa aumenta performance; Alta corrige efeitos complexos quando necessário.",
+         false, 0, 1, 1},
+        {T::Performance, RK::Toggle, "vram", "Uso de VRAM",
+         "Estratégia de retenção de buffers e texturas na VRAM da GPU.", false, 0, 1, 1},
+
+        {T::Performance, RK::Heading, "h_fork", "Otimizações Lichii & Perfil", "", false, 0, 0, 1},
+        {T::Performance, RK::Toggle, "occlusion_mod", "Mod Occlusion Off",
+         "Mantém ou desativa o mod Occlusion Off (ganho grande de CPU/GPU no Templo do Fogo). Requer reinício.",
+         true, 0, 1, 1},
+        {T::Performance, RK::Toggle, "async_shaders", "Shaders Assíncronos",
+         "Compila pipelines em background para evitar engasgos no primeiro uso de um shader.", false,
+         0, 1, 1},
+        {T::Performance, RK::Toggle, "disk_cache", "Cache Shader em Disco",
+         "Salva shaders compilados em disco entre sessões para abertura instantânea.", true, 0, 1,
+         1},
+        {T::Performance, RK::Choice, "precache", "Pré-compilar Shaders",
+         "Pré-carrega e compila os shaders salvos antes de entrar no jogo.", true, 0, 2, 1},
+        {T::Performance, RK::Choice, "idle_spin", "Idle Spin CPU (us)",
+         "Tempo de spin ativo (microsegundos) antes de dormir em Core::Idle. Valores baixos reduzem consumo e latência.",
+         false, 0, 5, 1},
+        {T::Performance, RK::Toggle, "read_areas", "Read Areas Direto (NX2)",
+         "Habilita leitura otimizada de regiões de memória no NX2 (nx2_menu_switches.txt). Requer reinício.",
+         true, 0, 1, 1},
+        {T::Performance, RK::Toggle, "gamemode", "GameMode (Linux)",
+         "Solicita perfil de alta performance GameMode do sistema no atalho/sessão.", true, 0, 1,
+         1},
+        {T::Performance, RK::Toggle, "pin_ccx", "Fixar 1 CCX (Ryzen)",
+         "Restringe os threads do emulador a um único CCX em processadores AMD Ryzen.", true, 0, 1,
+         1},
+        {T::Performance, RK::Action, "apply_restart", "Aplicar e Reiniciar",
+         "Salva todas as configurações no disco e reinicia a execução do jogo imediatamente.", false,
+         0, 0, 1},
+
+        // Tab 2: Controls
+        {T::Controls, RK::Heading, "h_prompts", "Botões na Tela e Layout", "", false, 0, 0, 1},
+        {T::Controls, RK::Choice, "prompts", "Ícones de Botão (Prompts)",
+         "Estilo visual dos ícones de botões mostrados dentro do jogo: Automático segue o controle/teclado conectado!",
+         false, 0, 6, 1},
+        {T::Controls, RK::Choice, "pad_layout", "Layout do Controle",
+         "Alterna ao vivo entre botões estilo Xbox PC (A embaixo / B direita) e Nintendo posicional, sincronizando com os prompts.",
+         false, 0, 2, 1},
+        {T::Controls, RK::Toggle, "kbd_layer", "Camada Teclado NX2",
+         "Ativa a camada de teclado/mouse do NX2 ao vivo para câmera e movimento sem controle.", false,
+         0, 1, 1},
+        {T::Controls, RK::Action, "reset_controls", "Resetar Controles",
+         "Mostra os botões e teclas atuais do Jogador 1 e permite restaurar os padrões.", false, 0,
+         0, 1},
+
+        // Tab 3: Audio & UI
+        {T::AudioUi, RK::Heading, "h_audio", "Áudio", "", false, 0, 0, 1},
+        {T::AudioUi, RK::Slider, "volume", "Volume Principal",
+         "Volume geral da saída de áudio do emulador (0% a 100%).", false, 0, 100, 5},
+        {T::AudioUi, RK::Toggle, "mute", "Silenciar (Mudo)",
+         "Silencia instantaneamente todo o som do jogo.", false, 0, 1, 1},
+        {T::AudioUi, RK::Choice, "audio_sink", "Backend de Áudio",
+         "Driver de saída de áudio utilizado pelo emulador.", true, 0, 3, 1},
+
+        {T::AudioUi, RK::Heading, "h_hud", "Medidor FPS e Interface", "", false, 0, 0, 1},
+        {T::AudioUi, RK::Choice, "fps_hud", "Contador de FPS",
+         "Exibe o contador nativo no canto da tela: FPS simples, Frame Time + 1% Low ou diagnóstico detalhado.",
+         false, 0, 3, 1},
+        {T::AudioUi, RK::Choice, "fps_corner", "Posição do FPS",
+         "Canto da tela onde o contador de FPS é exibido.", false, 0, 3, 1},
+        {T::AudioUi, RK::Choice, "menu_size", "Tamanho do Menu",
+         "Escala dos textos e caixas do menu.", false, 0, 3, 1},
+        {T::AudioUi, RK::Choice, "menu_lang", "Idioma do Menu",
+         "Idioma exibido em todas as abas e descrições deste menu.", false, 0, 1, 1},
+
+        {T::AudioUi, RK::Heading, "h_keys", "Atalhos e Sessão", "", false, 0, 0, 1},
+        {T::AudioUi, RK::Choice, "menu_key", "Tecla Menu Completo",
+         "Atalho de teclado para abrir/fechar este menu completo (no controle: L3+R3 ou +&-).",
+         false, 0, 2, 1},
+        {T::AudioUi, RK::Choice, "compact_key", "Tecla Barra Compacta",
+         "Tecla para abrir diretamente ou alternar com a Barra Compacta ao vivo.", false, 0, 2, 1},
+        {T::AudioUi, RK::Toggle, "esc_opens", "Esc Abre o Menu",
+         "Permite usar a tecla Esc também para abrir o menu completo (além de fechá-lo).", false, 0,
+         1, 1},
+        {T::AudioUi, RK::Action, "restart_game", "Reiniciar jogo",
+         "Salva todas as configurações no disco e reinicia a execução do jogo imediatamente.", false,
+         0, 0, 1},
+        {T::AudioUi, RK::Action, "quit_game", "Sair", "Salva e fecha o emulador com segurança.",
+         false, 0, 0, 1},
+    };
+    return kRows;
+}
+
+} // namespace
+
+OotMenuController::OotMenuController() = default;
+
+bool OotMenuController::ShouldDraw(const Common::OotMenu::Bridge& bridge) const {
+    if (!bridge.IsOcarina()) {
+        return false;
+    }
+    if (bridge.IsOpen()) {
+        return true;
+    }
+    return bridge.GetOptions().fps_hud > 0;
+}
+
+void OotMenuController::CaptureBaselineOnce(const PcOptions& opts) {
+    if (baseline_.captured) {
+        return;
+    }
+    baseline_.captured = true;
+    baseline_.ocarina_fsr_render = static_cast<int>(Settings::values.ocarina_fsr_render.GetValue());
+    baseline_.resolution_setup = static_cast<int>(Settings::values.resolution_setup.GetValue());
+    baseline_.use_docked_mode = static_cast<int>(Settings::values.use_docked_mode.GetValue());
+    baseline_.frame_rate_limit = static_cast<int>(Settings::values.frame_rate_limit.GetValue());
+    baseline_.occlusion_mod = opts.occlusion_mod;
+    baseline_.disk_shader_cache = Settings::values.use_disk_shader_cache.GetValue();
+    baseline_.precache_shaders = static_cast<int>(Settings::values.precache_shaders.GetValue());
+    baseline_.read_areas = opts.read_areas;
+    baseline_.gamemode = opts.gamemode;
+    baseline_.pin_ccx = opts.pin_ccx;
+    baseline_.sink_id = static_cast<int>(Settings::values.sink_id.GetValue());
+}
+
+bool OotMenuController::IsRowPendingRestart(const char* id, const PcOptions& opts) const {
+    if (!baseline_.captured || !id) {
+        return false;
+    }
+    if (std::strcmp(id, "fsr_render") == 0) {
+        return static_cast<int>(Settings::values.ocarina_fsr_render.GetValue()) !=
+               baseline_.ocarina_fsr_render;
+    }
+    if (std::strcmp(id, "res_scale") == 0) {
+        return static_cast<int>(Settings::values.resolution_setup.GetValue()) !=
+               baseline_.resolution_setup;
+    }
+    if (std::strcmp(id, "docked") == 0) {
+        return static_cast<int>(Settings::values.use_docked_mode.GetValue()) !=
+               baseline_.use_docked_mode;
+    }
+    if (std::strcmp(id, "nx2_fps") == 0) {
+        return static_cast<int>(Settings::values.frame_rate_limit.GetValue()) !=
+               baseline_.frame_rate_limit;
+    }
+    if (std::strcmp(id, "occlusion_mod") == 0) {
+        return opts.occlusion_mod != baseline_.occlusion_mod;
+    }
+    if (std::strcmp(id, "disk_cache") == 0) {
+        return Settings::values.use_disk_shader_cache.GetValue() != baseline_.disk_shader_cache;
+    }
+    if (std::strcmp(id, "precache") == 0) {
+        return static_cast<int>(Settings::values.precache_shaders.GetValue()) !=
+               baseline_.precache_shaders;
+    }
+    if (std::strcmp(id, "read_areas") == 0) {
+        return opts.read_areas != baseline_.read_areas;
+    }
+    if (std::strcmp(id, "gamemode") == 0) {
+        return opts.gamemode != baseline_.gamemode;
+    }
+    if (std::strcmp(id, "pin_ccx") == 0) {
+        return opts.pin_ccx != baseline_.pin_ccx;
+    }
+    if (std::strcmp(id, "audio_sink") == 0) {
+        return static_cast<int>(Settings::values.sink_id.GetValue()) != baseline_.sink_id;
+    }
+    return false;
+}
+
+std::vector<const char*> OotMenuController::CollectPendingRowNames(const PcOptions& opts) const {
+    std::vector<const char*> names;
+    for (const auto& r : AllRows()) {
+        if (r.requires_restart && IsRowPendingRestart(r.id, opts)) {
+            names.push_back(r.label);
+        }
+    }
+    return names;
+}
+
+std::vector<const OotMenuController::RowDef*> OotMenuController::RowsForTab(Tab t) const {
+    std::vector<const RowDef*> out;
+    for (const auto& r : AllRows()) {
+        if (r.tab == t) {
+            out.push_back(&r);
+        }
+    }
+    return out;
+}
+
+int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const {
+    if (std::strcmp(id, "upscaler") == 0) {
+        if (!Settings::values.ocarina_fsr.GetValue()) {
+            return 0;
+        }
+        return Settings::values.amd_fsr4.GetValue() ? 2 : 1;
+    }
+    if (std::strcmp(id, "fsr_output") == 0) {
+        return IndexIn(kFsrOutputChoices, Settings::values.ocarina_fsr_output.GetValue(), 0);
+    }
+    if (std::strcmp(id, "fsr_render") == 0) {
+        return IndexIn(kFsrRenderChoices, Settings::values.ocarina_fsr_render.GetValue(), 1);
+    }
+    if (std::strcmp(id, "res_scale") == 0) {
+        return IndexIn(kResScaleChoices, Settings::values.resolution_setup.GetValue(), 2);
+    }
+    if (std::strcmp(id, "rcas_sharp") == 0) {
+        return Settings::values.fsr_sharpening_slider.GetValue();
+    }
+    if (std::strcmp(id, "oot_aa") == 0) {
+        return Settings::values.oot_anti_aliasing.GetValue() ==
+                       Settings::OotAntiAliasing::NoSharpening
+                   ? 1
+                   : 0;
+    }
+    if (std::strcmp(id, "win_aa") == 0) {
+        return static_cast<int>(Settings::values.anti_aliasing.GetValue());
+    }
+    if (std::strcmp(id, "win_filter") == 0) {
+        return IndexIn(kScalingFilterChoices, Settings::values.scaling_filter.GetValue(), 1);
+    }
+    if (std::strcmp(id, "aniso") == 0) {
+        return static_cast<int>(Settings::values.max_anisotropy.GetValue());
+    }
+    if (std::strcmp(id, "docked") == 0) {
+        return Settings::values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked ? 1 : 0;
+    }
+    if (std::strcmp(id, "vsync") == 0) {
+        return static_cast<int>(Settings::values.vsync_mode.GetValue());
+    }
+    if (std::strcmp(id, "hdr") == 0) {
+        return static_cast<int>(Settings::values.hdr_mode.GetValue());
+    }
+    if (std::strcmp(id, "frame_gen") == 0) {
+        if (!Settings::values.frame_gen.GetValue()) {
+            return 0;
+        }
+        switch (Settings::values.frame_gen_type.GetValue()) {
+        case Settings::FrameGenType::Lsfg:
+            return 1;
+        case Settings::FrameGenType::Fsr3:
+            return 2;
+        case Settings::FrameGenType::NvidiaDlssG:
+            return 3;
+        }
+        return 1;
+    }
+    if (std::strcmp(id, "fg_mult") == 0) {
+        return std::clamp(static_cast<int>(Settings::values.frame_gen_multiplier.GetValue()), 2, 4);
+    }
+    if (std::strcmp(id, "nx2_fps") == 0) {
+        const u16 cur = Settings::values.frame_rate_limit.GetValue();
+        int best = 1;
+        int best_diff = 9999;
+        for (int i = 0; i < static_cast<int>(kNx2FpsChoices.size()); ++i) {
+            const int d = std::abs(static_cast<int>(cur) - static_cast<int>(kNx2FpsChoices[i]));
+            if (d < best_diff) {
+                best_diff = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+    if (std::strcmp(id, "speed_limit") == 0) {
+        if (!Settings::values.use_speed_limit.GetValue()) {
+            return 0;
+        }
+        const u16 lim = Settings::values.speed_limit.GetValue();
+        for (int i = 1; i < static_cast<int>(kSpeedChoices.size()); ++i) {
+            if (lim <= kSpeedChoices[i]) {
+                return i;
+            }
+        }
+        return 5;
+    }
+    if (std::strcmp(id, "gpu_acc") == 0) {
+        return Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High ? 1 : 0;
+    }
+    if (std::strcmp(id, "vram") == 0) {
+        return Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive
+                   ? 1
+                   : 0;
+    }
+    if (std::strcmp(id, "occlusion_mod") == 0) {
+        return opts.occlusion_mod ? 1 : 0;
+    }
+    if (std::strcmp(id, "async_shaders") == 0) {
+        return Settings::values.use_asynchronous_shaders.GetValue() ? 1 : 0;
+    }
+    if (std::strcmp(id, "disk_cache") == 0) {
+        return Settings::values.use_disk_shader_cache.GetValue() ? 1 : 0;
+    }
+    if (std::strcmp(id, "precache") == 0) {
+        return static_cast<int>(Settings::values.precache_shaders.GetValue());
+    }
+    if (std::strcmp(id, "idle_spin") == 0) {
+        return IndexIn(kIdleSpinChoices, opts.idle_spin_us, 0);
+    }
+    if (std::strcmp(id, "read_areas") == 0) {
+        return opts.read_areas ? 1 : 0;
+    }
+    if (std::strcmp(id, "gamemode") == 0) {
+        return opts.gamemode ? 1 : 0;
+    }
+    if (std::strcmp(id, "pin_ccx") == 0) {
+        return opts.pin_ccx ? 1 : 0;
+    }
+    if (std::strcmp(id, "prompts") == 0) {
+        return opts.button_prompts;
+    }
+    if (std::strcmp(id, "pad_layout") == 0) {
+        return opts.pad_layout;
+    }
+    if (std::strcmp(id, "kbd_layer") == 0) {
+        return opts.keyboard_layer ? 1 : 0;
+    }
+    if (std::strcmp(id, "volume") == 0) {
+        return static_cast<int>(Settings::values.volume.GetValue());
+    }
+    if (std::strcmp(id, "mute") == 0) {
+        return Settings::values.audio_muted.GetValue() ? 1 : 0;
+    }
+    if (std::strcmp(id, "audio_sink") == 0) {
+        return static_cast<int>(Settings::values.sink_id.GetValue());
+    }
+    if (std::strcmp(id, "fps_hud") == 0) {
+        return opts.fps_hud;
+    }
+    if (std::strcmp(id, "fps_corner") == 0) {
+        return opts.fps_corner;
+    }
+    if (std::strcmp(id, "menu_size") == 0) {
+        return opts.menu_size;
+    }
+    if (std::strcmp(id, "menu_lang") == 0) {
+        return opts.menu_lang;
+    }
+    if (std::strcmp(id, "menu_key") == 0) {
+        return opts.menu_key;
+    }
+    if (std::strcmp(id, "compact_key") == 0) {
+        return opts.compact_key;
+    }
+    if (std::strcmp(id, "esc_opens") == 0) {
+        return opts.esc_opens ? 1 : 0;
+    }
+    return 0;
+}
+
+void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, Bridge& bridge) {
+    bool dirty_settings = false;
+    bool dirty_bridge = false;
+    bool bump_prompts = false;
+    bool request_save = true;
+
+    if (std::strcmp(id, "upscaler") == 0) {
+        val = std::clamp(val, 0, 2);
+        ApplySettingValue(Settings::values.ocarina_fsr, val > 0);
+        ApplySettingValue(Settings::values.amd_fsr4, val == 2);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "fsr_output") == 0) {
+        val = std::clamp(val, 0, 2);
+        ApplySettingValue(Settings::values.ocarina_fsr_output,
+                          kFsrOutputChoices[static_cast<std::size_t>(val)]);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "fsr_render") == 0) {
+        val = std::clamp(val, 0, 2);
+        ApplySettingValue(Settings::values.ocarina_fsr_render,
+                          kFsrRenderChoices[static_cast<std::size_t>(val)]);
+    } else if (std::strcmp(id, "res_scale") == 0) {
+        val = std::clamp(val, 0, static_cast<int>(kResScaleChoices.size()) - 1);
+        ApplySettingValue(Settings::values.resolution_setup,
+                          kResScaleChoices[static_cast<std::size_t>(val)]);
+    } else if (std::strcmp(id, "rcas_sharp") == 0) {
+        val = std::clamp(val, 0, 200);
+        ApplySettingValue(Settings::values.fsr_sharpening_slider, val);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "oot_aa") == 0) {
+        ApplySettingValue(Settings::values.oot_anti_aliasing,
+                          val != 0 ? Settings::OotAntiAliasing::NoSharpening
+                                   : Settings::OotAntiAliasing::Game);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "win_aa") == 0) {
+        ApplySettingValue(Settings::values.anti_aliasing,
+                          static_cast<Settings::AntiAliasing>(std::clamp(val, 0, 2)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "win_filter") == 0) {
+        val = std::clamp(val, 0, static_cast<int>(kScalingFilterChoices.size()) - 1);
+        ApplySettingValue(Settings::values.scaling_filter,
+                          kScalingFilterChoices[static_cast<std::size_t>(val)]);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "aniso") == 0) {
+        ApplySettingValue(Settings::values.max_anisotropy,
+                          static_cast<Settings::AnisotropyMode>(std::clamp(val, 0, 5)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "docked") == 0) {
+        ApplySettingValue(Settings::values.use_docked_mode,
+                          val != 0 ? Settings::ConsoleMode::Docked
+                                   : Settings::ConsoleMode::Handheld);
+    } else if (std::strcmp(id, "vsync") == 0) {
+        ApplySettingValue(Settings::values.vsync_mode,
+                          static_cast<Settings::VSyncMode>(std::clamp(val, 0, 3)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "hdr") == 0) {
+        ApplySettingValue(Settings::values.hdr_mode,
+                          static_cast<Settings::HdrMode>(std::clamp(val, 0, 2)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "frame_gen") == 0) {
+        val = std::clamp(val, 0, 3);
+        ApplySettingValue(Settings::values.frame_gen, val > 0);
+        if (val == 1) {
+            ApplySettingValue(Settings::values.frame_gen_type, Settings::FrameGenType::Lsfg);
+        } else if (val == 2) {
+            ApplySettingValue(Settings::values.frame_gen_type, Settings::FrameGenType::Fsr3);
+        } else if (val == 3) {
+            ApplySettingValue(Settings::values.frame_gen_type,
+                              Settings::FrameGenType::NvidiaDlssG);
+        }
+        dirty_settings = true;
+    } else if (std::strcmp(id, "fg_mult") == 0) {
+        ApplySettingValue(Settings::values.frame_gen_multiplier,
+                          static_cast<u32>(std::clamp(val, 2, 4)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "nx2_fps") == 0) {
+        val = std::clamp(val, 0, static_cast<int>(kNx2FpsChoices.size()) - 1);
+        ApplySettingValue(Settings::values.frame_rate_limit,
+                          kNx2FpsChoices[static_cast<std::size_t>(val)]);
+    } else if (std::strcmp(id, "speed_limit") == 0) {
+        val = std::clamp(val, 0, static_cast<int>(kSpeedChoices.size()) - 1);
+        ApplySettingValue(Settings::values.use_speed_limit, val > 0);
+        if (val > 0) {
+            ApplySettingValue(Settings::values.speed_limit,
+                              kSpeedChoices[static_cast<std::size_t>(val)]);
+        }
+        dirty_settings = true;
+    } else if (std::strcmp(id, "gpu_acc") == 0) {
+        ApplySettingValue(Settings::values.gpu_accuracy,
+                          val != 0 ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
+        Settings::UpdateGPUAccuracy();
+        dirty_settings = true;
+    } else if (std::strcmp(id, "vram") == 0) {
+        ApplySettingValue(Settings::values.vram_usage_mode,
+                          val != 0 ? Settings::VramUsageMode::Aggressive
+                                   : Settings::VramUsageMode::Conservative);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "occlusion_mod") == 0) {
+        opts.occlusion_mod = (val != 0);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "async_shaders") == 0) {
+        ApplySettingValue(Settings::values.use_asynchronous_shaders, val != 0);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "disk_cache") == 0) {
+        ApplySettingValue(Settings::values.use_disk_shader_cache, val != 0);
+    } else if (std::strcmp(id, "precache") == 0) {
+        ApplySettingValue(Settings::values.precache_shaders,
+                          static_cast<Settings::PrecacheShaders>(std::clamp(val, 0, 2)));
+    } else if (std::strcmp(id, "idle_spin") == 0) {
+        val = std::clamp(val, 0, static_cast<int>(kIdleSpinChoices.size()) - 1);
+        opts.idle_spin_us = kIdleSpinChoices[static_cast<std::size_t>(val)];
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "read_areas") == 0) {
+        opts.read_areas = (val != 0);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "gamemode") == 0) {
+        opts.gamemode = (val != 0);
+        dirty_bridge = true;
+        bridge.RequestToggleGamemode();
+    } else if (std::strcmp(id, "pin_ccx") == 0) {
+        opts.pin_ccx = (val != 0);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "prompts") == 0) {
+        opts.button_prompts = std::clamp(val, 0, 6);
+        dirty_bridge = true;
+        bump_prompts = true;
+    } else if (std::strcmp(id, "pad_layout") == 0) {
+        val = std::clamp(val, 0, 2);
+        opts.pad_layout = val;
+        bridge.SetOptions(opts, true);
+        bridge.RequestApplyPadLayout(val);
+        request_save = false;
+    } else if (std::strcmp(id, "kbd_layer") == 0) {
+        opts.keyboard_layer = (val != 0);
+        dirty_bridge = true;
+        bump_prompts = true;
+    } else if (std::strcmp(id, "volume") == 0) {
+        ApplySettingValue(Settings::values.volume, static_cast<u8>(std::clamp(val, 0, 100)));
+        dirty_settings = true;
+    } else if (std::strcmp(id, "mute") == 0) {
+        ApplySettingValue(Settings::values.audio_muted, val != 0);
+        dirty_settings = true;
+    } else if (std::strcmp(id, "audio_sink") == 0) {
+        ApplySettingValue(Settings::values.sink_id,
+                          static_cast<Settings::AudioEngine>(std::clamp(val, 0, 3)));
+    } else if (std::strcmp(id, "fps_hud") == 0) {
+        opts.fps_hud = std::clamp(val, 0, 3);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "fps_corner") == 0) {
+        opts.fps_corner = std::clamp(val, 0, 3);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "menu_size") == 0) {
+        opts.menu_size = std::clamp(val, 0, 3);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "menu_lang") == 0) {
+        opts.menu_lang = std::clamp(val, 0, 1);
+        SetLang(opts.menu_lang);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "menu_key") == 0) {
+        opts.menu_key = std::clamp(val, 0, 2);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "compact_key") == 0) {
+        opts.compact_key = std::clamp(val, 0, 2);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "esc_opens") == 0) {
+        opts.esc_opens = (val != 0);
+        dirty_bridge = true;
+    }
+
+    if (dirty_bridge) {
+        bridge.SetOptions(opts, bump_prompts);
+    }
+    if (dirty_settings) {
+        bridge.BumpSettingsGeneration();
+    }
+    if (request_save) {
+        bridge.RequestSaveConfig();
+    }
+}
+
+void OotMenuController::TriggerRowAction(const char* id, Bridge& bridge) {
+    if (std::strcmp(id, "apply_restart") == 0) {
+        confirm_action_id_.clear();
+        bridge.RequestRestartGame();
+        return;
+    }
+    if (std::strcmp(id, "reset_controls") == 0) {
+        if (confirm_action_id_ == id) {
+            confirm_action_id_.clear();
+            bridge.RequestResetControls();
+        } else {
+            confirm_action_id_ = id;
+        }
+        return;
+    }
+    if (std::strcmp(id, "restart_game") == 0 || std::strcmp(id, "quit_game") == 0) {
+        if (confirm_action_id_ == id) {
+            confirm_action_id_.clear();
+            if (std::strcmp(id, "restart_game") == 0) {
+                bridge.RequestRestartGame();
+            } else {
+                bridge.RequestQuitGame();
+            }
+        } else {
+            confirm_action_id_ = id;
+        }
+    }
+}
+
+bool OotMenuController::IsRowDisabled(const char* id, const TelemetrySnapshot& tel) const {
+    if (std::strcmp(id, "fsr_output") == 0 || std::strcmp(id, "fsr_render") == 0 ||
+        std::strcmp(id, "rcas_sharp") == 0 || std::strcmp(id, "oot_aa") == 0) {
+        return !Settings::values.ocarina_fsr.GetValue();
+    }
+    if (std::strcmp(id, "fg_mult") == 0) {
+        return !Settings::values.frame_gen.GetValue();
+    }
+    if (std::strcmp(id, "apply_restart") == 0) {
+        return CollectPendingRowNames(Bridge::Instance().GetOptions()).empty() && !tel.needs_restart;
+    }
+    return false;
+}
+
+std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
+                                              const TelemetrySnapshot& tel) const {
+    const char* id = r.id;
+    if (r.kind == RowKind::Action) {
+        if (confirm_action_id_ == id) {
+            return Tr("Confirmar novamente");
+        }
+        return "";
+    }
+    if (std::strcmp(id, "upscaler") == 0) {
+        if (val == 0) {
+            return Tr("Nativo (Desligado)");
+        }
+        if (val == 2) {
+            if (!tel.fsr4_available) {
+                return std::string(Tr("FSR 4.1")) + " (GPU N/A)";
+            }
+            return tel.fsr4_int8 ? "FSR 4.1 (INT8)" : "FSR 4.1";
+        }
+        return Tr("FSR 3.1");
+    }
+    if (std::strcmp(id, "fsr_output") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"1080p (Full HD)", "1440p (QHD)",
+                                                         "4K (UHD)"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "fsr_render") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"720p (Leve)", "1080p (Equilibrado)",
+                                                         "1440p (Máxima)"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "res_scale") == 0) {
+        static constexpr std::array<const char*, 7> kLabs{
+            "0.5x (Metade)", "0.75x", "1x (Nativa)", "1.25x", "1.5x", "2x", "3x"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 6))]);
+    }
+    if (std::strcmp(id, "rcas_sharp") == 0 || std::strcmp(id, "volume") == 0) {
+        return std::to_string(val) + "%";
+    }
+    if (std::strcmp(id, "oot_aa") == 0) {
+        return Tr(val != 0 ? "Sem Nitidez (Suave)" : "Original do Jogo");
+    }
+    if (std::strcmp(id, "win_aa") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"Nenhum", "FXAA", "SMAA"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "win_filter") == 0) {
+        static constexpr std::array<const char*, 8> kLabs{
+            "Mais Próximo", "Bilinear", "Bicúbico", "Lanczos",
+            "ScaleForce",   "FSR",      "Area",     "SGSR"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 7))]);
+    }
+    if (std::strcmp(id, "aniso") == 0) {
+        static constexpr std::array<const char*, 6> kLabs{"Automático", "Padrão", "2x",
+                                                         "4x",         "8x",     "16x"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 5))]);
+    }
+    if (std::strcmp(id, "docked") == 0) {
+        return Tr(val != 0 ? "Dock (Alta Res.)" : "Portátil (720p)");
+    }
+    if (std::strcmp(id, "vsync") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{
+            "Imediato (Desligado)", "Mailbox (Sem Tearing)", "FIFO (VSync)", "FIFO Relaxado"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+    }
+    if (std::strcmp(id, "hdr") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"Desligado", "Ligado", "Automático"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "frame_gen") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{
+            "Desligado", "LSFG (Lossless)", "FSR 3 Frame Gen", "DLSS Frame Gen"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+    }
+    if (std::strcmp(id, "fg_mult") == 0) {
+        return std::to_string(val) + "x";
+    }
+    if (std::strcmp(id, "nx2_fps") == 0) {
+        return std::to_string(kNx2FpsChoices[static_cast<std::size_t>(std::clamp(val, 0, 6))]) +
+               " FPS";
+    }
+    if (std::strcmp(id, "speed_limit") == 0) {
+        static constexpr std::array<const char*, 6> kLabs{
+            "Ilimitado",        "100% (60 FPS base)",  "150% (90 FPS base)",
+            "200% (120 FPS base)", "240% (144 FPS base)", "400% (240 FPS base)"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 5))]);
+    }
+    if (std::strcmp(id, "gpu_acc") == 0) {
+        return Tr(val != 0 ? "Alta" : "Baixa (Normal)");
+    }
+    if (std::strcmp(id, "vram") == 0) {
+        return Tr(val != 0 ? "Agressivo" : "Conservador");
+    }
+    if (std::strcmp(id, "precache") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"Desligado", "Perguntar", "Sempre"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "idle_spin") == 0) {
+        const int us = kIdleSpinChoices[static_cast<std::size_t>(std::clamp(val, 0, 5))];
+        if (us < 0) {
+            return Tr("Padrão (-1)");
+        }
+        return std::to_string(us) + " us";
+    }
+    if (std::strcmp(id, "prompts") == 0) {
+        static constexpr std::array<const char*, 7> kLabs{
+            "Automático", "Switch", "Xbox", "PS4", "PS5", "Steam Deck", "Teclado"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 6))]);
+    }
+    if (std::strcmp(id, "pad_layout") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{
+            "Nintendo Posicional", "Xbox PC (A=Baixo, B=Dir)", "Personalizado"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "audio_sink") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{"Automático", "Cubeb", "SDL3", "Null"};
+        return kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))];
+    }
+    if (std::strcmp(id, "fps_hud") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{
+            "Desligado", "Simples", "Frame time + 1%", "Detalhado"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+    }
+    if (std::strcmp(id, "fps_corner") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{
+            "Superior Direito", "Superior Esquerdo", "Inferior Direito", "Inferior Esquerdo"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+    }
+    if (std::strcmp(id, "menu_size") == 0) {
+        static constexpr std::array<const char*, 4> kLabs{"Automático", "Pequeno", "Médio", "Grande"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+    }
+    if (std::strcmp(id, "menu_lang") == 0) {
+        return val == 1 ? "English" : "Português (BR)";
+    }
+    if (std::strcmp(id, "menu_key") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"Insert ou F1", "Insert", "F1"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (std::strcmp(id, "compact_key") == 0) {
+        static constexpr std::array<const char*, 3> kLabs{"RShift", "RCtrl", "F4"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+    }
+    if (r.kind == RowKind::Toggle) {
+        return Tr(val != 0 ? "Ligado" : "Desligado");
+    }
+    return std::to_string(val);
+}
+
+void OotMenuController::ClampSelection(const std::vector<const RowDef*>& tab_rows) {
+    if (tab_rows.empty()) {
+        return;
+    }
+    int& sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
+    sel = std::clamp(sel, 0, static_cast<int>(tab_rows.size()) - 1);
+    if (tab_rows[static_cast<std::size_t>(sel)]->kind == RowKind::Heading) {
+        for (int i = 0; i < static_cast<int>(tab_rows.size()); ++i) {
+            if (tab_rows[static_cast<std::size_t>(i)]->kind != RowKind::Heading) {
+                sel = i;
+                break;
+            }
+        }
+    }
+}
+
+void OotMenuController::MoveSelection(int delta, const std::vector<const RowDef*>& tab_rows) {
+    if (tab_rows.empty()) {
+        return;
+    }
+    confirm_action_id_.clear();
+    const int n = static_cast<int>(tab_rows.size());
+    int& sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
+    int next = sel;
+    for (int step = 0; step < n; ++step) {
+        next = (next + delta + n) % n;
+        if (tab_rows[static_cast<std::size_t>(next)]->kind != RowKind::Heading) {
+            sel = next;
+            return;
+        }
+    }
+}
+
+void OotMenuController::AdjustRow(const RowDef& r, int delta, Bridge& bridge) {
+    const auto tel = bridge.GetTelemetry();
+    if (IsRowDisabled(r.id, tel)) {
+        return;
+    }
+    auto opts = bridge.GetOptions();
+    if (r.kind == RowKind::Action) {
+        if (delta == 0) {
+            TriggerRowAction(r.id, bridge);
+        }
+        return;
+    }
+    int cur = ReadRowValue(r.id, opts);
+    int next = cur;
+    if (r.kind == RowKind::Slider) {
+        next = std::clamp(cur + delta * r.step, r.lo, r.hi);
+    } else if (r.kind == RowKind::Toggle) {
+        next = (delta == 0) ? (1 - cur) : std::clamp(cur + delta, 0, 1);
+    } else {
+        const int span = r.hi - r.lo + 1;
+        if (delta == 0) {
+            next = r.lo + ((cur - r.lo + 1) % span);
+        } else {
+            next = r.lo + ((cur - r.lo + delta + span) % span);
+        }
+    }
+    if (next != cur) {
+        confirm_action_id_.clear();
+        WriteRowValue(r.id, next, opts, bridge);
+    }
+}
+
+void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
+    if (!bridge.IsOpen()) {
+        prev_pad_mask_ = 0;
+        held_dir_ = 0;
+        return;
+    }
+    auto tab_rows = RowsForTab(cur_tab_);
+    ClampSelection(tab_rows);
+
+    auto switch_tab = [&](int delta) {
+        confirm_action_id_.clear();
+        const int count = static_cast<int>(Tab::Count);
+        cur_tab_ = static_cast<Tab>((static_cast<int>(cur_tab_) + delta + count) % count);
+        tab_rows = RowsForTab(cur_tab_);
+        ClampSelection(tab_rows);
+    };
+
+    auto apply_nav = [&](int up_down, int left_right, bool confirm, bool back, int tab_delta) {
+        if (tab_delta != 0) {
+            switch_tab(tab_delta);
+        }
+        if (up_down != 0) {
+            MoveSelection(up_down, tab_rows);
+        }
+        if (left_right != 0 && !tab_rows.empty()) {
+            const int sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
+            AdjustRow(*tab_rows[static_cast<std::size_t>(sel)], left_right, bridge);
+        }
+        if (confirm && !tab_rows.empty()) {
+            const int sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
+            AdjustRow(*tab_rows[static_cast<std::size_t>(sel)], 0, bridge);
+        }
+        if (back) {
+            if (!confirm_action_id_.empty()) {
+                confirm_action_id_.clear();
+            } else {
+                bridge.CloseMenu();
+            }
+        }
+    };
+
+    std::vector<Common::OotMenu::KeyEvent> keys;
+    bridge.DrainKeyEvents(keys);
+    for (const auto& ev : keys) {
+        if (!ev.down) {
+            continue;
+        }
+        switch (ev.key) {
+        case Key::Up:
+            apply_nav(-1, 0, false, false, 0);
+            break;
+        case Key::Down:
+            apply_nav(1, 0, false, false, 0);
+            break;
+        case Key::Left:
+            apply_nav(0, -1, false, false, 0);
+            break;
+        case Key::Right:
+            apply_nav(0, 1, false, false, 0);
+            break;
+        case Key::PageUp:
+            MoveSelection(-5, tab_rows);
+            break;
+        case Key::PageDown:
+            MoveSelection(5, tab_rows);
+            break;
+        case Key::Home:
+            tab_sel_[static_cast<std::size_t>(cur_tab_)] = 0;
+            ClampSelection(tab_rows);
+            break;
+        case Key::End:
+            tab_sel_[static_cast<std::size_t>(cur_tab_)] =
+                static_cast<int>(tab_rows.size()) - 1;
+            MoveSelection(0, tab_rows);
+            break;
+        case Key::Confirm:
+            apply_nav(0, 0, true, false, 0);
+            break;
+        case Key::Back:
+        case Key::Esc:
+            apply_nav(0, 0, false, true, 0);
+            break;
+        case Key::TabPrev:
+            apply_nav(0, 0, false, false, -1);
+            break;
+        case Key::TabNext:
+            apply_nav(0, 0, false, false, 1);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Gamepad navigation with smooth initial hold delay + fast repeat
+    bool from_kbd = false;
+    const u64 mask = bridge.GamepadNavMask(&from_kbd);
+    const u64 pressed = mask & ~prev_pad_mask_;
+    prev_pad_mask_ = mask;
+
+    constexpr u64 kBitA = 1ULL << 0;
+    constexpr u64 kBitB = 1ULL << 1;
+    constexpr u64 kBitL = 1ULL << 6;
+    constexpr u64 kBitR = 1ULL << 7;
+    constexpr u64 kBitPlus = 1ULL << 10;
+    constexpr u64 kBitLeft = (1ULL << 12) | (1ULL << 16);
+    constexpr u64 kBitUp = (1ULL << 13) | (1ULL << 17);
+    constexpr u64 kBitRight = (1ULL << 14) | (1ULL << 18);
+    constexpr u64 kBitDown = (1ULL << 15) | (1ULL << 19);
+
+    int cur_dir = 0;
+    if (mask & kBitUp) {
+        cur_dir = 1;
+    } else if (mask & kBitDown) {
+        cur_dir = 2;
+    } else if (mask & kBitLeft) {
+        cur_dir = 3;
+    } else if (mask & kBitRight) {
+        cur_dir = 4;
+    }
+
+    bool trigger_dir = false;
+    if (cur_dir == 0) {
+        held_dir_ = 0;
+        dir_hold_timer_ = 0.0f;
+        dir_repeat_timer_ = 0.0f;
+    } else if (cur_dir != held_dir_) {
+        held_dir_ = cur_dir;
+        dir_hold_timer_ = 0.0f;
+        dir_repeat_timer_ = 0.0f;
+        trigger_dir = true;
+    } else {
+        dir_hold_timer_ += dt_sec;
+        if (dir_hold_timer_ >= 0.34f) {
+            dir_repeat_timer_ += dt_sec;
+            if (dir_repeat_timer_ >= 0.065f) {
+                dir_repeat_timer_ = 0.0f;
+                trigger_dir = true;
+            }
+        }
+    }
+
+    if (trigger_dir) {
+        apply_nav(held_dir_ == 1 ? -1 : (held_dir_ == 2 ? 1 : 0),
+                  held_dir_ == 3 ? -1 : (held_dir_ == 4 ? 1 : 0), false, false, 0);
+    }
+    if ((pressed & kBitL) != 0) {
+        apply_nav(0, 0, false, false, -1);
+    }
+    if ((pressed & kBitR) != 0) {
+        apply_nav(0, 0, false, false, 1);
+    }
+    if ((pressed & kBitA) != 0) {
+        apply_nav(0, 0, true, false, 0);
+    }
+    if ((pressed & (kBitB | kBitPlus)) != 0) {
+        apply_nav(0, 0, false, true, 0);
+    }
+
+    ProcessPointer(bridge, tab_rows);
+}
+
+void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const RowDef*>& tab_rows) {
+    const auto ptr = bridge.ConsumePointer();
+    const float mx = ptr.x - menu_ox_;
+    const float my = ptr.y;
+    const std::size_t tab_idx = static_cast<std::size_t>(cur_tab_);
+
+    if (ptr.wheel_y != 0.0f && !bridge.IsCompact()) {
+        const float max_scroll = std::max(0.0f, static_cast<float>(tab_rows.size()) - 8.0f);
+        scroll_want_[tab_idx] =
+            std::clamp(scroll_want_[tab_idx] - ptr.wheel_y * 2.0f, 0.0f, max_scroll);
+    }
+
+    hover_tab_ = -1;
+    hover_apply_ = false;
+    if (ptr.moved) {
+        hover_row_ = -1;
+    }
+
+    const bool l_down = (ptr.held_mask & 1u) != 0;
+    const bool l_pressed = (ptr.pressed_mask & 1u) != 0;
+    const bool r_pressed = (ptr.pressed_mask & 2u) != 0;
+
+    if (!l_down) {
+        dragging_slider_row_ = -1;
+    }
+
+    if (r_pressed) {
+        bridge.CloseMenu();
+        return;
+    }
+
+    for (const auto& hb : hits_) {
+        const bool inside = (mx >= hb.x0 && mx <= hb.x1 && my >= hb.y0 && my <= hb.y1);
+        if (hb.kind == HitKind::SliderTrack && dragging_slider_row_ == hb.index && l_down &&
+            !tab_rows.empty() && hb.index >= 0 && hb.index < static_cast<int>(tab_rows.size())) {
+            const float denom = std::max(1.0f, hb.tx1 - hb.tx0);
+            const float norm = std::clamp((mx - hb.tx0) / denom, 0.0f, 1.0f);
+            const auto& r = *tab_rows[static_cast<std::size_t>(hb.index)];
+            const int raw =
+                r.lo + static_cast<int>(std::lround(norm * static_cast<float>(r.hi - r.lo)));
+            const int snapped = ((raw - r.lo + r.step / 2) / r.step) * r.step + r.lo;
+            auto opts = bridge.GetOptions();
+            if (ReadRowValue(r.id, opts) != snapped) {
+                WriteRowValue(r.id, snapped, opts, bridge);
+            }
+            return;
+        }
+        if (!inside) {
+            continue;
+        }
+        switch (hb.kind) {
+        case HitKind::Tab:
+            hover_tab_ = hb.index;
+            if (l_pressed) {
+                cur_tab_ = static_cast<Tab>(hb.index);
+                confirm_action_id_.clear();
+                const auto next_rows = RowsForTab(cur_tab_);
+                ClampSelection(next_rows);
+            }
+            return;
+        case HitKind::TabPrev:
+        case HitKind::TabNext:
+            if (l_pressed) {
+                const int d = (hb.kind == HitKind::TabPrev) ? -1 : 1;
+                const int count = static_cast<int>(Tab::Count);
+                cur_tab_ =
+                    static_cast<Tab>((static_cast<int>(cur_tab_) + d + count) % count);
+                confirm_action_id_.clear();
+                const auto next_rows = RowsForTab(cur_tab_);
+                ClampSelection(next_rows);
+            }
+            return;
+        case HitKind::ApplyRestart:
+            hover_apply_ = true;
+            if (l_pressed) {
+                bridge.RequestRestartGame();
+            }
+            return;
+        case HitKind::BackToCompact:
+            if (l_pressed) {
+                bridge.ToggleCompact();
+            }
+            return;
+        case HitKind::Row:
+        case HitKind::SliderTrack:
+            if (hb.index >= 0 && hb.index < static_cast<int>(tab_rows.size())) {
+                const auto& r = *tab_rows[static_cast<std::size_t>(hb.index)];
+                if (r.kind != RowKind::Heading) {
+                    if (ptr.moved) {
+                        hover_row_ = hb.index;
+                        tab_sel_[tab_idx] = hb.index;
+                        last_scrolled_[tab_idx] = hb.index;
+                    }
+                    if (l_pressed) {
+                        tab_sel_[tab_idx] = hb.index;
+                        if (r.kind == RowKind::Slider && hb.tx1 > hb.tx0) {
+                            dragging_slider_row_ = hb.index;
+                            const float norm =
+                                std::clamp((mx - hb.tx0) / (hb.tx1 - hb.tx0), 0.0f, 1.0f);
+                            const int raw =
+                                r.lo +
+                                static_cast<int>(std::lround(norm * static_cast<float>(r.hi - r.lo)));
+                            const int snapped =
+                                ((raw - r.lo + r.step / 2) / r.step) * r.step + r.lo;
+                            auto opts = bridge.GetOptions();
+                            WriteRowValue(r.id, snapped, opts, bridge);
+                        } else if (mx >= hb.vx0 && mx <= hb.vx1) {
+                            const float vmid = (hb.vx0 + hb.vx1) * 0.5f;
+                            if (r.kind == RowKind::Toggle) {
+                                auto opts = bridge.GetOptions();
+                                WriteRowValue(r.id, mx >= vmid ? 1 : 0, opts, bridge);
+                            } else if (r.kind == RowKind::Action) {
+                                TriggerRowAction(r.id, bridge);
+                            } else {
+                                AdjustRow(r, mx < vmid ? -1 : 1, bridge);
+                            }
+                        } else if (r.kind == RowKind::Action) {
+                            TriggerRowAction(r.id, bridge);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+
+void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
+    const float s = c.s;
+    const auto opts = bridge.GetOptions();
+    const auto tel = bridge.GetTelemetry();
+    const auto tab_rows = RowsForTab(cur_tab_);
+    ClampSelection(tab_rows);
+
+    const int sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
+    const auto& r = *tab_rows[static_cast<std::size_t>(sel)];
+    const int val = ReadRowValue(r.id, opts);
+    const bool pending = r.requires_restart && IsRowPendingRestart(r.id, opts);
+    const bool disabled = IsRowDisabled(r.id, tel);
+
+    const float bw = std::min(c.w - 2.0f * c.safe, 760.0f * s);
+    const float bx0 = (c.w - bw) * 0.5f;
+    const float bx1 = bx0 + bw;
+    const float bh = 112.0f * s;
+    const float by1 = c.h - c.safe - 14.0f * s;
+    const float by0 = by1 - bh;
+
+    c.d->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), Rgba(14, 10, 6, 236), 6.0f * s);
+    c.d->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1), Alpha(kEdge, 0.9f), 6.0f * s,
+                 std::max(1.0f, s));
+
+    const float header_y = by0 + 14.0f * s;
+    const char* cur_name = TabTitles()[static_cast<std::size_t>(cur_tab_)];
+    const float nw = TextMid(c, c.f.heading, 14.5f * s, bx0 + 16.0f * s, header_y, kGoldHi, cur_name);
+    const char* tab_hint = c.pad ? " (L / R)" : " (Q / E)";
+    TextMidRaw(c, c.f.body, 12.5f * s, bx0 + 18.0f * s + nw, header_y, kDim, tab_hint);
+
+    if (pending || r.requires_restart) {
+        Diamond(c, ImVec2(bx1 - 20.0f * s, header_y), 4.0f * s, kGoldHi);
+        TextMidRight(c, c.f.body, 12.5f * s, bx1 - 30.0f * s, header_y, kGoldHi,
+                     pending ? "Após reiniciar" : "Requer reinício");
+    } else {
+        c.d->AddCircleFilled(ImVec2(bx1 - 20.0f * s, header_y), 3.5f * s, kLiveGreen);
+        TextMidRight(c, c.f.body, 12.5f * s, bx1 - 30.0f * s, header_y, kLiveGreen, "Ao Vivo");
+    }
+
+    const float ry0 = by0 + 28.0f * s;
+    const float ry1 = ry0 + 38.0f * s;
+    const float rx0 = bx0 + 14.0f * s;
+    const float rx1 = bx1 - 14.0f * s;
+    const float split = rx0 + (rx1 - rx0) * 0.45f;
+
+    DrawNameCell(c, ImVec2(rx0, ry0), ImVec2(split, ry1), r.label, true, pending,
+                 !r.requires_restart);
+
+    const ImVec2 va(split, ry0);
+    const ImVec2 vb(rx1, ry1);
+    float tx0 = 0.0f;
+    float tx1 = 0.0f;
+    const std::string val_str = FormatRowValue(r, val, tel);
+    if (r.kind == RowKind::Slider) {
+        DrawSliderCell(c, va, vb, val_str,
+                       static_cast<int>((val - r.lo) * 1000LL / std::max(1, r.hi - r.lo)), true,
+                       &tx0, &tx1);
+    } else if (r.kind == RowKind::Toggle) {
+        const char* lo_l = std::strcmp(r.id, "gpu_acc") == 0
+                               ? "Baixa (Normal)"
+                               : (std::strcmp(r.id, "vram") == 0 ? "Conservador" : "Desligado");
+        const char* hi_l = std::strcmp(r.id, "gpu_acc") == 0
+                               ? "Alta"
+                               : (std::strcmp(r.id, "vram") == 0 ? "Agressivo" : "Ligado");
+        DrawHalvesCell(c, va, vb, lo_l, hi_l, val != 0, true, disabled);
+    } else {
+        DrawChoiceCell(c, va, vb, val_str, true, !disabled && r.kind != RowKind::Action,
+                       !disabled && r.kind != RowKind::Action, disabled);
+    }
+    hits_.push_back({rx0, ry0, rx1, ry1,
+                     r.kind == RowKind::Slider ? HitKind::SliderTrack : HitKind::Row, sel, va.x,
+                     vb.x, tx0, tx1});
+
+    const char* compact_k =
+        opts.compact_key == 1 ? "RCtrl" : (opts.compact_key == 2 ? "F4" : "RShift");
+    const std::array<Prompt, 4> pr{{
+        {Glyph::UpDown, "Escolher"},
+        {r.kind == RowKind::Action ? Glyph::Confirm : Glyph::LeftRight, "Alterar"},
+        {Glyph::Compact, "Menu completo", compact_k},
+        {Glyph::Back, "Fechar"},
+    }};
+    const float pw = Prompts(c, ImVec2(0.0f, 0.0f), pr.data(), 4, false);
+    Prompts(c, ImVec2(bx0 + (bw - pw) * 0.5f, by1 - 33.0f * s), pr.data(), 4, true);
+}
+
+void OotMenuController::DrawControlsBindings(Ctx& c, float x0, float x1, float top, float bottom,
+                                             const Common::OotMenu::PadBindingSnapshot& snap) {
+    const float s = c.s;
+    const float pad_top = top + 12.0f * s;
+    const float row_h = 26.0f * s;
+    const float col1_x = x0 + 18.0f * s;
+    const float col2_x = x0 + (x1 - x0) * 0.42f;
+    const float col3_x = x0 + (x1 - x0) * 0.72f;
+
+    const std::string header = std::string(Tr("Mapeamento Jogador 1")) +
+                               (snap.pad_connected && !snap.active_pad_name.empty()
+                                    ? (" · " + snap.active_pad_name)
+                                    : "");
+    TextMidRaw(c, c.f.heading, 15.0f * s, col1_x, pad_top + 10.0f * s, kAccent, header.c_str());
+
+    const float list_top = pad_top + 26.0f * s;
+    const int fit = std::max(1, static_cast<int>((bottom - list_top) / row_h));
+    const int n = std::min(fit, static_cast<int>(kSwitchActionLabels.size()));
+    for (int i = 0; i < n; ++i) {
+        const float ry = list_top + static_cast<float>(i) * row_h;
+        if ((i & 1) == 0) {
+            c.d->AddRectFilled(ImVec2(x0 + 10.0f * s, ry), ImVec2(x1 - 10.0f * s, ry + row_h - 2.0f * s),
+                               Rgba(24, 18, 12, 170));
+        }
+        const float ym = ry + row_h * 0.5f;
+        TextMid(c, c.f.body, 14.0f * s, col1_x, ym, kInk, kSwitchActionLabels[static_cast<std::size_t>(i)]);
+        const char* p_str = snap.pad_names[static_cast<std::size_t>(i)].empty()
+                                ? "-"
+                                : snap.pad_names[static_cast<std::size_t>(i)].c_str();
+        const char* k_str = snap.key_names[static_cast<std::size_t>(i)].empty()
+                                ? "-"
+                                : snap.key_names[static_cast<std::size_t>(i)].c_str();
+        TextMidRaw(c, c.f.strong, 14.0f * s, col2_x, ym, kGoldHi, p_str);
+        TextMidRaw(c, c.f.body, 14.0f * s, col3_x, ym, kSoft, k_str);
+    }
+}
+
+void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
+    const float s = c.s;
+    const float hh = BannerHeight(c);
+    const auto opts = bridge.GetOptions();
+    const auto tel = bridge.GetTelemetry();
+    const auto bindings = bridge.GetPadBindings();
+
+    Banner(c, hh);
+
+    // Centered tabs in banner
+    std::array<float, 4> tw{};
+    float total = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        tw[static_cast<std::size_t>(i)] =
+            SizeOf(c.f.heading, 22.0f * s, TabTitles()[static_cast<std::size_t>(i)]).x + 52.0f * s;
+        total += tw[static_cast<std::size_t>(i)];
+    }
+    float tx = (c.w - total) * 0.5f;
+    const float ty = hh * 0.5f + s;
+    const std::array<const char*, 2> tab_keys{c.pad ? "L" : "Q", c.pad ? "R" : "E"};
+    for (int i = 0; i < 2; ++i) {
+        const float cw = 26.0f * s;
+        const float cx = (i == 1) ? (tx + total + 20.0f * s) : (tx - 20.0f * s - cw);
+        c.d->AddRectFilled(ImVec2(cx, ty - 13.0f * s), ImVec2(cx + cw, ty + 13.0f * s), kBannerInk,
+                           3.0f * s);
+        TextMidCentreRaw(c, c.f.strong, 14.0f * s, cx + cw * 0.5f, ty, kInk,
+                         tab_keys[static_cast<std::size_t>(i)]);
+        hits_.push_back({(i == 1) ? cx - 10.0f * s : 0.0f, 0.0f, (i == 1) ? c.w : cx + cw + 10.0f * s,
+                         hh, (i == 1) ? HitKind::TabNext : HitKind::TabPrev, -1, 0, 0, 0, 0});
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        const bool shown = (i == static_cast<int>(cur_tab_));
+        const bool hover = (i == hover_tab_);
+        if (shown || hover) {
+            c.d->AddRectFilled(ImVec2(tx, 0.0f), ImVec2(tx + tw[static_cast<std::size_t>(i)], hh - 3.0f * s),
+                               shown ? kTabInset : Alpha(kTabInset, 0.35f));
+        }
+        TextMid(c, c.f.heading, 22.0f * s, tx + 26.0f * s, ty, shown ? kInkBright : kBannerInk,
+                TabTitles()[static_cast<std::size_t>(i)]);
+        hits_.push_back(
+            {tx, 0.0f, tx + tw[static_cast<std::size_t>(i)], hh, HitKind::Tab, i, 0, 0, 0, 0});
+        tx += tw[static_cast<std::size_t>(i)];
+    }
+
+    // Left badge inside banner
+    {
+        const float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
+        const char* ver = "Lichii · OoT PC";
+        const float fit = FitPx(15.0f * s, 10.0f * s, 0.5f * s, room,
+                                [&](float px) { return SizeOfRaw(c.f.body, px, ver).x; });
+        if (fit > 0.0f) {
+            TextMidRaw(c, c.f.body, fit, c.safe, ty, kBannerInk, ver);
+        }
+    }
+
+    float cx0 = 0.0f, cx1 = 0.0f, hx0 = 0.0f, hx1 = 0.0f;
+    bool narrow = false;
+    Columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    DrawColumn(c, cx0, cx1, hh);
+
+    const auto tab_rows = RowsForTab(cur_tab_);
+    ClampSelection(tab_rows);
+    const std::size_t tid = static_cast<std::size_t>(cur_tab_);
+    const int sel = tab_sel_[tid];
+    const int n = static_cast<int>(tab_rows.size());
+
+    const float list_top = hh + 14.0f * s;
+    const float list_bottom =
+        (cur_tab_ == Tab::Controls) ? (hh + 218.0f * s) : (PromptBarTop(c) - 10.0f * s);
+    const float pitch = 44.0f * s;
+    const int fit = std::max(1, static_cast<int>((list_bottom - list_top) / pitch));
+
+    float& at = scroll_at_[tid];
+    float& want = scroll_want_[tid];
+    if (n <= fit) {
+        want = 0.0f;
+    } else {
+        if (sel != last_scrolled_[tid]) {
+            const int margin = fit > 4 ? 1 : 0;
+            if (static_cast<float>(sel - margin) < want) {
+                want = static_cast<float>(std::max(0, sel - margin));
+            }
+            if (static_cast<float>(sel + margin + 1) > want + static_cast<float>(fit)) {
+                want = static_cast<float>(sel + margin + 1 - fit);
+            }
+        }
+        want = std::clamp(want, 0.0f, static_cast<float>(n - fit));
+    }
+    last_scrolled_[tid] = sel;
+    at += (want - at) * 0.25f;
+    if (std::fabs(want - at) < 0.02f) {
+        at = want;
+    }
+
+    const float rx0 = cx0 + 18.0f * s;
+    const float rx1 = cx1 - 24.0f * s;
+    const float split = rx0 + (rx1 - rx0) * 0.50f;
+    const float row_h = 37.0f * s;
+
+    c.d->PushClipRect(ImVec2(cx0, hh + 2.0f * s), ImVec2(cx1, list_bottom));
+    for (int i = 0; i < n; ++i) {
+        const float ry0 = list_top + (static_cast<float>(i) - at) * pitch;
+        const float ry1 = ry0 + row_h;
+        if (ry1 < hh || ry0 > list_bottom) {
+            continue;
+        }
+        const auto& r = *tab_rows[static_cast<std::size_t>(i)];
+        if (r.kind == RowKind::Heading) {
+            TextMid(c, c.f.heading, 15.0f * s, rx0 + 4.0f * s, (ry0 + ry1) * 0.5f + 2.0f * s,
+                    kAccent, r.label);
+            c.d->AddLine(ImVec2(rx0, ry1 - 4.0f * s), ImVec2(rx1, ry1 - 4.0f * s), Alpha(kEdge, 0.7f),
+                         std::max(1.0f, s));
+            continue;
+        }
+
+        const bool is_sel = (i == sel);
+        const bool is_hov = (i == hover_row_);
+        const int val = ReadRowValue(r.id, opts);
+        const bool pending = r.requires_restart && IsRowPendingRestart(r.id, opts);
+        const bool disabled = IsRowDisabled(r.id, tel);
+
+        if (r.kind == RowKind::Action) {
+            const ImU32 label_col = is_sel ? kGoldInk : (disabled ? kDim : kInk);
+            if (is_sel && !disabled) {
+                GoldFill(c, ImVec2(rx0, ry0), ImVec2(rx1, ry1));
+            } else {
+                c.d->AddRectFilled(ImVec2(rx0, ry0), ImVec2(rx1, ry1),
+                                   is_hov ? kCellNameSel : kCellName);
+            }
+            c.d->AddRect(ImVec2(rx0, ry0), ImVec2(rx1, ry1), kEdge, 0.0f, std::max(1.0f, s));
+            const std::string action_text =
+                confirm_action_id_ == r.id ? Tr("Confirmar novamente") : Tr(r.label);
+            TextMidCentreRaw(c, is_sel ? c.f.strong : c.f.body, 18.0f * s, (rx0 + rx1) * 0.5f,
+                             (ry0 + ry1) * 0.5f, label_col, action_text.c_str());
+            if (is_sel) {
+                Glow(c, ImVec2(rx0, ry0), ImVec2(rx1, ry1));
+            }
+            hits_.push_back({rx0, ry0, rx1, ry1, HitKind::Row, i, rx0, rx1, 0, 0});
+            continue;
+        }
+
+        DrawNameCell(c, ImVec2(rx0, ry0), ImVec2(split, ry1), r.label, is_sel || is_hov, pending,
+                     !r.requires_restart);
+        const ImVec2 va(split, ry0);
+        const ImVec2 vb(rx1, ry1);
+        float tx0 = 0.0f;
+        float tx1 = 0.0f;
+        const std::string val_str = FormatRowValue(r, val, tel);
+        if (r.kind == RowKind::Slider) {
+            DrawSliderCell(c, va, vb, val_str,
+                           static_cast<int>((val - r.lo) * 1000LL / std::max(1, r.hi - r.lo)),
+                           is_sel, &tx0, &tx1);
+        } else if (r.kind == RowKind::Toggle) {
+            const char* lo_l =
+                std::strcmp(r.id, "gpu_acc") == 0
+                    ? "Baixa (Normal)"
+                    : (std::strcmp(r.id, "vram") == 0
+                           ? "Conservador"
+                           : (std::strcmp(r.id, "docked") == 0
+                                  ? "Portátil (720p)"
+                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Original do Jogo"
+                                                                      : "Desligado")));
+            const char* hi_l =
+                std::strcmp(r.id, "gpu_acc") == 0
+                    ? "Alta"
+                    : (std::strcmp(r.id, "vram") == 0
+                           ? "Agressivo"
+                           : (std::strcmp(r.id, "docked") == 0
+                                  ? "Dock (Alta Res.)"
+                                  : (std::strcmp(r.id, "oot_aa") == 0 ? "Sem Nitidez (Suave)"
+                                                                      : "Ligado")));
+            DrawHalvesCell(c, va, vb, lo_l, hi_l, val != 0, is_sel, disabled);
+        } else {
+            DrawChoiceCell(c, va, vb, val_str, is_sel, !disabled, !disabled, disabled);
+        }
+        hits_.push_back({rx0, ry0, rx1, ry1,
+                         r.kind == RowKind::Slider ? HitKind::SliderTrack : HitKind::Row, i, va.x,
+                         vb.x, tx0, tx1});
+    }
+    c.d->PopClipRect();
+
+    if (n > fit) {
+        const float sx = cx1 - 9.0f * s;
+        const float span = list_bottom - list_top;
+        const float sb0 = list_top + span * at / static_cast<float>(n);
+        const float sb1 = list_top + span * (at + static_cast<float>(fit)) / static_cast<float>(n);
+        c.d->AddRectFilled(ImVec2(sx - 2.0f * s, list_top), ImVec2(sx + 2.0f * s, list_bottom),
+                           Rgba(0, 0, 0, 140), 2.0f * s);
+        c.d->AddRectFilled(ImVec2(sx - 2.0f * s, sb0), ImVec2(sx + 2.0f * s, sb1), kAccent, 2.0f * s);
+    }
+
+    if (cur_tab_ == Tab::Controls) {
+        DrawControlsBindings(c, cx0 + 12.0f * s, cx1 - 12.0f * s, list_bottom + 4.0f * s,
+                             PromptBarTop(c) - 10.0f * s, bindings);
+    }
+
+    // Right Help & Live Telemetry Card
+    const auto& sel_row = *tab_rows[static_cast<std::size_t>(sel)];
+    const auto pending_list = CollectPendingRowNames(opts);
+    const bool any_pending = !pending_list.empty() || tel.needs_restart;
+
+    if (!narrow) {
+        const float hy0 = hh + 24.0f * s;
+        const float hy1 = PromptBarTop(c) - 18.0f * s;
+        Box(c, ImVec2(hx0, hy0), ImVec2(hx1, hy1));
+        c.d->PushClipRect(ImVec2(hx0, hy0), ImVec2(hx1, hy1));
+
+        float y = hy0 + 22.0f * s;
+        const float w_txt = hx1 - hx0 - 48.0f * s;
+        Text(c, c.f.heading, 21.0f * s, ImVec2(hx0 + 24.0f * s, y), kInk, sel_row.label);
+        y += 32.0f * s;
+
+        if (sel_row.requires_restart) {
+            Diamond(c, ImVec2(hx0 + 29.0f * s, y + 9.0f * s), 4.0f * s, kGoldHi);
+            TextMid(c, c.f.strong, 15.5f * s, hx0 + 42.0f * s, y + 9.0f * s, kGoldHi,
+                    "Requer reinício");
+            y += 28.0f * s;
+        } else {
+            c.d->AddCircleFilled(ImVec2(hx0 + 29.0f * s, y + 9.0f * s), 3.8f * s, kLiveGreen);
+            TextMid(c, c.f.strong, 15.5f * s, hx0 + 42.0f * s, y + 9.0f * s, kLiveGreen, "Ao Vivo");
+            y += 28.0f * s;
+        }
+
+        if (sel_row.help && *sel_row.help) {
+            y += Para(c, c.f.body, 17.5f * s, ImVec2(hx0 + 24.0f * s, y), kInk, sel_row.help,
+                      w_txt);
+            y += 16.0f * s;
+        }
+
+        // Live telemetry readout inside help panel
+        char tel_buf[256];
+        std::snprintf(tel_buf, sizeof(tel_buf), "%s: %ux%u -> %ux%u | %s\nFPS: %.1f (%.2f ms)",
+                      Tr("Upscaler (OoT)"), tel.render_width, tel.render_height, tel.output_width,
+                      tel.output_height, tel.upscaler_name.c_str(), tel.fps, tel.frametime_ms);
+        c.d->AddRectFilled(ImVec2(hx0 + 24.0f * s, y + 2.0f * s),
+                           ImVec2(hx0 + 26.5f * s, y + 42.0f * s), kAccent, s);
+        TextRaw(c, c.f.body, 15.0f * s, ImVec2(hx0 + 38.0f * s, y), kSoft, tel_buf, w_txt - 16.0f * s);
+        y += 52.0f * s;
+
+        std::string ctrl_line;
+        if (bindings.pad_connected && !bindings.active_pad_name.empty()) {
+            ctrl_line = std::string(Tr("Layout do Controle")) + ": " + bindings.active_pad_name;
+        } else {
+            ctrl_line = std::string(Tr("Teclado")) +
+                        (tel.has_prompts ? " (Prompts Dinâmicos ON)" : "");
+        }
+        TextRaw(c, c.f.body, 14.5f * s, ImVec2(hx0 + 24.0f * s, y), kDim, ctrl_line.c_str(),
+                w_txt);
+
+        if (any_pending && hy1 - 86.0f * s > y + 28.0f * s) {
+            const float sep_y = hy1 - 92.0f * s;
+            c.d->AddLine(ImVec2(hx0 + 24.0f * s, sep_y), ImVec2(hx1 - 24.0f * s, sep_y),
+                         Alpha(kEdge, 0.8f), std::max(1.0f, s));
+            std::string msg = std::to_string(pending_list.size()) + " " + Tr("Após reiniciar");
+            TextMidRaw(c, c.f.strong, 14.5f * s, hx0 + 24.0f * s, sep_y + 18.0f * s, kGoldHi,
+                       msg.c_str());
+            const ImVec2 b0(hx0 + 24.0f * s, hy1 - 54.0f * s);
+            const ImVec2 b1(hx1 - 24.0f * s, hy1 - 14.0f * s);
+            Button(c, b0, b1, "Aplicar e Reiniciar", hover_apply_);
+            hits_.push_back({b0.x, b0.y, b1.x, b1.y, HitKind::ApplyRestart, -1, 0, 0, 0, 0});
+        }
+        c.d->PopClipRect();
+    }
+
+    const char* compact_k =
+        opts.compact_key == 1 ? "RCtrl" : (opts.compact_key == 2 ? "F4" : "RShift");
+    const std::array<Prompt, 6> prompt_list{{
+        {Glyph::UpDown, "Escolher"},
+        {sel_row.kind == RowKind::Action ? Glyph::Confirm : Glyph::LeftRight, "Alterar"},
+        {Glyph::Tabs, "Abas"},
+        {Glyph::Compact, "Compacto", compact_k},
+        {Glyph::Confirm, "Confirmar"},
+        {Glyph::Back, "Fechar"},
+    }};
+    PromptBar(c, prompt_list.data(), static_cast<int>(prompt_list.size()));
+}
+
+void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open, bool compact) {
+    const auto opts = bridge.GetOptions();
+    if (opts.fps_hud <= 0) {
+        return;
+    }
+    const auto tel = bridge.GetTelemetry();
+    if (tel.frametime_ms > 0.0 && tel.frametime_ms != prev_recorded_sample_) {
+        prev_recorded_sample_ = tel.frametime_ms;
+        fps_graph_[fps_graph_head_] = tel.frametime_ms;
+        fps_graph_head_ = (fps_graph_head_ + 1) % fps_graph_.size();
+        fps_graph_count_ = std::min(fps_graph_count_ + 1, fps_graph_.size());
+    }
+
+    const float s = c.s;
+    const float big = 27.0f * s;
+    const float small = 13.0f * s;
+    const int corner = std::clamp(opts.fps_corner, 0, 3);
+    const bool left = (corner & 1) != 0;
+    const bool bottom = corner >= 2;
+    const float edge = left ? c.safe : (c.w - c.safe);
+    const float top =
+        bottom ? (c.h - c.safe - (opts.fps_hud >= 3 ? 115.0f * s : 56.0f * s))
+               : ((menu_open && !compact && corner < 2) ? (BannerHeight(c) + 10.0f * s) : c.safe);
+
+    char fps_buf[32];
+    std::snprintf(fps_buf, sizeof(fps_buf), "%d", static_cast<int>(std::lround(tel.fps)));
+    const float nw = SizeOfRaw(c.f.strong, big, fps_buf).x;
+    const float lw = SizeOfRaw(c.f.strong, small, "FPS").x;
+    const ImU32 green = Rgba(72, 255, 110);
+    const ImU32 col =
+        tel.fps >= 55.0 ? green : (tel.fps >= 38.0 ? Rgba(255, 200, 60) : Rgba(255, 95, 80));
+
+    const float x_num = left ? edge : (edge - nw - 4.0f * s - lw);
+    OutlinedText(c, c.f.strong, big, x_num, top, col, fps_buf);
+    OutlinedText(c, c.f.strong, small, x_num + nw + 4.0f * s, top + 12.0f * s, col, "FPS");
+
+    float y = top + 30.0f * s;
+    char mode_buf[96];
+    if (tel.output_height > 0) {
+        std::snprintf(mode_buf, sizeof(mode_buf), "%up %s", tel.output_height,
+                      tel.upscaler_name.c_str());
+    } else {
+        std::snprintf(mode_buf, sizeof(mode_buf), "%s", tel.upscaler_name.c_str());
+    }
+    const float mw = SizeOfRaw(c.f.strong, small, mode_buf).x;
+    OutlinedText(c, c.f.strong, small, left ? edge : (edge - mw), y, kInkBright, mode_buf);
+    y += 16.0f * s;
+
+    if (opts.fps_hud >= 2) {
+        char ft_buf[64];
+        std::snprintf(ft_buf, sizeof(ft_buf), "%.1f ms  p99 %.1f ms", tel.frametime_ms,
+                      tel.frametime_p99_ms);
+        const float fw = SizeOfRaw(c.f.body, small, ft_buf).x;
+        OutlinedText(c, c.f.body, small, left ? edge : (edge - fw), y, kSoft, ft_buf);
+        y += 18.0f * s;
+    }
+
+    if (opts.fps_hud >= 3 && fps_graph_count_ >= 4) {
+        const float gw = 196.0f * s;
+        const float gh = 42.0f * s;
+        const float gx0 = left ? edge : (edge - gw);
+        c.d->AddRectFilled(ImVec2(gx0, y), ImVec2(gx0 + gw, y + gh), Rgba(12, 9, 6, 170), 3.0f * s);
+        c.d->AddRect(ImVec2(gx0, y), ImVec2(gx0 + gw, y + gh), Alpha(kEdge, 0.8f), 3.0f * s, 1.0f);
+        const double max_ms = 33.3;
+        const float dx = gw / static_cast<float>(fps_graph_.size() - 1);
+        for (std::size_t i = 1; i < fps_graph_count_; ++i) {
+            const std::size_t idx0 = (fps_graph_head_ + fps_graph_.size() - fps_graph_count_ + i - 1) %
+                                     fps_graph_.size();
+            const std::size_t idx1 =
+                (fps_graph_head_ + fps_graph_.size() - fps_graph_count_ + i) % fps_graph_.size();
+            const float f0 = static_cast<float>(std::clamp(fps_graph_[idx0] / max_ms, 0.0, 1.0));
+            const float f1 = static_cast<float>(std::clamp(fps_graph_[idx1] / max_ms, 0.0, 1.0));
+            const float px0 = gx0 + static_cast<float>(i - 1) * dx;
+            const float px1 = gx0 + static_cast<float>(i) * dx;
+            const float py0 = y + gh - f0 * (gh - 4.0f * s) - 2.0f * s;
+            const float py1 = y + gh - f1 * (gh - 4.0f * s) - 2.0f * s;
+            c.d->AddLine(ImVec2(px0, py0), ImVec2(px1, py1), f1 > 0.6f ? kGoldHi : green,
+                         std::max(1.2f, 1.4f * s));
+        }
+    }
+}
+
+void OotMenuController::TickAndDraw(Ctx& c) {
+    auto& bridge = Bridge::Instance();
+    if (!bridge.IsOcarina()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    float dt_sec = 1.0f / 60.0f;
+    if (last_tick_ != std::chrono::steady_clock::time_point{}) {
+        dt_sec = std::clamp(std::chrono::duration<float>(now - last_tick_).count(), 0.001f, 0.25f);
+    }
+    last_tick_ = now;
+
+    const auto opts = bridge.GetOptions();
+    CaptureBaselineOnce(opts);
+    ProcessInput(bridge, dt_sec);
+
+    const bool open = bridge.IsOpen();
+    const bool compact = bridge.IsCompact();
+
+    if (open) {
+        if (!compact) {
+            c.d->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(c.w, c.h), Rgba(8, 5, 2, kDimAlpha));
+        }
+        Ctx k = c;
+        k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
+        menu_ox_ = std::floor((c.w - k.w) * 0.5f);
+        const int vtx0 = c.d->VtxBuffer.Size;
+        const int cmd0 = c.d->CmdBuffer.Size;
+        hits_.clear();
+        if (compact) {
+            DrawCompactBar(k, bridge);
+        } else {
+            DrawFullMenu(k, bridge);
+        }
+        if (menu_ox_ > 0.0f) {
+            for (int i = vtx0; i < c.d->VtxBuffer.Size; ++i) {
+                c.d->VtxBuffer[i].pos.x += menu_ox_;
+            }
+            for (int i = std::max(0, cmd0 - 1); i < c.d->CmdBuffer.Size; ++i) {
+                ImVec4& rect = c.d->CmdBuffer[i].ClipRect;
+                if (rect.x <= 0.0f && rect.z >= c.w) {
+                    continue;
+                }
+                rect.x += menu_ox_;
+                rect.z += menu_ox_;
+            }
+        }
+    } else {
+        menu_ox_ = 0.0f;
+        hits_.clear();
+    }
+
+    DrawFpsHud(c, bridge, open, compact);
+}
+
+} // namespace Vulkan::OotUi
