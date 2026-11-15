@@ -2008,14 +2008,37 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
         }
     }
 
-    // Left badge inside banner
+    // Left badge inside banner: the running game's icon, name and ID (E47.T12), read from its
+    // NACP so the menu fits any game of the best build; "Lichii" until the core reports one.
     {
-        const float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
-        const char* ver = "Lichii · OoT PC";
-        const float fit = FitPx(15.0f * s, 10.0f * s, 0.5f * s, room,
-                                [&](float px) { return SizeOfRaw(c.f.body, px, ver).x; });
-        if (fit > 0.0f) {
-            TextMidRaw(c, c.f.body, fit, c.safe, ty, kBannerInk, ver);
+        float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
+        float x = c.safe;
+        if (c.has_game_icon && room > hh) {
+            const float side = hh - 14.0f * s;
+            const ImVec2 p0{x, (hh - 3.0f * s - side) * 0.5f};
+            c.d->AddImageRounded(c.game_icon, p0, ImVec2(p0.x + side, p0.y + side), ImVec2(0, 0),
+                                 ImVec2(1, 1), IM_COL32_WHITE, 6.0f * s);
+            c.d->AddRect(p0, ImVec2(p0.x + side, p0.y + side), kBannerEdge, 6.0f * s, 0, 1.0f * s);
+            x += side + 10.0f * s;
+            room -= side + 10.0f * s;
+        }
+        const bool has_title = c.game_title && c.game_title[0] != '\0';
+        const char* title = has_title ? c.game_title : "Lichii";
+        const float title_px = FitPx(17.0f * s, 10.0f * s, 0.5f * s, room, [&](float px) {
+            return SizeOfRaw(c.f.strong, px, title).x;
+        });
+        if (title_px > 0.0f && room > 0.0f) {
+            const bool two_lines = has_title && c.game_id && c.game_id[0] != '\0';
+            TextMidRaw(c, c.f.strong, title_px, x, two_lines ? ty - 8.0f * s : ty, kBannerInk,
+                       title);
+            if (two_lines) {
+                const float id_px = FitPx(12.0f * s, 9.0f * s, 0.5f * s, room, [&](float px) {
+                    return SizeOfRaw(c.f.body, px, c.game_id).x;
+                });
+                if (id_px > 0.0f) {
+                    TextMidRaw(c, c.f.body, id_px, x, ty + 10.0f * s, kBannerEdge, c.game_id);
+                }
+            }
         }
     }
 

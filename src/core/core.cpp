@@ -17,6 +17,8 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
+#include "common/oot_menu_bridge.h"
+#include "common/stb.h"
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -131,6 +133,47 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 }
 
 namespace {
+
+/// E47.T12: the in-game menu banner shows the running game's icon, name and ID, read from its
+/// control data (NACP + icon JPEG, with updates applied). Any game, not only Ocarina of Time.
+void PublishGameInfoToMenu(System& system, u64 program_id, std::string fallback_title) {
+    if (program_id == 0) {
+        return;
+    }
+    Common::OotMenu::GameInfo info;
+    info.program_id = program_id;
+    const FileSys::PatchManager pm(program_id, system.GetFileSystemController(),
+                                   system.GetContentProvider());
+    const auto metadata = pm.GetControlMetadata();
+    if (metadata.first) {
+        info.title = metadata.first->GetApplicationName();
+        info.version = metadata.first->GetVersionString();
+    }
+    if (info.title.empty()) {
+        info.title = std::move(fallback_title);
+    }
+    if (metadata.second) {
+        constexpr int kIconSide = 128;
+        std::vector<u8> jpeg = metadata.second->ReadAllBytes();
+        int w = 0, h = 0, channels = 0;
+        u8* pixels = jpeg.empty() ? nullptr
+                                  : stbi_load_from_memory(jpeg.data(), static_cast<int>(jpeg.size()),
+                                                          &w, &h, &channels, STBI_rgb_alpha);
+        if (pixels) {
+            info.icon_rgba.resize(static_cast<std::size_t>(kIconSide) * kIconSide * 4);
+            if (stbir_resize_uint8_srgb(pixels, w, h, 0, info.icon_rgba.data(), kIconSide,
+                                        kIconSide, 0, 4, 3, 0)) {
+                info.icon_width = info.icon_height = kIconSide;
+            } else {
+                info.icon_rgba.clear();
+            }
+            stbi_image_free(pixels);
+        }
+    }
+    LOG_INFO(Core, "In-game menu: {} ({:016X}) {} icon {}x{}", info.title, program_id,
+             info.version, info.icon_width, info.icon_height);
+    Common::OotMenu::Bridge::Instance().SetGameInfo(std::move(info));
+}
 
 // The program id from a Switch 2 program's main.npdm, if it is one.
 std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
@@ -580,6 +623,11 @@ struct System::Impl {
         const FileSys::PatchManager pm(params.program_id, system.GetFileSystemController(), system.GetContentProvider());
         auto const metadata = pm.GetControlMetadata();
         std::string title_version = metadata.first != nullptr ? metadata.first->GetVersionString() : "";
+        {
+            std::string loader_title;
+            app_loader->ReadTitle(loader_title);
+            PublishGameInfoToMenu(system, params.program_id, std::move(loader_title));
+        }
 
         if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM");
@@ -1255,6 +1303,8 @@ void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& cal
 void System::NotifyApplicationChanged(u64 program_id) {
     //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
 
+    // Console mode (qlaunch) starts games here instead of through Load (E47.T12).
+    PublishGameInfoToMenu(*this, program_id, {});
     if (impl->application_changed_callback) {
         impl->application_changed_callback(program_id);
     }

@@ -74,6 +74,11 @@ struct Ctx {
     bool pad = false;
     int confirm_dot = 3; // 0 top, 1 right, 2 left, 3 bottom (Xbox South = 3, Nintendo East = 1)
     int back_dot = 1;
+    // E47.T12: running game for the banner (empty title = no game info yet)
+    bool has_game_icon = false;
+    ImTextureRef game_icon{};
+    const char* game_title = "";
+    const char* game_id = "";
 };
 
 inline ImVec2 SizeOf(ImFont* font, float px, const char* raw_text, float wrap = 0.0f) {

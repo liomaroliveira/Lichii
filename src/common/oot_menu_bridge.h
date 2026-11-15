@@ -197,6 +197,17 @@ struct HostCallbacks {
     std::function<void()> cancel_rebind;
 };
 
+/// The running game, for the menu banner (E47.T12): read from its NACP when it starts.
+struct GameInfo {
+    u64 serial = 0; ///< bumps on every SetGameInfo, so the overlay re-uploads the icon
+    u64 program_id = 0;
+    std::string title;
+    std::string version;
+    int icon_width = 0;
+    int icon_height = 0;
+    std::vector<u8> icon_rgba; ///< icon_width * icon_height * 4, empty without an icon
+};
+
 class Bridge {
 public:
     static Bridge& Instance();
@@ -305,6 +316,13 @@ public:
     [[nodiscard]] std::vector<u8> CopyRomFsStrongFont() const;
     [[nodiscard]] std::vector<u8> CopyRomFsHeadingFont() const;
 
+    // E47.T12: title, version and icon of the running game (core, when the application changes)
+    void SetGameInfo(GameInfo info);
+    [[nodiscard]] GameInfo GetGameInfo() const;
+    [[nodiscard]] u64 GameInfoSerial() const noexcept {
+        return game_info_serial_.load(std::memory_order_acquire);
+    }
+
     void SetPromptsAvailable(bool available, std::string path);
     [[nodiscard]] bool HasPrompts() const noexcept {
         return has_prompts_.load(std::memory_order_acquire);
@@ -360,6 +378,8 @@ private:
     std::vector<u8> romfs_heading_font_;
     std::string prompts_dir_;
     HostCallbacks callbacks_;
+    GameInfo game_info_;
+    std::atomic<u64> game_info_serial_{0};
 
     mutable std::mutex perf_mutex_;
     std::array<double, 240> recent_frame_ms_{};

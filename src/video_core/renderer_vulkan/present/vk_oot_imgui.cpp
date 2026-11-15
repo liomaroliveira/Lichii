@@ -9,11 +9,14 @@
 #include <cmath>
 #include <cstring>
 
+#include <fmt/format.h>
+
 #include "backends/imgui_impl_vulkan.h"
 #include "common/logging.h"
 #include "common/oot_menu_bridge.h"
 #include "common/settings.h"
 #include "imgui.h"
+#include "imgui_internal.h" // RegisterUserTexture (E47.T12)
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -207,6 +210,11 @@ void OotOverlay::Shutdown() {
         backend_ready_ = false;
     }
     descriptor_pool_.reset();
+    if (ctx && game_icon_) {
+        ImGui::UnregisterUserTexture(game_icon_.get());
+    }
+    game_icon_.reset();
+    game_info_serial_ = 0;
     if (ctx) {
         ImGui::DestroyContext(ctx);
         ctx = nullptr;
@@ -520,6 +528,36 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
     return true;
 }
 
+void OotOverlay::SyncGameInfo() {
+    const auto& bridge = Common::OotMenu::Bridge::Instance();
+    const u64 serial = bridge.GameInfoSerial();
+    if (serial == game_info_serial_) {
+        return;
+    }
+    game_info_serial_ = serial;
+    const auto info = bridge.GetGameInfo();
+    game_title_ = info.title;
+    game_id_ = info.program_id ? fmt::format("{:016X}", info.program_id) : std::string{};
+    if (info.icon_rgba.empty()) {
+        return; // keep the last icon rather than churn textures; a new game brings its own
+    }
+    if (game_icon_ && (game_icon_->Width != info.icon_width ||
+                       game_icon_->Height != info.icon_height)) {
+        return; // the core always sends 128x128; a different size is not expected
+    }
+    if (!game_icon_) {
+        game_icon_ = std::make_unique<ImTextureData>();
+        game_icon_->Create(ImTextureFormat_RGBA32, info.icon_width, info.icon_height);
+        ImGui::RegisterUserTexture(game_icon_.get());
+    }
+    std::memcpy(game_icon_->GetPixels(), info.icon_rgba.data(), info.icon_rgba.size());
+    if (game_icon_->Status == ImTextureStatus_OK) {
+        game_icon_->UpdateRect = {0, 0, static_cast<unsigned short>(info.icon_width),
+                                  static_cast<unsigned short>(info.icon_height)};
+        game_icon_->SetStatus(ImTextureStatus_WantUpdates);
+    }
+}
+
 void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
     if (!draw_data || !draw_data->Textures) {
         return;
@@ -745,6 +783,7 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
     io.DeltaTime = dt;
 
+    SyncGameInfo(); // before NewFrame, which gathers the user textures
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 
@@ -763,6 +802,12 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     const bool nintendo_pad = (opts.pad_layout == static_cast<int>(Common::OotMenu::PadLayout::Nintendo));
     ui_ctx.confirm_dot = nintendo_pad ? 1 : 3;
     ui_ctx.back_dot = nintendo_pad ? 3 : 1;
+    ui_ctx.has_game_icon = game_icon_ != nullptr;
+    if (game_icon_) {
+        ui_ctx.game_icon = game_icon_->GetTexRef();
+    }
+    ui_ctx.game_title = game_title_.c_str();
+    ui_ctx.game_id = game_id_.c_str();
 
     draw_fn(ui_ctx);
 

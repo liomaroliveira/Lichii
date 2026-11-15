@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "common/common_types.h"
@@ -91,6 +92,13 @@ private:
 
     u64 present_serial_ = 0;
     std::chrono::steady_clock::time_point last_frame_time_{};
+
+    // E47.T12: the running game's icon (user texture uploaded like the font atlas) and labels
+    void SyncGameInfo();
+    std::unique_ptr<ImTextureData> game_icon_;
+    u64 game_info_serial_ = 0;
+    std::string game_title_;
+    std::string game_id_;
 };
 
 } // namespace Vulkan

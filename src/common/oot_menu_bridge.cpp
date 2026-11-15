@@ -640,6 +640,23 @@ void Bridge::UpdateVramStats(u64 used_bytes, u64 budget_bytes) {
     telemetry_.vram_budget = budget_bytes;
 }
 
+void Bridge::SetGameInfo(GameInfo info) {
+    std::scoped_lock lk{state_mutex_};
+    info.serial = game_info_serial_.load(std::memory_order_relaxed) + 1;
+    if (info.icon_rgba.size() !=
+        static_cast<std::size_t>(info.icon_width) * static_cast<std::size_t>(info.icon_height) * 4) {
+        info.icon_rgba.clear();
+        info.icon_width = info.icon_height = 0;
+    }
+    game_info_ = std::move(info);
+    game_info_serial_.store(game_info_.serial, std::memory_order_release);
+}
+
+GameInfo Bridge::GetGameInfo() const {
+    std::scoped_lock lk{state_mutex_};
+    return game_info_;
+}
+
 void Bridge::SetRomFsFontData(std::vector<u8> body_otf_bytes,
                               std::vector<u8> strong_otf_bytes,
                               std::vector<u8> heading_otf_bytes) {
