@@ -3860,6 +3860,19 @@ bool MainWindow::UsingExclusiveFullscreen() {
 void MainWindow::ShowFullscreen() {
     const auto show_fullscreen = [this](QWidget* window) {
         if (UsingExclusiveFullscreen()) {
+            // E47.T10: on Wayland Qt asks for fullscreen on the window's screen, by default the first
+            // output the compositor announced (an always-connected HDMI dongle wins over the main
+            // monitor). The shortcut names the main monitor's connector when it is on.
+            const QString wanted = qEnvironmentVariable("LICHII_FULLSCREEN_OUTPUT").trimmed();
+            if (!wanted.isEmpty()) {
+                for (QScreen* screen : QGuiApplication::screens()) {
+                    if (screen->name() == wanted) {
+                        window->setScreen(screen);
+                        LOG_INFO(Frontend, "Fullscreen on output {}", wanted.toStdString());
+                        break;
+                    }
+                }
+            }
             window->showFullScreen();
             return;
         }
@@ -5624,8 +5637,33 @@ void MainWindow::RegisterOotMenuCallbacks() {
     };
     Common::OotMenu::HostCallbacks callbacks;
     callbacks.save_config = [this, on_gui] { on_gui([this] { config->SaveAllValues(); }); };
-    callbacks.restart_game = [this, on_gui] { on_gui([this] { OnRestartGame(); }); };
-    callbacks.quit_game = [this, on_gui] { on_gui([this] { OnStopGame(); }); };
+    // The menu asks once ("Confirmar novamente"), so the emulator's own dialogs are skipped (E47.T5)
+    callbacks.restart_game = [this, on_gui] {
+        on_gui([this] {
+            if (!QtCommon::system->IsPoweredOn()) {
+                return;
+            }
+            const auto current_game = QString(current_game_path);
+            ShutdownGame();
+            BootGame(current_game, ApplicationAppletParameters());
+        });
+    };
+    callbacks.quit_game = [this, on_gui] {
+        on_gui([this] {
+            close_pending = true; // closeEvent skips ConfirmClose and stops the game first
+            close();
+        });
+    };
+    callbacks.stop_game = [this, on_gui] {
+        on_gui([this] {
+            play_time_manager->Stop();
+            if (OnShutdownBegin()) {
+                OnShutdownBeginDialog();
+            } else {
+                OnEmulationStopped();
+            }
+        });
+    };
     callbacks.apply_pad_layout = [this, on_gui](int layout) {
         on_gui([this, layout] { OotApplyPadLayout(layout); });
     };

@@ -50,6 +50,13 @@ constexpr std::array<Settings::ScalingFilter, 8> kScalingFilterChoices{
     Settings::ScalingFilter::Area,            Settings::ScalingFilter::Sgsr,
 };
 constexpr std::array<int, 6> kIdleSpinChoices{-1, 0, 5, 15, 30, 50};
+// NVIDIA DLSS Frame Generation only runs with Streamline (Windows NVIDIA builds); elsewhere it
+// falls back to the optical flow interpolation, so the menu does not offer it (E47.T3).
+#ifdef EGLANTINE_STREAMLINE
+constexpr int kFrameGenMax = 3;
+#else
+constexpr int kFrameGenMax = 2;
+#endif
 constexpr std::array<Settings::OcarinaFsrOutput, 3> kFsrOutputChoices{
     Settings::OcarinaFsrOutput::Output1080p,
     Settings::OcarinaFsrOutput::Output1440p,
@@ -277,6 +284,19 @@ void OutlinedText(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col, c
     c.d->AddText(font, px, ImVec2(x, y), col, text);
 }
 
+// Small clickable pill (E47.T4: switch full menu <-> compact bar with the mouse)
+void PillButton(Ctx& c, ImVec2 a, ImVec2 b, const char* raw_label, bool hover) {
+    const float s = c.s;
+    c.d->AddRectFilled(a, b, hover ? kGoldHi : kBannerInk, 4.0f * s);
+    c.d->AddRect(a, b, kEdge, 4.0f * s, std::max(1.0f, s));
+    TextMidCentre(c, c.f.strong, 14.0f * s, (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f,
+                  hover ? kGoldInk : kInk, raw_label);
+}
+
+float PillWidth(const Ctx& c, const char* raw_label) {
+    return SizeOf(c.f.strong, 14.0f * c.s, raw_label).x + 26.0f * c.s;
+}
+
 const std::vector<OotMenuController::RowDef>& AllRows() {
     using RK = OotMenuController::RowKind;
     using T = OotMenuController::Tab;
@@ -288,10 +308,10 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          false, 1, static_cast<int>(kPresets.size()), 1},
         {T::Graphics, RK::Heading, "h_upscale", "Reconstrução e Nitidez", "", false, 0, 0, 1},
         {T::Graphics, RK::Choice, "upscaler", "Upscaler (OoT)",
-         "Substitui a reconstrução do jogo ao vivo sem reiniciar: Nativo, FSR 3.1 ou AMD FSR 4.1 (INT8/FP8).",
+         "Reconstrução da imagem do jogo: Nativo, AMD FSR 3.1 ou AMD FSR 4.1 (INT8 nas Radeon RX 6000/7000). Entre FSR 3.1 e 4.1 a troca é ao vivo; ligar ou desligar o FSR (Nativo) vale depois de reiniciar.",
          false, 0, 2, 1},
         {T::Graphics, RK::Choice, "fsr_output", "Resolução Saída FSR",
-         "Altera ao vivo a resolução de saída reconstruída pelo FSR 3.1/4.1: Full HD (1080p), 1440p ou 4K.",
+         "Resolução que o FSR 3.1/4.1 reconstrói: Full HD (1080p), 1440p ou 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
          false, 0, 2, 1},
         {T::Graphics, RK::Choice, "fsr_render", "Resolução Interna FSR",
          "Resolução interna renderizada pelo jogo antes do upscaler FSR. 1080p ou 720p aliviam bastante GPU/Templo do Fogo.",
@@ -300,7 +320,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Fator de escala geral do emulador quando o upscaler de cena está desligado ou em jogos gerais.",
          true, 0, 6, 1},
         {T::Graphics, RK::Slider, "rcas_sharp", "Nitidez RCAS (FSR)",
-         "Força do filtro de nitidez FidelityFX RCAS após o FSR 3.1/4.1.", false, 0, 200, 5},
+         "Força do filtro de nitidez AMD RCAS aplicado depois do FSR 3.1/4.1, na mesma escala da janela de configurações do Lichii: 0% desliga, 100% é o máximo. Muda ao vivo.",
+         false, 0, 200, 10},
         {T::Graphics, RK::Toggle, "oot_aa", "Antisserrilhamento Jogo",
          "Remove o sharpening extra original do jogo que cria halos ao redor do texto quando combinado com FSR.",
          false, 0, 1, 1},
@@ -312,7 +333,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Filtro usado ao esticar ou reduzir a imagem do emulador até o tamanho da janela.",
          false, 0, 7, 1},
         {T::Graphics, RK::Choice, "aniso", "Filtro Anisotrópico",
-         "Qualidade da filtragem de texturas inclinadas no chão e paredes.", false, 0, 5, 1},
+         "Qualidade da filtragem de texturas inclinadas no chão e paredes. Vale por inteiro depois de reiniciar (as texturas já carregadas mantêm o valor antigo).",
+         true, 0, 5, 1},
         {T::Graphics, RK::Toggle, "docked", "Modo Console",
          "Define se o jogo inicia em perfil Dock (alta resolução) ou Portátil (720p).", true, 0,
          1, 1},
@@ -322,8 +344,12 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
         {T::Graphics, RK::Choice, "hdr", "HDR (Monitor)",
          "Ativa saída HDR10 na tela quando suportada pelo monitor e compositor.", false, 0, 2, 1},
         {T::Graphics, RK::Choice, "frame_gen", "Geração de Quadros",
-         "Gera quadros intermediários (LSFG / FSR 3 FG) para fluidez acima do FPS base do emulador.",
-         false, 0, 3, 1},
+         "Cria quadros intermediários para a imagem ficar mais fluida que o FPS do jogo. Fluxo óptico: interpolação própria do Lichii feita na GPU (no Lichii aparece como \"FSR 3\", mas não é a biblioteca da AMD). LSFG: usa a DLL do Lossless Scaling, se ela estiver instalada."
+#ifdef EGLANTINE_STREAMLINE
+         " DLSS Frame Gen: só em placas NVIDIA."
+#endif
+         ,
+         false, 0, kFrameGenMax, 1},
         {T::Graphics, RK::Choice, "fg_mult", "Multiplicador FG",
          "Multiplicador de quadros gerados quando Frame Gen está ativo (2x = dobra o FPS exibido).",
          false, 2, 4, 1},
@@ -340,15 +366,16 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Precisão da GPU emulada. Baixa aumenta performance; Alta corrige efeitos complexos quando necessário.",
          false, 0, 1, 1},
         {T::Performance, RK::Toggle, "vram", "Uso de VRAM",
-         "Estratégia de retenção de buffers e texturas na VRAM da GPU.", false, 0, 1, 1},
+         "Estratégia de retenção de buffers e texturas na VRAM da GPU. Lida só ao iniciar o jogo.",
+         true, 0, 1, 1},
 
         {T::Performance, RK::Heading, "h_fork", "Otimizações Lichii & Perfil", "", false, 0, 0, 1},
         {T::Performance, RK::Toggle, "occlusion_mod", "Mod Occlusion Off",
          "Mantém ou desativa o mod Occlusion Off (ganho grande de CPU/GPU no Templo do Fogo). Requer reinício.",
          true, 0, 1, 1},
         {T::Performance, RK::Toggle, "async_shaders", "Shaders Assíncronos",
-         "Compila pipelines em background para evitar engasgos no primeiro uso de um shader.", false,
-         0, 1, 1},
+         "Compila pipelines em background para evitar engasgos no primeiro uso de um shader. Lida só ao iniciar o jogo.",
+         true, 0, 1, 1},
         {T::Performance, RK::Toggle, "disk_cache", "Cache Shader em Disco",
          "Salva shaders compilados em disco entre sessões para abertura instantânea.", true, 0, 1,
          1},
@@ -358,13 +385,13 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Tempo de spin ativo (microsegundos) antes de dormir em Core::Idle. Valores baixos reduzem consumo e latência.",
          false, 0, 5, 1},
         {T::Performance, RK::Toggle, "read_areas", "Read Areas Direto (NX2)",
-         "Habilita leitura otimizada de regiões de memória no NX2 (nx2_menu_switches.txt). Requer reinício.",
+         "Lê direto da RAM as áreas que a GPU já escreveu, em vez de esperar uma cópia (ganho grande no Templo do Fogo). Vale na próxima abertura pelo atalho.",
          true, 0, 1, 1},
         {T::Performance, RK::Toggle, "gamemode", "GameMode (Linux)",
-         "Solicita perfil de alta performance GameMode do sistema no atalho/sessão.", true, 0, 1,
+         "Liga o GameMode e o clock alto da GPU ao abrir o jogo pelo atalho. Vale na próxima abertura pelo atalho.", true, 0, 1,
          1},
         {T::Performance, RK::Toggle, "pin_ccx", "Fixar 1 CCX (Ryzen)",
-         "Restringe os threads do emulador a um único CCX em processadores AMD Ryzen.", true, 0, 1,
+         "Põe os núcleos do jogo num CCX e a GPU no outro (Ryzen com 2 CCX, +4% no 3800X). Vale na próxima abertura pelo atalho.", true, 0, 1,
          1},
         {T::Performance, RK::Action, "apply_restart", "Aplicar e Reiniciar",
          "Salva todas as configurações no disco e reinicia a execução do jogo imediatamente.", false,
@@ -418,10 +445,13 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Permite usar a tecla Esc também para abrir o menu completo (além de fechá-lo).", false, 0,
          1, 1},
         {T::AudioUi, RK::Action, "restart_game", "Reiniciar jogo",
-         "Salva todas as configurações no disco e reinicia a execução do jogo imediatamente.", false,
-         0, 0, 1},
-        {T::AudioUi, RK::Action, "quit_game", "Sair", "Salva e fecha o emulador com segurança.",
+         "Salva as configurações e reinicia o jogo, sem a pergunta do emulador.", false, 0, 0, 1},
+        {T::AudioUi, RK::Action, "stop_game", "Encerrar e voltar à lista",
+         "Salva as configurações, encerra o jogo e deixa o emulador aberto na lista de jogos.",
          false, 0, 0, 1},
+        {T::AudioUi, RK::Action, "quit_game", "Fechar o jogo",
+         "Salva as configurações e fecha o jogo e o emulador, sem a pergunta do emulador.", false,
+         0, 0, 1},
     };
     return kRows;
 }
@@ -446,6 +476,7 @@ void OotMenuController::CaptureBaselineOnce(const PcOptions& opts) {
     }
     baseline_.captured = true;
     baseline_.ocarina_fsr_render = static_cast<int>(Settings::values.ocarina_fsr_render.GetValue());
+    baseline_.ocarina_fsr = Settings::values.ocarina_fsr.GetValue();
     baseline_.resolution_setup = static_cast<int>(Settings::values.resolution_setup.GetValue());
     baseline_.use_docked_mode = static_cast<int>(Settings::values.use_docked_mode.GetValue());
     baseline_.frame_rate_limit = static_cast<int>(Settings::values.frame_rate_limit.GetValue());
@@ -465,6 +496,10 @@ bool OotMenuController::IsRowPendingRestart(const char* id, const PcOptions& opt
     if (std::strcmp(id, "fsr_render") == 0) {
         return static_cast<int>(Settings::values.ocarina_fsr_render.GetValue()) !=
                baseline_.ocarina_fsr_render;
+    }
+    if (std::strcmp(id, "upscaler") == 0 || std::strcmp(id, "preset") == 0) {
+        // Native <-> FSR changes the render scale patched into the game at boot (E47.T2)
+        return Settings::values.ocarina_fsr.GetValue() != baseline_.ocarina_fsr;
     }
     if (std::strcmp(id, "res_scale") == 0) {
         return static_cast<int>(Settings::values.resolution_setup.GetValue()) !=
@@ -506,7 +541,8 @@ bool OotMenuController::IsRowPendingRestart(const char* id, const PcOptions& opt
 std::vector<const char*> OotMenuController::CollectPendingRowNames(const PcOptions& opts) const {
     std::vector<const char*> names;
     for (const auto& r : AllRows()) {
-        if (r.requires_restart && IsRowPendingRestart(r.id, opts)) {
+        if ((r.requires_restart || std::strcmp(r.id, "upscaler") == 0) &&
+            IsRowPendingRestart(r.id, opts)) {
             names.push_back(r.label);
         }
     }
@@ -558,7 +594,8 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
         return IndexIn(kResScaleChoices, Settings::values.resolution_setup.GetValue(), 2);
     }
     if (std::strcmp(id, "rcas_sharp") == 0) {
-        return Settings::values.fsr_sharpening_slider.GetValue();
+        // Stored as RCAS "stops" (0 = sharpest, 200 = off); the menu shows sharpness (E47.T1)
+        return 200 - std::clamp(Settings::values.fsr_sharpening_slider.GetValue(), 0, 200);
     }
     if (std::strcmp(id, "oot_aa") == 0) {
         return Settings::values.oot_anti_aliasing.GetValue() ==
@@ -594,7 +631,7 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
         case Settings::FrameGenType::Fsr3:
             return 2;
         case Settings::FrameGenType::NvidiaDlssG:
-            return 3;
+            return kFrameGenMax == 3 ? 3 : 2; // without Streamline it runs the optical flow
         }
         return 1;
     }
@@ -747,7 +784,7 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
                           kResScaleChoices[static_cast<std::size_t>(val)]);
     } else if (std::strcmp(id, "rcas_sharp") == 0) {
         val = std::clamp(val, 0, 200);
-        ApplySettingValue(Settings::values.fsr_sharpening_slider, val);
+        ApplySettingValue(Settings::values.fsr_sharpening_slider, 200 - val);
         dirty_settings = true;
     } else if (std::strcmp(id, "oot_aa") == 0) {
         ApplySettingValue(Settings::values.oot_anti_aliasing,
@@ -780,7 +817,7 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
                           static_cast<Settings::HdrMode>(std::clamp(val, 0, 2)));
         dirty_settings = true;
     } else if (std::strcmp(id, "frame_gen") == 0) {
-        val = std::clamp(val, 0, 3);
+        val = std::clamp(val, 0, kFrameGenMax);
         ApplySettingValue(Settings::values.frame_gen, val > 0);
         if (val == 1) {
             ApplySettingValue(Settings::values.frame_gen_type, Settings::FrameGenType::Lsfg);
@@ -915,11 +952,14 @@ void OotMenuController::TriggerRowAction(const char* id, Bridge& bridge) {
         }
         return;
     }
-    if (std::strcmp(id, "restart_game") == 0 || std::strcmp(id, "quit_game") == 0) {
+    if (std::strcmp(id, "restart_game") == 0 || std::strcmp(id, "quit_game") == 0 ||
+        std::strcmp(id, "stop_game") == 0) {
         if (confirm_action_id_ == id) {
             confirm_action_id_.clear();
             if (std::strcmp(id, "restart_game") == 0) {
                 bridge.RequestRestartGame();
+            } else if (std::strcmp(id, "stop_game") == 0) {
+                bridge.RequestStopGame();
             } else {
                 bridge.RequestQuitGame();
             }
@@ -988,7 +1028,19 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
             "0.5x (Metade)", "0.75x", "1x (Nativa)", "1.25x", "1.5x", "2x", "3x"};
         return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 6))]);
     }
-    if (std::strcmp(id, "rcas_sharp") == 0 || std::strcmp(id, "volume") == 0) {
+    if (std::strcmp(id, "rcas_sharp") == 0) {
+        if (val <= 0) {
+            return Tr("Desligada (0%)");
+        }
+        char buf[16];
+        if (val % 2 == 0) {
+            std::snprintf(buf, sizeof(buf), "%d%%", val / 2);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%d,5%%", val / 2);
+        }
+        return buf;
+    }
+    if (std::strcmp(id, "volume") == 0) {
         return std::to_string(val) + "%";
     }
     if (std::strcmp(id, "oot_aa") == 0) {
@@ -1023,7 +1075,7 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
     }
     if (std::strcmp(id, "frame_gen") == 0) {
         static constexpr std::array<const char*, 4> kLabs{
-            "Desligado", "LSFG (Lossless)", "FSR 3 Frame Gen", "DLSS Frame Gen"};
+            "Desligado", "LSFG (Lossless Scaling)", "Fluxo óptico (Lichii)", "DLSS Frame Gen (NVIDIA)"};
         return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
     }
     if (std::strcmp(id, "fg_mult") == 0) {
@@ -1371,6 +1423,8 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
     constexpr u64 kBitL = 1ULL << 6;
     constexpr u64 kBitR = 1ULL << 7;
     constexpr u64 kBitPlus = 1ULL << 10;
+    constexpr u64 kBitStickL = 1ULL << 4;
+    constexpr u64 kBitStickR = 1ULL << 5;
     constexpr u64 kBitLeft = (1ULL << 12) | (1ULL << 16);
     constexpr u64 kBitUp = (1ULL << 13) | (1ULL << 17);
     constexpr u64 kBitRight = (1ULL << 14) | (1ULL << 18);
@@ -1412,6 +1466,9 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
         apply_nav(held_dir_ == 1 ? -1 : (held_dir_ == 2 ? 1 : 0),
                   held_dir_ == 3 ? -1 : (held_dir_ == 4 ? 1 : 0), false, false, 0);
     }
+    if ((pressed & kBitStickR) != 0 && (mask & kBitStickL) == 0 && !DropdownOpen()) {
+        bridge.ToggleCompact(); // E47.T4: R3 switches full menu <-> compact bar
+    }
     if ((pressed & kBitL) != 0) {
         apply_nav(0, 0, false, false, -1);
     }
@@ -1439,6 +1496,7 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
     if (DropdownOpen()) {
         hover_tab_ = -1;
         hover_apply_ = false;
+        hover_compact_ = false;
         if ((ptr.pressed_mask & 2u) != 0) {
             CloseDropdown();
             return;
@@ -1476,6 +1534,7 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
 
     hover_tab_ = -1;
     hover_apply_ = false;
+    hover_compact_ = false;
     if (ptr.moved) {
         hover_row_ = -1;
     }
@@ -1541,6 +1600,7 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
             }
             return;
         case HitKind::BackToCompact:
+            hover_compact_ = true;
             if (l_pressed) {
                 bridge.ToggleCompact();
             }
@@ -1691,7 +1751,8 @@ void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
     const int sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
     const auto& r = *tab_rows[static_cast<std::size_t>(sel)];
     const int val = ReadRowValue(r.id, opts);
-    const bool pending = r.requires_restart && IsRowPendingRestart(r.id, opts);
+    const bool pending = (r.requires_restart || std::strcmp(r.id, "upscaler") == 0) &&
+                             IsRowPendingRestart(r.id, opts);
     const bool disabled = IsRowDisabled(r.id, tel);
 
     const float bw = std::min(c.w - 2.0f * c.safe, 760.0f * s);
@@ -1704,6 +1765,15 @@ void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
     c.d->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), Rgba(14, 10, 6, 236), 6.0f * s);
     c.d->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1), Alpha(kEdge, 0.9f), 6.0f * s,
                  std::max(1.0f, s));
+
+    {
+        const char* lab = "Menu completo";
+        const float pw = PillWidth(c, lab);
+        const ImVec2 a(bx1 - pw, by0 - 36.0f * s);
+        const ImVec2 b(bx1, by0 - 8.0f * s);
+        PillButton(c, a, b, lab, hover_compact_);
+        hits_.push_back({a.x, a.y, b.x, b.y, HitKind::BackToCompact, -1, 0, 0, 0, 0});
+    }
 
     const float header_y = by0 + 14.0f * s;
     const char* cur_name = TabTitles()[static_cast<std::size_t>(cur_tab_)];
@@ -1881,6 +1951,18 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
         tx += tw[static_cast<std::size_t>(i)];
     }
 
+    // Right of the banner: switch to the compact bar (E47.T4)
+    {
+        const char* lab = "Compacto";
+        const float pw = PillWidth(c, lab);
+        const ImVec2 a(c.w - c.safe - pw, ty - 14.0f * s);
+        const ImVec2 b(c.w - c.safe, ty + 14.0f * s);
+        if (a.x > tx + 60.0f * s) { // tx is past the last tab here
+            PillButton(c, a, b, lab, hover_compact_);
+            hits_.push_back({a.x, a.y, b.x, b.y, HitKind::BackToCompact, -1, 0, 0, 0, 0});
+        }
+    }
+
     // Left badge inside banner
     {
         const float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
@@ -1958,7 +2040,8 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
         const bool is_sel = (i == sel);
         const bool is_hov = (i == hover_row_);
         const int val = ReadRowValue(r.id, opts);
-        const bool pending = r.requires_restart && IsRowPendingRestart(r.id, opts);
+        const bool pending = (r.requires_restart || std::strcmp(r.id, "upscaler") == 0) &&
+                             IsRowPendingRestart(r.id, opts);
         const bool disabled = IsRowDisabled(r.id, tel);
 
         if (r.kind == RowKind::Action) {

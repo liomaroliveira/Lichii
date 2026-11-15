@@ -76,6 +76,7 @@ public:
     struct RestartBaseline {
         bool captured{false};
         int ocarina_fsr_render{};
+        bool ocarina_fsr{};
         int resolution_setup{};
         int use_docked_mode{};
         int frame_rate_limit{};
@@ -147,6 +148,7 @@ private:
     int hover_row_{-1};
     int hover_tab_{-1};
     bool hover_apply_{false};
+    bool hover_compact_{false};
     float menu_ox_{0.0f};
     int dragging_slider_row_{-1};
     std::vector<HitBox> hits_;

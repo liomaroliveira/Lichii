@@ -348,6 +348,7 @@ private:
         }
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
+    u32 oot_upscaler_key = 0; ///< amd_fsr4 | fsr_output << 1 the upscaler was built with
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};

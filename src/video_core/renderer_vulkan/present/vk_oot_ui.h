@@ -140,8 +140,20 @@ inline float Para(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const cha
     return y > 0.0f ? y - px * 0.3f : 0.0f;
 }
 
+// Top of a line whose letters look centred on y (E47.T6). Measures the loaded font: the centre is
+// halfway between the baseline and the average of the cap and x heights, so text that mixes
+// capitals and lowercase sits in the middle of its box whatever the font's ascent/descent are.
 inline float MidTop(ImFont* font, float px, float y) {
-    return y - font->GetFontBaked(px)->Ascent + 0.35f * px;
+    ImFontBaked* baked = font->GetFontBaked(px);
+    const ImFontGlyph* cap = baked->FindGlyphNoFallback(static_cast<ImWchar>('H'));
+    const ImFontGlyph* low = baked->FindGlyphNoFallback(static_cast<ImWchar>('x'));
+    if (cap == nullptr || low == nullptr || cap->Y1 <= cap->Y0 || baked->Size <= 0.0f) {
+        return y - baked->Ascent + 0.35f * px;
+    }
+    const float scale = px / baked->Size;
+    const float top = 0.5f * (cap->Y0 + low->Y0) * scale;
+    const float base = cap->Y1 * scale;
+    return y - 0.5f * (top + base);
 }
 
 inline float TextMidRaw(Ctx& c, ImFont* font, float px, float x, float y, ImU32 col,
@@ -254,24 +266,8 @@ inline float DrawGlyph(Ctx& c, float px, ImVec2 p, const Prompt& pr, bool draw) 
         return draw_key(p.x, pr.key);
     }
     if (pr.g == Glyph::Compact) {
-        if (!c.pad) {
-            return draw_key(p.x, pr.key ? pr.key : "RShift");
-        }
-        const float r = hh * 0.5f;
-        const ImVec2 m(p.x + r, my);
-        if (draw) {
-            c.d->AddCircleFilled(m, r, cap);
-            const ImVec2 at[4] = {m + ImVec2(0.0f, -r * 0.5f), m + ImVec2(r * 0.5f, 0.0f),
-                                  m + ImVec2(-r * 0.5f, 0.0f), m + ImVec2(0.0f, r * 0.5f)};
-            for (int i = 0; i < 4; i++) {
-                if (i == 2) {
-                    c.d->AddCircleFilled(at[i], r * 0.27f, ink);
-                } else {
-                    c.d->AddCircle(at[i], r * 0.22f, dim, 0, std::max(1.0f, s));
-                }
-            }
-        }
-        return 2.0f * r;
+        // Keyboard: the chosen key; controller: R3 (E47.T4, vk_oot_menu.cpp ProcessInput)
+        return draw_key(p.x, c.pad ? "R3" : (pr.key ? pr.key : "RShift"));
     }
     if (!c.pad) {
         switch (pr.g) {

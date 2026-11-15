@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -370,6 +371,20 @@ void Bridge::LoadFromDisk() {
         }
     }
 
+    // E47.T8: the shortcut (play/zelda.sh) exports what this session really runs with, so the
+    // menu shows the truth and its saved file can be read back by the shortcut next time.
+    const auto env_flag = [](const char* name, bool* out) {
+        if (const char* v = std::getenv(name); v != nullptr && v[0] != '\0') {
+            *out = !(std::strcmp(v, "0") == 0 || std::strcmp(v, "none") == 0);
+            return true;
+        }
+        return false;
+    };
+    bool from_shortcut = env_flag("LICHII_SHORTCUT_PIN", &opts.pin_ccx);
+    from_shortcut = env_flag("LICHII_SHORTCUT_GAMEMODE", &opts.gamemode) || from_shortcut;
+    env_flag("EDEN_NX2_READ_AREAS", &opts.read_areas);
+    shortcut_session_ = from_shortcut;
+
     {
         std::scoped_lock lk{state_mutex_};
         options_ = opts;
@@ -413,6 +428,10 @@ void Bridge::SaveToDisk() const {
             << "menu_key=" << opts.menu_key << "\n"
             << "compact_key=" << opts.compact_key << "\n"
             << "esc_opens=" << (opts.esc_opens ? 1 : 0) << "\n";
+        if (shortcut_session_) {
+            // pin_ccx / gamemode / read_areas above were seeded by the shortcut: it may apply them
+            out << "shortcut_sync=1\n";
+        }
     }
     std::filesystem::rename(tmp, ini_path, ec);
 
@@ -705,6 +724,18 @@ void Bridge::RequestQuitGame() {
     {
         std::scoped_lock lk{state_mutex_};
         cb = callbacks_.quit_game;
+    }
+    if (cb) {
+        cb();
+    }
+}
+
+void Bridge::RequestStopGame() {
+    RequestSaveConfig();
+    std::function<void()> cb;
+    {
+        std::scoped_lock lk{state_mutex_};
+        cb = callbacks_.stop_game;
     }
     if (cb) {
         cb();

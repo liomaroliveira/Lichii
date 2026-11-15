@@ -186,6 +186,8 @@ struct HostCallbacks {
     std::function<void()> save_config;
     std::function<void()> restart_game;
     std::function<void()> quit_game;
+    // Stops the game and keeps the emulator open (back to the game list), without asking (E47.T5)
+    std::function<void()> stop_game;
     std::function<void(int layout_mode)> apply_pad_layout;
     std::function<void()> reset_controls;
     std::function<void()> toggle_gamemode;
@@ -315,6 +317,7 @@ public:
     void RequestSaveConfig();
     void RequestRestartGame();
     void RequestQuitGame();
+    void RequestStopGame();
     void RequestApplyPadLayout(int layout_mode);
     void RequestResetControls();
     void RequestToggleGamemode();
@@ -331,6 +334,7 @@ private:
     std::atomic<u64> program_id_{0};
     std::atomic<bool> open_{false};
     std::atomic<bool> compact_{false};
+    bool shortcut_session_{false}; ///< started by play/zelda.sh (LICHII_SHORTCUT_*)
     std::atomic<u64> settings_gen_{1};
     std::atomic<u64> prompts_gen_{1};
     std::atomic<int> idle_spin_override_us_{-1};

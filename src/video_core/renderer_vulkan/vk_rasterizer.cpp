@@ -3923,6 +3923,20 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         if (!target_view || (upscale_4k && !scene_reference)) {
             return fail("no upscale target view");
         }
+        // E47.T2: FSR 3.1 <-> FSR 4.1 and the FSR output resolution change live from the in-game
+        // menu. Both keep the render scale patched at boot, so rebuilding the upscaler (its own
+        // history and images) on the next scene is enough; Native <-> FSR still needs a restart.
+        const u32 upscaler_key =
+            (Settings::values.amd_fsr4.GetValue() ? 1U : 0U) |
+            (static_cast<u32>(Settings::values.ocarina_fsr_output.GetValue()) << 1);
+        if (oot_live_dlss && oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+            upscaler_key != oot_upscaler_key) {
+            LOG_INFO(Render_Vulkan, "Ocarina upscaler settings changed ({} -> {}): rebuilding it",
+                     oot_upscaler_key, upscaler_key);
+            scheduler.Finish();
+            oot_live_dlss.reset();
+        }
+        oot_upscaler_key = upscaler_key;
         if (!oot_live_dlss) {
             oot_live_dlss = std::make_unique<OcarinaUpscaler>(
                 device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator,
