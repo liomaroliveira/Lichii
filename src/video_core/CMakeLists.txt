@@ -183,6 +183,12 @@ add_library(video_core STATIC
     renderer_vulkan/present/fsr3.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
+    renderer_vulkan/present/vk_oot_i18n.h
+    renderer_vulkan/present/vk_oot_imgui.cpp
+    renderer_vulkan/present/vk_oot_imgui.h
+    renderer_vulkan/present/vk_oot_menu.cpp
+    renderer_vulkan/present/vk_oot_menu.h
+    renderer_vulkan/present/vk_oot_ui.h
     renderer_vulkan/present/hdr_convert.cpp
     renderer_vulkan/present/hdr_convert.h
     renderer_vulkan/present/layer.cpp
@@ -629,6 +635,9 @@ if (WIN32)
 endif()
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
+if (TARGET imgui::imgui)
+    target_link_libraries(video_core PRIVATE imgui::imgui)
+endif()
 
 # Header-only stuff needed by all dependent targets
 target_link_libraries(video_core PUBLIC Vulkan::Headers Vulkan::UtilityHeaders GPUOpen::VulkanMemoryAllocator)

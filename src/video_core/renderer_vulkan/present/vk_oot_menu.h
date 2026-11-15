@@ -25,7 +25,7 @@ public:
     /// Processes queued keyboard/mouse/gamepad navigation inputs and renders the active overlays.
     void TickAndDraw(Ctx& c);
 
-private:
+    // Row tables are built by a free function in vk_oot_menu.cpp.
     enum class Tab : int {
         Graphics = 0,
         Performance = 1,
@@ -87,6 +87,7 @@ private:
         int sink_id{};
     };
 
+private:
     void CaptureBaselineOnce(const Common::OotMenu::PcOptions& opts);
     [[nodiscard]] bool IsRowPendingRestart(const char* id,
                                            const Common::OotMenu::PcOptions& opts) const;

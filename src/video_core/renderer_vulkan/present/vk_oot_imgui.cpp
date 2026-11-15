@@ -134,7 +134,7 @@ void RemapDrawDataColors(ImDrawData* draw_data, bool is_srgb, bool is_hdr, doubl
     }
 }
 
-void TransitionSwapchainImage(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout old_layout,
+void TransitionSwapchainImage(const vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout old_layout,
                               VkImageLayout new_layout, VkAccessFlags src_access,
                               VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
                               VkPipelineStageFlags dst_stage) {
@@ -423,7 +423,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         ImGui_ImplVulkan_InitInfo init_info{};
         init_info.ApiVersion = VK_API_VERSION_1_1;
         init_info.Instance = *instance;
-        init_info.PhysicalDevice = *device.GetPhysical();
+        init_info.PhysicalDevice = device.GetPhysical();
         init_info.Device = *device.GetLogical();
         init_info.QueueFamily = device.GetGraphicsFamily();
         init_info.Queue = *device.GetGraphicsQueue();
@@ -448,10 +448,18 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
     if (count == 0) {
         return false;
     }
+    bool images_changed = fb_images_.size() != count;
+    for (std::size_t i = 0; !images_changed && i < count; ++i) {
+        images_changed = fb_images_[i] != swapchain.GetImageIndex(i);
+    }
     if (fb_extent_.width != extent.width || fb_extent_.height != extent.height ||
-        framebuffers_.size() != count) {
+        framebuffers_.size() != count || images_changed) {
         framebuffers_.clear();
         image_views_.clear();
+        fb_images_.clear();
+        for (std::size_t i = 0; i < count; ++i) {
+            fb_images_.push_back(swapchain.GetImageIndex(i));
+        }
         image_views_.reserve(count);
         framebuffers_.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
@@ -498,7 +506,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
     return true;
 }
 
-void OotOverlay::UploadTextures(vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
+void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
     if (!draw_data || !draw_data->Textures) {
         return;
     }
@@ -695,7 +703,7 @@ void OotOverlay::Idle() {
     }
 }
 
-void OotOverlay::Record(vk::CommandBuffer& cmdbuf, VkImage swapchain_image, std::size_t image_index,
+void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image, std::size_t image_index,
                         VkExtent2D extent, VkFormat swapchain_format, bool is_hdr,
                         const std::function<void(OotUi::Ctx&)>& draw_fn) {
     ++present_serial_;

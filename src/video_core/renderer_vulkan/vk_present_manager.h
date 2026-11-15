@@ -13,6 +13,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include <memory>
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -26,8 +27,12 @@ class EmuWindow;
 namespace Vulkan {
 
 class Device;
+class OotOverlay;
 class Scheduler;
 class Swapchain;
+namespace OotUi {
+class OotMenuController;
+}
 
 struct Frame {
     u32 width;
@@ -164,6 +169,9 @@ private:
     /// See TakeBlockedTime. Atomic: a composite can also run from a syncpoint action on
     /// another thread (GPU::RequestComposite).
     std::atomic<std::chrono::steady_clock::rep> blocked_time{};
+    /// In-game OoT menu (E45): drawn on the swapchain image after the copy; nothing runs while closed.
+    std::unique_ptr<OotOverlay> oot_overlay;
+    std::unique_ptr<OotUi::OotMenuController> oot_menu;
 };
 
 } // namespace Vulkan

@@ -18,6 +18,9 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "common/oot_menu_bridge.h"
+#include "video_core/renderer_vulkan/present/vk_oot_imgui.h"
+#include "video_core/renderer_vulkan/present/vk_oot_menu.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -717,6 +720,26 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         cmdbuf.CopyImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
+    }
+
+    auto& oot_bridge = Common::OotMenu::Bridge::Instance();
+    if (const u64 program_id = Settings::GetCurrentProgramID(); oot_bridge.ProgramId() != program_id) {
+        oot_bridge.LoadFromDisk();
+        oot_bridge.SetProgramId(program_id);
+    }
+    if (!oot_menu) {
+        oot_menu = std::make_unique<OotUi::OotMenuController>();
+    }
+    if (oot_menu->ShouldDraw(oot_bridge)) {
+        if (!oot_overlay) {
+            oot_overlay = std::make_unique<OotOverlay>(instance, device, memory_allocator, swapchain);
+        }
+        oot_overlay->Record(cmdbuf, image, swapchain.GetImageIndex(), extent,
+                            swapchain.GetImageFormat(),
+                            frame->color_space != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+                            [this](OotUi::Ctx& ctx) { oot_menu->TickAndDraw(ctx); });
+    } else if (oot_overlay) {
+        oot_overlay->Idle();
     }
 
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, {},

@@ -37,7 +37,7 @@ public:
 
     /// Records the ImGui render pass onto `cmdbuf` while `swapchain_image` is in
     /// `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`, leaving it back in `TRANSFER_DST_OPTIMAL`.
-    void Record(vk::CommandBuffer& cmdbuf, VkImage swapchain_image, std::size_t image_index,
+    void Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image, std::size_t image_index,
                 VkExtent2D extent, VkFormat swapchain_format, bool is_hdr,
                 const std::function<void(OotUi::Ctx&)>& draw_fn);
 
@@ -61,7 +61,7 @@ private:
     bool EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent);
     void BuildFontAtlas();
     void CleanupRetired(bool force_all);
-    void UploadTextures(vk::CommandBuffer& cmdbuf, ImDrawData* draw_data);
+    void UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data);
     void Shutdown();
 
     const vk::Instance& instance;
@@ -82,6 +82,8 @@ private:
     VkExtent2D fb_extent_{};
     std::vector<vk::ImageView> image_views_;
     std::vector<vk::Framebuffer> framebuffers_;
+    std::vector<VkImage> fb_images_; ///< Swapchain images the views were made for
+
 
     std::vector<std::unique_ptr<GpuTex>> live_textures_;
     std::vector<RetiredUpload> retired_uploads_;
