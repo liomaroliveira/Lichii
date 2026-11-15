@@ -153,7 +153,7 @@ ENUM(AntiAliasing, None, Fxaa, Smaa);
 ENUM(OotAntiAliasing, Game, NoSharpening);
 ENUM(NvidiaDlssQuality, Automatic, Native, Quality, Balanced, Performance, UltraPerformance);
 ENUM(NvidiaDlssPreset, M, NvidiaDefault, E, F, J, K, L);
-ENUM(OcarinaFsrRender, Render1440p, Render1080p, Render720p);
+ENUM(OcarinaFsrRender, Render1440p, Render1080p, Render720p, Render956p, Render844p);
 ENUM(OcarinaFsrOutput, Output4K, Output1440p, Output1080p, OutputGame);
 ENUM(HdrMode, Off, On, Auto);
 ENUM(HdrSwapchain, Hdr10, Scrgb);

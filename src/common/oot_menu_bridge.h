@@ -159,10 +159,18 @@ struct TelemetrySnapshot {
     double frametime_ms = 0.0;
     double frametime_p99_ms = 0.0;
     double gpu_time_ms = 0.0;
+    // Presented image (the game's final image, after any upscale) and the swapchain (screen)
     u32 render_width = 0;
     u32 render_height = 0;
     u32 output_width = 0;
     u32 output_height = 0;
+    // The upscaler's real input and output, from its last evaluation (E47 honest HUD)
+    u32 fsr_in_width = 0;
+    u32 fsr_in_height = 0;
+    u32 fsr_out_width = 0;
+    u32 fsr_out_height = 0;
+    int fsr_version = 0;       // 3 = FSR 3.1, 4 = FSR 4.1, 0 = never evaluated
+    double fsr_age_ms = -1.0;  // time since that evaluation (-1: never)
     bool fsr4_available = false;
     bool fsr4_int8 = false;
     bool fsr4_failed = false;
@@ -303,6 +311,8 @@ public:
                            std::string_view upscaler_name, bool fsr4_avail, bool fsr4_int8,
                            bool fsr4_failed, bool fsr3_supported, bool hdr_active);
     void RecordPresentSample(double frame_ms, bool is_generated = false);
+    // Each Ocarina FSR evaluation (render thread): real input and output sizes. Lock-free.
+    void RecordUpscale(u32 in_w, u32 in_h, u32 out_w, u32 out_h, int fsr_version);
     [[nodiscard]] TelemetrySnapshot GetTelemetry() const;
     // The last frames' present-to-present times, oldest first (up to 240), for the graph
     void CopyRecentFrames(std::vector<float>& out) const;
@@ -376,6 +386,9 @@ private:
     PcOptions options_;
     PadBindingSnapshot bindings_;
     TelemetrySnapshot telemetry_;
+    std::atomic<u64> upscale_sizes_{0};    // in_w << 48 | in_h << 32 | out_w << 16 | out_h
+    std::atomic<s64> upscale_time_ns_{0};  // steady_clock of the last evaluation
+    std::atomic<int> upscale_version_{0};
     std::vector<u8> romfs_body_font_;
     std::vector<u8> romfs_strong_font_;
     std::vector<u8> romfs_heading_font_;

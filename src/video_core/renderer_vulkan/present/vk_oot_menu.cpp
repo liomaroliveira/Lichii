@@ -148,11 +148,132 @@ constexpr std::array<Settings::OcarinaFsrOutput, 4> kFsrOutputChoices{
     Settings::OcarinaFsrOutput::Output4K,
     Settings::OcarinaFsrOutput::OutputGame,
 };
-constexpr std::array<Settings::OcarinaFsrRender, 3> kFsrRenderChoices{
-    Settings::OcarinaFsrRender::Render720p,
-    Settings::OcarinaFsrRender::Render1080p,
+// FSR modes, lightest first (E47): the game's render size; the name comes from the real ratio.
+constexpr std::array<Settings::OcarinaFsrRender, 5> kFsrRenderChoices{
+    Settings::OcarinaFsrRender::Render720p,  Settings::OcarinaFsrRender::Render844p,
+    Settings::OcarinaFsrRender::Render956p,  Settings::OcarinaFsrRender::Render1080p,
     Settings::OcarinaFsrRender::Render1440p,
 };
+constexpr int kFsrRenderDefaultIdx = 3; // 1920x1080
+
+/// Render size the game gets at boot for a render setting and FSR output (docked, 2560x1440 max).
+std::pair<u32, u32> FsrRenderSize(Settings::OcarinaFsrRender render,
+                                  Settings::OcarinaFsrOutput output) noexcept {
+    using R = Settings::OcarinaFsrRender;
+    switch (render) {
+    case R::Render720p:
+        return {1280, 720};
+    case R::Render844p:
+        return {1500, 844};
+    case R::Render956p:
+        return {1700, 956};
+    case R::Render1080p:
+        return {1920, 1080};
+    default:
+        // Settings::OcarinaFsrRenderScale: 1440p with a 1080p output boots at 1080p
+        return output == Settings::OcarinaFsrOutput::Output1080p ? std::pair<u32, u32>{1920, 1080}
+                                                                 : std::pair<u32, u32>{2560, 1440};
+    }
+}
+
+/// Height FSR reconstructs to for an output setting (OutputGame = the game's own 1440p step).
+u32 FsrOutputHeight(Settings::OcarinaFsrOutput output) noexcept {
+    switch (output) {
+    case Settings::OcarinaFsrOutput::Output1080p:
+        return 1080;
+    case Settings::OcarinaFsrOutput::Output4K:
+        return 2160;
+    default:
+        return 1440;
+    }
+}
+
+/// Game-style FSR mode name from the real upscale ratio (output height / render height).
+const char* FsrModeName(double ratio) noexcept {
+    if (ratio < 1.05) {
+        return "Nativo (AA)";
+    }
+    if (ratio < 1.42) {
+        return "Ultra Qualidade";
+    }
+    if (ratio < 1.6) {
+        return "Qualidade";
+    }
+    if (ratio < 1.85) {
+        return "Equilibrado";
+    }
+    if (ratio < 2.5) {
+        return "Desempenho";
+    }
+    return "Ultra Desempenho";
+}
+
+std::string FormatRatio(double r) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "%.2f", r);
+    std::string out = b;
+    while (!out.empty() && out.back() == '0') {
+        out.pop_back();
+    }
+    if (!out.empty() && out.back() == '.') {
+        out.pop_back();
+    }
+    for (auto& ch : out) {
+        if (ch == '.') {
+            ch = ',';
+        }
+    }
+    return out + "x";
+}
+
+struct ChainLine {
+    std::string label;
+    std::string value;
+};
+
+/// The real image chain (E47 honest HUD): what the game renders, what FSR makes of it, the game's
+/// final image and the screen, with supersampling when the image is larger than the screen.
+std::vector<ChainLine> ResolutionChain(const TelemetrySnapshot& tel) {
+    std::vector<ChainLine> out;
+    char b[96];
+    const bool fsr_live = tel.fsr_version != 0 && tel.fsr_age_ms >= 0.0 && tel.fsr_age_ms < 1000.0;
+    if (fsr_live) {
+        std::snprintf(b, sizeof(b), "%ux%u", tel.fsr_in_width, tel.fsr_in_height);
+        out.push_back({Tr("Render do jogo"), b});
+        const double ratio = tel.fsr_in_height > 0 ? static_cast<double>(tel.fsr_out_height) /
+                                                         tel.fsr_in_height
+                                                   : 1.0;
+        std::snprintf(b, sizeof(b), "%ux%u (%s, %s)", tel.fsr_out_width, tel.fsr_out_height,
+                      FormatRatio(ratio).c_str(), Tr(FsrModeName(ratio)));
+        out.push_back({tel.fsr_version == 4 ? "FSR 4.1" : "FSR 3.1", b});
+    } else if (Settings::values.ocarina_fsr.GetValue() && tel.fsr_version != 0) {
+        out.push_back({"FSR", Tr("parado: o jogo escala sozinho")});
+    } else if (Settings::values.ocarina_fsr.GetValue()) {
+        out.push_back({"FSR", Tr("ainda não avaliou")});
+    }
+    if (tel.render_height > 0) {
+        std::snprintf(b, sizeof(b), "%ux%u", tel.render_width, tel.render_height);
+        std::string img = b;
+        if (fsr_live && tel.fsr_out_height > 0 && tel.fsr_out_height != tel.render_height) {
+            img += std::string(" (") + Tr("esticada") + " " +
+                   FormatRatio(static_cast<double>(tel.render_height) / tel.fsr_out_height) + ")";
+        }
+        out.push_back({Tr("Imagem do jogo"), img});
+    }
+    if (tel.output_height > 0) {
+        std::snprintf(b, sizeof(b), "%ux%u", tel.output_width, tel.output_height);
+        std::string scr = b;
+        if (tel.render_height > tel.output_height) {
+            scr += std::string(" (supersampling ") +
+                   FormatRatio(static_cast<double>(tel.render_height) / tel.output_height) + ")";
+        } else if (tel.render_height > 0 && tel.render_height < tel.output_height) {
+            scr += std::string(" (") + Tr("ampliada") + " " +
+                   FormatRatio(static_cast<double>(tel.output_height) / tel.render_height) + ")";
+        }
+        out.push_back({Tr("Tela"), scr});
+    }
+    return out;
+}
 
 // Presets mirror the measured project profiles (bench/profiles/packaa_*). Indices into
 // upscaler (0 Native, 1 FSR 3.1, 2 FSR 4.1), kFsrOutputChoices and kFsrRenderChoices.
@@ -163,11 +284,11 @@ struct UpscalePreset {
     int render_idx;
 };
 constexpr std::array<UpscalePreset, 7> kPresets{{
-    {"Atalho: FSR 4.1 + nitidez do jogo", 2, 3, 1},
-    {"FSR 4.1 Full HD", 2, 0, 1},
-    {"FSR 3.1 Full HD", 1, 0, 1},
-    {"FSR 4.1 1440p", 2, 1, 2},
-    {"FSR 4.1 saída 4K", 2, 2, 1},
+    {"Atalho: FSR 4.1 + nitidez do jogo", 2, 3, 3},
+    {"FSR 4.1 Full HD", 2, 0, 3},
+    {"FSR 3.1 Full HD", 1, 0, 3},
+    {"FSR 4.1 1440p", 2, 1, 4},
+    {"FSR 4.1 saída 4K", 2, 2, 3},
     {"Leve: FSR 3.1 720p > 1080p", 1, 0, 0},
     {"Nativo (sem FSR)", 0, -1, -1},
 }};
@@ -400,17 +521,17 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
         {T::Graphics, RK::Choice, "fsr_output", "Resolução Saída FSR",
          "Resolução que o FSR 3.1/4.1 reconstrói. \"1440p + nitidez do jogo\" (padrão): com o jogo em 1080p, o FSR 4.1 reconstrói até 1440p no lugar do passo de escala do próprio jogo, e a nitidez padrão do jogo roda por cima; é o mais nítido. Full HD, 1440p e 4K reconstroem e depois esticam a imagem para 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
          false, 0, 3, 1},
-        {T::Graphics, RK::Choice, "fsr_render", "Resolução Interna FSR",
-         "Resolução interna renderizada pelo jogo antes do upscaler FSR. 1080p ou 720p aliviam bastante GPU/Templo do Fogo.",
-         true, 0, 2, 1},
+        {T::Graphics, RK::Choice, "fsr_render", "Modo do FSR (render)",
+         "Resolução em que o jogo renderiza antes do FSR, como nos jogos de PC. O nome vem da razão real entre a saída do FSR e o render: Nativo (AA) 1:1, Ultra Qualidade 1,33x, Qualidade 1,5x, Equilibrado 1,7x, Desempenho 2x. Menos render alivia a GPU (Templo do Fogo) e deixa mais para o FSR reconstruir. Vale depois de reiniciar o jogo.",
+         true, 0, 4, 1},
         {T::Graphics, RK::Choice, "res_scale", "Escala de Resolução",
          "Fator de escala geral do emulador quando o upscaler de cena está desligado ou em jogos gerais.",
          true, 0, 6, 1},
         {T::Graphics, RK::Slider, "rcas_sharp", "Nitidez RCAS (FSR)",
          "Força do filtro de nitidez AMD RCAS aplicado depois do FSR 3.1/4.1, na mesma escala da janela de configurações do Lichii: 0% desliga, 100% é o máximo. Muda ao vivo.",
          false, 0, 200, 10},
-        {T::Graphics, RK::Toggle, "oot_aa", "Nitidez do Jogo (Nativo)",
-         "Nitidez original do jogo ou uma versão sem nitidez (sem halos). Com FSR 3.1/4.1 ligado a nitidez original fica sempre ativa e a opção trava em \"Nitidez Original\"; o RCAS acima soma nitidez por cima. \"Sem Nitidez\" só vale com o Upscaler em Nativo.",
+        {T::Graphics, RK::Toggle, "oot_aa", "Nitidez do Jogo",
+         "Com FSR: \"Nitidez Original\" põe o FSR no passo de escala do próprio jogo (saída 1440p) e a nitidez do jogo roda por cima; \"Sem Nitidez\" deixa o FSR reconstruir direto em Full HD, sem a nitidez do jogo. Muda junto com a Resolução Saída FSR, ao vivo. Sem FSR (Nativo): nitidez original do jogo ou a versão sem nitidez (sem halos). O RCAS soma nitidez por cima.",
          false, 0, 1, 1},
 
         {T::Graphics, RK::Heading, "h_win", "Janela e Pós-Processamento", "", false, 0, 0, 1},
@@ -703,7 +824,8 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
         return IndexIn(kFsrOutputChoices, Settings::values.ocarina_fsr_output.GetValue(), 0);
     }
     if (std::strcmp(id, "fsr_render") == 0) {
-        return IndexIn(kFsrRenderChoices, Settings::values.ocarina_fsr_render.GetValue(), 1);
+        return IndexIn(kFsrRenderChoices, Settings::values.ocarina_fsr_render.GetValue(),
+                       kFsrRenderDefaultIdx);
     }
     if (std::strcmp(id, "res_scale") == 0) {
         return IndexIn(kResScaleChoices, Settings::values.resolution_setup.GetValue(), 2);
@@ -713,10 +835,13 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
         return 200 - std::clamp(Settings::values.fsr_sharpening_slider.GetValue(), 0, 200);
     }
     if (std::strcmp(id, "oot_aa") == 0) {
-        // Show what runs, not what is stored (E47): with FSR on the rasterizer turns the bypass
-        // off (OotNetworkBypass), so the game's own sharpening is always there.
+        // Show what runs, not what is stored (E47): with FSR the game's sharpening runs only when
+        // FSR takes the game's own upscale step (OutputGame); the other outputs replace it.
         if (Settings::values.ocarina_fsr.GetValue()) {
-            return 0;
+            return Settings::values.ocarina_fsr_output.GetValue() ==
+                           Settings::OcarinaFsrOutput::OutputGame
+                       ? 0
+                       : 1;
         }
         return Settings::values.oot_anti_aliasing.GetValue() ==
                        Settings::OotAntiAliasing::NoSharpening
@@ -901,7 +1026,7 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
                           kFsrOutputChoices[static_cast<std::size_t>(val)]);
         dirty_settings = true;
     } else if (std::strcmp(id, "fsr_render") == 0) {
-        val = std::clamp(val, 0, 2);
+        val = std::clamp(val, 0, static_cast<int>(kFsrRenderChoices.size()) - 1);
         ApplySettingValue(Settings::values.ocarina_fsr_render,
                           kFsrRenderChoices[static_cast<std::size_t>(val)]);
     } else if (std::strcmp(id, "res_scale") == 0) {
@@ -913,9 +1038,22 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
         ApplySettingValue(Settings::values.fsr_sharpening_slider, 200 - val);
         dirty_settings = true;
     } else if (std::strcmp(id, "oot_aa") == 0) {
-        ApplySettingValue(Settings::values.oot_anti_aliasing,
-                          val != 0 ? Settings::OotAntiAliasing::NoSharpening
-                                   : Settings::OotAntiAliasing::Game);
+        if (Settings::values.ocarina_fsr.GetValue()) {
+            // With FSR the game's sharpening is the output choice (E47): on = the game's step
+            const bool on_game = Settings::values.ocarina_fsr_output.GetValue() ==
+                                 Settings::OcarinaFsrOutput::OutputGame;
+            if (val == 0 && !on_game) {
+                ApplySettingValue(Settings::values.ocarina_fsr_output,
+                                  Settings::OcarinaFsrOutput::OutputGame);
+            } else if (val != 0 && on_game) {
+                ApplySettingValue(Settings::values.ocarina_fsr_output,
+                                  Settings::OcarinaFsrOutput::Output1080p);
+            }
+        } else {
+            ApplySettingValue(Settings::values.oot_anti_aliasing,
+                              val != 0 ? Settings::OotAntiAliasing::NoSharpening
+                                       : Settings::OotAntiAliasing::Game);
+        }
         dirty_settings = true;
     } else if (std::strcmp(id, "win_aa") == 0) {
         ApplySettingValue(Settings::values.anti_aliasing,
@@ -1110,10 +1248,6 @@ bool OotMenuController::IsRowDisabled(const char* id, const TelemetrySnapshot& t
         std::strcmp(id, "rcas_sharp") == 0) {
         return !Settings::values.ocarina_fsr.GetValue();
     }
-    if (std::strcmp(id, "oot_aa") == 0) {
-        // The FSR replaces the game's output pass, so this toggle has no effect with it on (E47)
-        return Settings::values.ocarina_fsr.GetValue();
-    }
     if (std::strcmp(id, "fg_mult") == 0) {
         return !Settings::values.frame_gen.GetValue();
     }
@@ -1159,9 +1293,16 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
         return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
     }
     if (std::strcmp(id, "fsr_render") == 0) {
-        static constexpr std::array<const char*, 3> kLabs{"720p (Leve)", "1080p (Equilibrado)",
-                                                         "1440p (Máxima)"};
-        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+        const auto output = Settings::values.ocarina_fsr_output.GetValue();
+        const auto [w, h] = FsrRenderSize(
+            kFsrRenderChoices[static_cast<std::size_t>(
+                std::clamp(val, 0, static_cast<int>(kFsrRenderChoices.size()) - 1))],
+            output);
+        const double ratio = static_cast<double>(FsrOutputHeight(output)) / h;
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "%s · %ux%u (%s)", Tr(FsrModeName(ratio)), w, h,
+                      FormatRatio(ratio).c_str());
+        return buf;
     }
     if (std::strcmp(id, "res_scale") == 0) {
         static constexpr std::array<const char*, 7> kLabs{
@@ -2334,14 +2475,21 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
         }
 
         // Live telemetry readout inside help panel
-        char tel_buf[256];
-        std::snprintf(tel_buf, sizeof(tel_buf), "%s: %ux%u -> %ux%u | %s\nFPS: %.1f (%.2f ms)",
-                      Tr("Upscaler (OoT)"), tel.render_width, tel.render_height, tel.output_width,
-                      tel.output_height, tel.upscaler_name.c_str(), tel.fps, tel.frametime_ms);
+        std::string tel_text;
+        for (const auto& l : ResolutionChain(tel)) {
+            tel_text += l.label + ": " + l.value + "\n";
+        }
+        char fps_buf[64];
+        std::snprintf(fps_buf, sizeof(fps_buf), "FPS: %.1f (%.2f ms)", tel.fps, tel.frametime_ms);
+        tel_text += fps_buf;
+        const int tel_lines =
+            static_cast<int>(std::count(tel_text.begin(), tel_text.end(), '\n')) + 1;
+        const float tel_h = 20.0f * s * static_cast<float>(tel_lines);
         c.d->AddRectFilled(ImVec2(hx0 + 24.0f * s, y + 2.0f * s),
-                           ImVec2(hx0 + 26.5f * s, y + 42.0f * s), kAccent, s);
-        TextRaw(c, c.f.body, 15.0f * s, ImVec2(hx0 + 38.0f * s, y), kSoft, tel_buf, w_txt - 16.0f * s);
-        y += 52.0f * s;
+                           ImVec2(hx0 + 26.5f * s, y + tel_h + 2.0f * s), kAccent, s);
+        TextRaw(c, c.f.body, 15.0f * s, ImVec2(hx0 + 38.0f * s, y), kSoft, tel_text.c_str(),
+                w_txt - 16.0f * s);
+        y += tel_h + 12.0f * s;
 
         std::string ctrl_line;
         if (bindings.pad_connected && !bindings.active_pad_name.empty()) {
@@ -2445,7 +2593,12 @@ void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open,
     };
     std::vector<HudLine> lines;
     char b[128];
-    if (tel.output_height > 0) {
+    if (tel.fsr_version != 0 && tel.fsr_age_ms >= 0.0 && tel.fsr_age_ms < 1000.0) {
+        // E47: the real chain, not the setting: render > FSR output > screen
+        std::snprintf(b, sizeof(b), "%up > %s %up > %up", tel.fsr_in_height,
+                      tel.fsr_version == 4 ? "FSR 4.1" : "FSR 3.1", tel.fsr_out_height,
+                      tel.output_height);
+    } else if (tel.output_height > 0) {
         std::snprintf(b, sizeof(b), "%up %s", tel.output_height, tel.upscaler_name.c_str());
     } else {
         std::snprintf(b, sizeof(b), "%s", tel.upscaler_name.c_str());
@@ -2459,9 +2612,9 @@ void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open,
         lines.push_back({"1% low", b, fps_col(low)});
     }
     if (level >= 4) {
-        std::snprintf(b, sizeof(b), "%ux%u > %ux%u", tel.render_width, tel.render_height,
-                      tel.output_width, tel.output_height);
-        lines.push_back({"Render > saída", b, kSoft});
+        for (auto& l : ResolutionChain(tel)) {
+            lines.push_back({std::move(l.label), std::move(l.value), kSoft});
+        }
         if (tel.base_fps > 0.0 && tel.fps > tel.base_fps * 1.15) {
             std::snprintf(b, sizeof(b), "%.0f base > %.0f exibidos", tel.base_fps, tel.fps);
             lines.push_back({"Frame gen", b, kSoft});

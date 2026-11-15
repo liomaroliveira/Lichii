@@ -1163,6 +1163,12 @@ std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale();
 /// The quality whose render-scale patch the running game's main module got (none: unpatched).
 void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
 std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
+/// FSR-only render scales between the DLSS ones (E47 FSR modes): 956p (Quality, 1.5x to 1440p) and
+/// 844p (Balanced, 1.7x to 1440p). Docked, FSR on and DLSS off; none for the other resolutions.
+std::optional<OcarinaFsrRender> OcarinaFsrOnlyRenderScale();
+/// Render height of the scale patch the running game got (0: unpatched, 1440p with Max Resolution).
+void SetAppliedOcarinaRenderHeight(u32 height);
+u32 AppliedOcarinaRenderHeight();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;

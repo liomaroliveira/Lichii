@@ -9,6 +9,7 @@
 #include <optional>
 
 #include "common/logging.h"
+#include "common/oot_menu_bridge.h"
 #include "common/settings.h"
 #include "video_core/fsr.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
@@ -1047,6 +1048,8 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         });
         if (used_fsr4) {
             state.last_evaluation = now;
+            Common::OotMenu::Bridge::Instance().RecordUpscale(
+                extent.width, extent.height, output_extent.width, output_extent.height, 4);
             static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
             if (trace || frame % 120 == 0 || reset) {
                 LOG_INFO(Render_Vulkan,
@@ -1083,6 +1086,8 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .vertical_fov = 2.0f * std::atan(1.0f / projection_y),
         });
         state.last_evaluation = now;
+        Common::OotMenu::Bridge::Instance().RecordUpscale(
+            extent.width, extent.height, output_extent.width, output_extent.height, 3);
         static const bool trace = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE") != nullptr;
         if (trace || frame % 120 == 0 || fsr_reset) {
             LOG_INFO(Render_Vulkan,

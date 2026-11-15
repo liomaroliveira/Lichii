@@ -4702,6 +4702,9 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
                             : *scale == Quality::UltraPerformance ? 720
                                                                   : 1440;
         }
+        if (const u32 applied = Settings::AppliedOcarinaRenderHeight(); applied != 0) {
+            render_height = applied; // also the FSR-only 956p/844p modes (E47)
+        }
         const u32 output_height =
             VideoCommon::ResolveOcarinaFsrOutput(
                 Settings::values.ocarina_fsr_output.GetValue(), 0, render_height)

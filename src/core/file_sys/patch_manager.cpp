@@ -66,6 +66,10 @@ struct BuiltinPatch {
     // Applies only with NVIDIA DLSS on at this quality in docked mode, and is not listed in
     // Add-Ons.
     std::optional<Settings::NvidiaDlssQuality> dlss_quality{};
+    // Applies only with Ocarina FSR on at this render resolution (E47 FSR-only modes), docked.
+    std::optional<Settings::OcarinaFsrRender> fsr_render{};
+    // Render height the scale patch gives (2560x1440 scaled), for the FSR's texture LOD bias.
+    u32 render_height = 0;
 };
 
 constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
@@ -91,6 +95,16 @@ constexpr std::array RENDER_PERFORMANCE_RECORDS{
 };
 constexpr std::array RENDER_ULTRA_RECORDS{
     BuiltinPatchRecord{0x806420, RENDER_SCALE_ULTRA, RENDER_SCALE_ONE},
+};
+// FSR-only modes (E47): movz w9 with the float's top half. 0x3F2A = 0.6641 (1700x956, 1.5x to
+// 1440p, FSR Quality); 0x3F16 = 0.5859 (1500x844, 1.7x, FSR Balanced).
+constexpr std::array<u8, 4> RENDER_SCALE_956P{0x49, 0xE5, 0xA7, 0x52};
+constexpr std::array<u8, 4> RENDER_SCALE_844P{0xC9, 0xE2, 0xA7, 0x52};
+constexpr std::array RENDER_956P_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_956P, RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_844P_RECORDS{
+    BuiltinPatchRecord{0x806420, RENDER_SCALE_844P, RENDER_SCALE_ONE},
 };
 
 // RsMan-Dev's texture pool patch: stp x8, x9, [sp, #0x10] stores the graphics allocator's
@@ -362,6 +376,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = RENDER_BALANCED_RECORDS,
         .dlss_quality = Settings::NvidiaDlssQuality::Balanced,
+        .render_height = 1280,
     },
     BuiltinPatch{
         .name = "DLSS Performance render scale (built-in)",
@@ -370,6 +385,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = RENDER_PERFORMANCE_RECORDS,
         .dlss_quality = Settings::NvidiaDlssQuality::Performance,
+        .render_height = 1080,
     },
     BuiltinPatch{
         .name = "DLSS Ultra Performance render scale (built-in)",
@@ -378,6 +394,25 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = RENDER_ULTRA_RECORDS,
         .dlss_quality = Settings::NvidiaDlssQuality::UltraPerformance,
+        .render_height = 720,
+    },
+    BuiltinPatch{
+        .name = "FSR Quality render scale 956p (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_956P_RECORDS,
+        .fsr_render = Settings::OcarinaFsrRender::Render956p,
+        .render_height = 956,
+    },
+    BuiltinPatch{
+        .name = "FSR Balanced render scale 844p (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_844P_RECORDS,
+        .fsr_render = Settings::OcarinaFsrRender::Render844p,
+        .render_height = 844,
     },
 };
 
@@ -753,6 +788,7 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
     if (name == "main") {
         Settings::SetAppliedOcarinaRenderScale(std::nullopt);
+        Settings::SetAppliedOcarinaRenderHeight(0);
     }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
@@ -837,6 +873,14 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             const auto scale = Settings::OcarinaFsrRenderScale();
 #endif
             const bool wanted = scale == patch.dlss_quality &&
+                                std::find(disabled.cbegin(), disabled.cend(),
+                                          MAX_RESOLUTION_NAME) == disabled.cend();
+            if (!wanted) {
+                continue;
+            }
+        }
+        if (patch.fsr_render) {
+            const bool wanted = Settings::OcarinaFsrOnlyRenderScale() == patch.fsr_render &&
                                 std::find(disabled.cbegin(), disabled.cend(),
                                           MAX_RESOLUTION_NAME) == disabled.cend();
             if (!wanted) {
@@ -930,6 +974,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (patch.dlss_quality) {
             Settings::SetAppliedOcarinaRenderScale(patch.dlss_quality);
+        }
+        if (patch.render_height != 0) {
+            Settings::SetAppliedOcarinaRenderHeight(patch.render_height);
         }
     }
 
@@ -1490,7 +1537,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || patch.dlss_quality) {
+        if (patch.title_id != title_id || patch.dlss_quality || patch.fsr_render) {
             continue;
         }
         const auto is_disabled = [&](std::string_view name) {

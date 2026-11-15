@@ -589,12 +589,35 @@ void Bridge::RecordPresentSample(double frame_ms, bool is_generated) {
     }
 }
 
+void Bridge::RecordUpscale(u32 in_w, u32 in_h, u32 out_w, u32 out_h, int fsr_version) {
+    const u64 packed = (u64{in_w & 0xFFFF} << 48) | (u64{in_h & 0xFFFF} << 32) |
+                       (u64{out_w & 0xFFFF} << 16) | u64{out_h & 0xFFFF};
+    upscale_sizes_.store(packed, std::memory_order_relaxed);
+    upscale_version_.store(fsr_version, std::memory_order_relaxed);
+    upscale_time_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count(),
+                           std::memory_order_release);
+}
+
 TelemetrySnapshot Bridge::GetTelemetry() const {
     TelemetrySnapshot snap;
     {
         std::scoped_lock lk{state_mutex_};
         snap = telemetry_;
         snap.has_prompts = has_prompts_.load(std::memory_order_acquire);
+    }
+    if (const s64 t = upscale_time_ns_.load(std::memory_order_acquire); t != 0) {
+        const u64 packed = upscale_sizes_.load(std::memory_order_relaxed);
+        snap.fsr_in_width = static_cast<u32>((packed >> 48) & 0xFFFF);
+        snap.fsr_in_height = static_cast<u32>((packed >> 32) & 0xFFFF);
+        snap.fsr_out_width = static_cast<u32>((packed >> 16) & 0xFFFF);
+        snap.fsr_out_height = static_cast<u32>(packed & 0xFFFF);
+        snap.fsr_version = upscale_version_.load(std::memory_order_relaxed);
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        snap.fsr_age_ms = static_cast<double>(now - t) / 1e6;
     }
     std::scoped_lock plk{perf_mutex_};
     snap.fps = last_fps_;

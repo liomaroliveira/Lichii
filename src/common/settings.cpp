@@ -93,6 +93,7 @@ Values values;
 namespace {
 std::atomic<u32> nvidia_dlss_runtime_options{};
 std::atomic<u32> applied_ocarina_render_scale{};
+std::atomic<u32> applied_ocarina_render_height{};
 }
 
 void RefreshNvidiaDlssRuntimeSettings() {
@@ -121,6 +122,9 @@ std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale() {
         return NvidiaDlssQuality::Performance;
     case OcarinaFsrRender::Render720p:
         return NvidiaDlssQuality::UltraPerformance;
+    case OcarinaFsrRender::Render956p:
+    case OcarinaFsrRender::Render844p:
+        return std::nullopt; // OcarinaFsrOnlyRenderScale's patches
     default:
         // Don't leave boot render at 1440p when targeting 1080p output (would downscale/fail FSR).
         if (values.ocarina_fsr_output.GetValue() == OcarinaFsrOutput::Output1080p) {
@@ -133,6 +137,25 @@ std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale() {
 void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
     applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
                                        std::memory_order_relaxed);
+}
+
+std::optional<OcarinaFsrRender> OcarinaFsrOnlyRenderScale() {
+    if (!values.ocarina_fsr.GetValue() || !IsDockedMode() || values.nvidia_dlss.GetValue()) {
+        return std::nullopt;
+    }
+    const auto render = values.ocarina_fsr_render.GetValue();
+    if (render != OcarinaFsrRender::Render956p && render != OcarinaFsrRender::Render844p) {
+        return std::nullopt;
+    }
+    return render;
+}
+
+void SetAppliedOcarinaRenderHeight(u32 height) {
+    applied_ocarina_render_height.store(height, std::memory_order_relaxed);
+}
+
+u32 AppliedOcarinaRenderHeight() {
+    return applied_ocarina_render_height.load(std::memory_order_relaxed);
 }
 
 std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
