@@ -26,6 +26,7 @@ add_executable(tests
     core/nx2_debug_server.cpp
     core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
+    core/nx2_fence_action.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
@@ -49,6 +50,7 @@ add_executable(tests
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
+    core/memory_span.cpp
     core/builtin_patches.cpp
     core/builtin_font_glyphs.cpp
     core/system_test_context.h
@@ -192,6 +194,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/host_wait_margin.cpp
     core/local_redirect.cpp
     core/nextendo_redirect.cpp
     core/filesystem_rename.cpp

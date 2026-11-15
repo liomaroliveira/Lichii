@@ -3266,7 +3266,10 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    // Pages no image was ever registered on hold no image or stale page to update, as in
+    // GetFlushArea, so the texture cache's lock (held by the back through each draw) is not
+    // waited for there.
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
@@ -4355,6 +4358,12 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
+    if (descriptor_buffer_ring.NeedsSubmit(scheduler)) {
+        draw_counter = 0;
+        scheduler.Flush();
+        pending_native_work = native && !android;
+        return;
+    }
     u32 budget = SubmissionPolicy::DefaultNativeBudget;
     if (native && !android) {
         static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
