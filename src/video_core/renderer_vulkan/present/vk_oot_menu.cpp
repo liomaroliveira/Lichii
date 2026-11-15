@@ -2249,8 +2249,25 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
             const float sep_y = hy1 - 92.0f * s;
             c.d->AddLine(ImVec2(hx0 + 24.0f * s, sep_y), ImVec2(hx1 - 24.0f * s, sep_y),
                          Alpha(kEdge, 0.8f), std::max(1.0f, s));
-            std::string msg = std::to_string(pending_list.size()) + " " + Tr("Após reiniciar");
-            TextMidRaw(c, c.f.strong, 14.5f * s, hx0 + 24.0f * s, sep_y + 18.0f * s, kGoldHi,
+            // Longshot parity (E47.T13): name what waits for the restart, not just how many.
+            std::string msg = std::string(Tr("Requer reinício")) + ":";
+            for (std::size_t i = 0; i < pending_list.size(); ++i) {
+                msg += (i == 0 ? " " : ", ");
+                msg += Tr(pending_list[i]);
+            }
+            if (pending_list.empty()) {
+                msg = Tr("Após reiniciar");
+            }
+            const float room_w = hx1 - hx0 - 48.0f * s;
+            float px = FitPx(14.5f * s, 11.0f * s, 0.5f * s, room_w, [&](float v) {
+                return SizeOfRaw(c.f.strong, v, msg.c_str()).x;
+            });
+            if (px <= 0.0f || SizeOfRaw(c.f.strong, 11.0f * s, msg.c_str()).x > room_w) {
+                msg = std::string(Tr("Requer reinício")) + ": " +
+                      std::to_string(pending_list.size()) + " " + Tr("opções");
+                px = 14.5f * s;
+            }
+            TextMidRaw(c, c.f.strong, px, hx0 + 24.0f * s, sep_y + 18.0f * s, kGoldHi,
                        msg.c_str());
             const ImVec2 b0(hx0 + 24.0f * s, hy1 - 54.0f * s);
             const ImVec2 b1(hx1 - 24.0f * s, hy1 - 14.0f * s);

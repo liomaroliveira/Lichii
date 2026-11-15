@@ -309,6 +309,7 @@ inline const char* Tr(const char* pt_br) noexcept {
         {"Leve: FSR 3.1 720p > 1080p", "Light: FSR 3.1 720p > 1080p"},
         {"Nativo (sem FSR)", "Native (no FSR)"},
         {"Lista", "List"},
+        {"opções", "options"},
         // T6c: performance overlay
         {"Gráfico", "Graph"},
         {"Detalhado", "Detailed"},
