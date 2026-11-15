@@ -50,6 +50,7 @@ public:
         SliderTrack,
         ApplyRestart,
         BackToCompact,
+        DropItem,
     };
 
     struct HitBox {
@@ -108,6 +109,18 @@ private:
     void MoveSelection(int delta, const std::vector<const RowDef*>& tab_rows);
     void AdjustRow(const RowDef& r, int delta, Common::OotMenu::Bridge& bridge);
 
+    // Drop-down list for Choice rows (T6a): A opens, up/down picks, A applies, B closes.
+    void OpenDropdown(const RowDef& r, const Common::OotMenu::PcOptions& opts);
+    void CloseDropdown();
+    void ApplyDropdown(Common::OotMenu::Bridge& bridge);
+    void MoveDropdown(int delta);
+    void DrawDropdown(Ctx& c, ImVec2 anchor_a, ImVec2 anchor_b, bool prefer_up,
+                      const Common::OotMenu::TelemetrySnapshot& tel,
+                      const Common::OotMenu::PcOptions& opts);
+    [[nodiscard]] bool DropdownOpen() const noexcept {
+        return dd_row_ != nullptr;
+    }
+
     void ProcessInput(Common::OotMenu::Bridge& bridge, float dt_sec);
     void ProcessPointer(Common::OotMenu::Bridge& bridge, const std::vector<const RowDef*>& tab_rows);
 
@@ -131,6 +144,12 @@ private:
     float menu_ox_{0.0f};
     int dragging_slider_row_{-1};
     std::vector<HitBox> hits_;
+
+    int rebind_pick_{0}; // Switch button chosen in "Trocar um botão" (T6b)
+    const RowDef* dd_row_{nullptr};
+    int dd_sel_{0};
+    int dd_scroll_{0};
+    int dd_hover_{-1};
 
     u64 prev_pad_mask_{0};
     int held_dir_{0}; // 1=up, 2=down, 3=left, 4=right

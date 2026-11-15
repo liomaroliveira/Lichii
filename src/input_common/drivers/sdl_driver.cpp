@@ -7,11 +7,13 @@
 #include <array>
 #include <numbers>
 #include <optional>
+#include <unordered_map>
 #include "common/logging.h"
 #include "common/math_util.h"
 #include "common/param_package.h"
 #include "common/settings.h"
 #include "common/thread.h"
+
 #include "common/vector_math.h"
 #include "input_common/drivers/sdl_driver.h"
 #include "input_common/helpers/dualsense_haptics.h"
@@ -22,14 +24,17 @@ namespace InputCommon {
 namespace {
 std::mutex last_active_pad_mutex;
 LastActivePad last_active_pad;
+// Last value of each joystick axis (SDL event thread only), to see a trigger leave its rest.
+std::unordered_map<std::string, float> last_axis_value;
 } // Anonymous namespace
 
-void NoteLastActivePad(std::string guid, int port) {
+void NoteLastActivePad(std::string guid, int port, std::string input) {
     std::scoped_lock lock{last_active_pad_mutex};
     if (last_active_pad.guid != guid || last_active_pad.port != port) {
         last_active_pad.guid = std::move(guid);
         last_active_pad.port = port;
     }
+    last_active_pad.input = std::move(input);
     ++last_active_pad.presses;
 }
 
@@ -757,7 +762,11 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jbutton.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
             SetButton(identifier, event.jbutton.button, true);
-            NoteLastActivePad(joystick->GetGUID().RawString(), joystick->GetPort());
+            NoteLastActivePad(joystick->GetGUID().RawString(), joystick->GetPort(),
+                              BuildButtonParamPackageForButton(joystick->GetPort(),
+                                                               joystick->GetGUID(),
+                                                               event.jbutton.button)
+                                  .Serialize());
         }
         break;
     }
@@ -765,13 +774,38 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jhat.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
             SetHatButton(identifier, event.jhat.hat, event.jhat.value);
+            if (!GetHatButtonName(event.jhat.value).empty()) {
+                NoteLastActivePad(joystick->GetGUID().RawString(), joystick->GetPort(),
+                                  BuildHatParamPackageForButton(joystick->GetPort(),
+                                                                joystick->GetGUID(),
+                                                                event.jhat.hat, event.jhat.value)
+                                      .Serialize());
+            }
         }
         break;
     }
     case SDL_EVENT_JOYSTICK_AXIS_MOTION: {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jaxis.which)) {
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            SetAxis(identifier, event.jaxis.axis, event.jaxis.value / 32767.0f);
+            const float value = event.jaxis.value / 32767.0f;
+            SetAxis(identifier, event.jaxis.axis, value);
+            // A trigger rests at -1: going from rest to past half counts as a press.
+            const std::string key = joystick->GetGUID().RawString() + ':' +
+                                    std::to_string(joystick->GetPort()) + ':' +
+                                    std::to_string(event.jaxis.axis);
+            const auto prev = last_axis_value.find(key);
+            const bool was_rest = prev != last_axis_value.end() && prev->second < -0.5f;
+            const bool was_low = prev == last_axis_value.end() || prev->second <= 0.5f;
+            if (was_rest && was_low && value > 0.5f) {
+                NoteLastActivePad(joystick->GetGUID().RawString(), joystick->GetPort(),
+                                  BuildAnalogParamPackageForButton(joystick->GetPort(),
+                                                                   joystick->GetGUID(),
+                                                                   event.jaxis.axis, 1.0f)
+                                      .Serialize());
+            }
+            if (value < -0.5f || value > 0.5f || prev == last_axis_value.end()) {
+                last_axis_value[key] = value;
+            }
         }
         break;
     }

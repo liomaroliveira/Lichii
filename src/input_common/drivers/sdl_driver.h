@@ -36,8 +36,11 @@ struct LastActivePad {
     std::string guid;
     int port = 0;
     u64 presses = 0;
+    /// The input that was pressed, as a full ParamPackage string (button, hat direction or a
+    /// trigger axis), for button-by-button remapping in the OoT menu.
+    std::string input;
 };
-void NoteLastActivePad(std::string guid, int port);
+void NoteLastActivePad(std::string guid, int port, std::string input = {});
 [[nodiscard]] LastActivePad GetLastActivePad();
 
 class SDLDriver : public InputEngine {

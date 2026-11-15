@@ -176,6 +176,10 @@ struct HostCallbacks {
     std::function<void(int layout_mode)> apply_pad_layout;
     std::function<void()> reset_controls;
     std::function<void()> toggle_gamemode;
+    // Button-by-button remap (T6b): the host waits for the next press on player 1's controller
+    // and maps it to the Switch button `switch_button` (0..15, NativeButton order).
+    std::function<void(int switch_button)> begin_rebind;
+    std::function<void()> cancel_rebind;
 };
 
 class Bridge {
@@ -249,6 +253,19 @@ public:
 
     // Pad bindings & device info snapshot for prompts + Controls tab
     void SetPadBindings(const PadBindingSnapshot& snap);
+    // Only the readable names in the Controls tab (keeps pad_input / first_vk for prompts)
+    void SetBindingNames(const std::array<std::string, kSwitchButtonCount>& pad_names,
+                         const std::array<std::string, kSwitchButtonCount>& key_names);
+
+    // Button-by-button remap state (-1 = not capturing)
+    void BeginRebind(int switch_button);
+    void CancelRebind();
+    void FinishRebind(std::string message);
+    [[nodiscard]] int RebindTarget() const noexcept {
+        return rebind_target_.load(std::memory_order_acquire);
+    }
+    // Last remap result and how long ago it was set, for a short notice in the menu
+    [[nodiscard]] std::string RebindMessage(double* age_sec) const;
     [[nodiscard]] PadBindingSnapshot GetPadBindings() const;
     [[nodiscard]] int EffectivePromptFace() const;
 
@@ -300,6 +317,9 @@ private:
     std::atomic<int> idle_spin_override_us_{-1};
     std::atomic<bool> has_prompts_{false};
     std::atomic<bool> loaded_from_disk_{false};
+    std::atomic<int> rebind_target_{-1};
+    std::string rebind_message_;
+    std::chrono::steady_clock::time_point rebind_message_at_{};
 
     mutable std::mutex input_mutex_;
     std::vector<KeyEvent> key_queue_;

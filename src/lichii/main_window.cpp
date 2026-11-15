@@ -9,7 +9,9 @@
 #endif
 
 #include <map>
+#include <filesystem>
 #include <fstream>
+#include <QKeySequence>
 #include <QScopeGuard>
 #include <QFile>
 #include <cstdlib>
@@ -5627,9 +5629,162 @@ void MainWindow::RegisterOotMenuCallbacks() {
     callbacks.reset_controls = [this, on_gui] {
         on_gui([this] {
             OotApplyPadLayout(Common::OotMenu::Bridge::Instance().GetOptions().pad_layout);
+            OotRefreshBindingNames();
         });
     };
+    callbacks.begin_rebind = [this, on_gui](int switch_button) {
+        on_gui([this, switch_button] {
+            oot_rebind_target = switch_button;
+            oot_rebind_presses = InputCommon::GetLastActivePad().presses;
+            oot_rebind_ticks = 0;
+        });
+    };
+    callbacks.cancel_rebind = [this, on_gui] { on_gui([this] { oot_rebind_target = -1; }); };
     Common::OotMenu::Bridge::Instance().RegisterCallbacks(std::move(callbacks));
+    if (!oot_menu_timer.isActive()) {
+        oot_menu_timer.setInterval(50);
+        connect(&oot_menu_timer, &QTimer::timeout, this, &MainWindow::OotMenuTick);
+        oot_menu_timer.start();
+    }
+}
+
+namespace {
+// Readable name of a mapped input for the menu's Controls tab
+std::string OotInputName(const Common::ParamPackage& p) {
+    const std::string engine = p.Get("engine", "");
+    if (engine.empty()) {
+        return {};
+    }
+    if (engine == "keyboard") {
+        return QKeySequence(p.Get("code", 0)).toString().toStdString();
+    }
+    if (p.Has("hat")) {
+        const std::string dir = p.Get("direction", "");
+        const char* pt = dir == "up"     ? "cima"
+                         : dir == "down" ? "baixo"
+                         : dir == "left" ? "esq."
+                                         : "dir.";
+        return std::string("D-pad ") + pt;
+    }
+    if (p.Has("axis")) {
+        return "Eixo " + std::to_string(p.Get("axis", 0)) + (p.Get("invert", "+") == "-" ? "-" : "+");
+    }
+    if (p.Has("button")) {
+        return "Botão " + std::to_string(p.Get("button", 0));
+    }
+    return engine;
+}
+} // namespace
+
+void MainWindow::OotRefreshBindingNames() {
+    if (!QtCommon::system) {
+        return;
+    }
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller == nullptr) {
+        return;
+    }
+    std::array<std::string, Common::OotMenu::kSwitchButtonCount> pad{}, keys{};
+    const bool layer = [] {
+        const char* v = std::getenv("EDEN_NX2_KEYBOARD_LAYER");
+        return v != nullptr && v[0] == '1';
+    }();
+    for (std::size_t i = 0; i < pad.size(); ++i) {
+        const Common::ParamPackage p = controller->GetButtonParam(i);
+        if (p.Get("engine", "") == "keyboard") {
+            keys[i] = OotInputName(p);
+        } else {
+            pad[i] = OotInputName(p);
+            if (layer && QtConfig::default_buttons[i] != 0) {
+                keys[i] = QKeySequence(QtConfig::default_buttons[i]).toString().toStdString();
+            }
+        }
+    }
+    Common::OotMenu::Bridge::Instance().SetBindingNames(pad, keys);
+}
+
+void MainWindow::OotSaveControllerProfile(const Common::ParamPackage& any_button) {
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    const std::string guid = any_button.Get("guid", "");
+    if (controller == nullptr || guid.empty()) {
+        return;
+    }
+    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "oot-controles";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto file = dir / (guid + ".ini");
+    // First remap of the session: keep the profile as it was (play/tools/controller.py's format)
+    if (!oot_profile_backed_up && std::filesystem::exists(file, ec)) {
+        std::filesystem::copy_file(file, dir / (guid + ".ini.bak"),
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        oot_profile_backed_up = true;
+    }
+    std::ofstream out{file, std::ios::trunc};
+    if (!out) {
+        return;
+    }
+    out << "# " << Common::OotMenu::Bridge::Instance().GetPadBindings().active_pad_name << '\n'
+        << "# layout=custom\n";
+    for (std::size_t i = 0; i < Settings::NativeButton::NumButtons; ++i) {
+        out << Settings::NativeButton::mapping[i] << "=\""
+            << controller->GetButtonParam(i).Serialize() << "\"\n";
+    }
+    for (std::size_t i = 0; i < Settings::NativeAnalog::NumAnalogs; ++i) {
+        out << Settings::NativeAnalog::mapping[i] << "=\""
+            << controller->GetStickParam(i).Serialize() << "\"\n";
+    }
+}
+
+void MainWindow::OotMenuTick() {
+    auto& bridge = Common::OotMenu::Bridge::Instance();
+    if (!QtCommon::system || !bridge.IsOcarina()) {
+        oot_rebind_target = -1;
+        return;
+    }
+    if (oot_rebind_target >= 0) {
+        static constexpr std::array<const char*, 16> kNames{
+            "A (Ação)", "B (Espada)", "X (Item E)", "Y (Item C)", "LS (Analóg.)", "RS (Câmera)",
+            "L (Esq.)", "R (Dir.)",   "ZL (Mira Z)", "ZR (Escudo)", "+ (Pausa)",  "- (Mapa)",
+            "D-Esq.",   "D-Cima",     "D-Dir.",     "D-Baixo"};
+        const int target = oot_rebind_target;
+        auto* controller =
+            QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+        const Common::ParamPackage current =
+            controller ? controller->GetButtonParam(Settings::NativeButton::A)
+                       : Common::ParamPackage{};
+        const InputCommon::LastActivePad active = InputCommon::GetLastActivePad();
+        if (controller == nullptr || current.Get("engine", "") != "sdl") {
+            oot_rebind_target = -1;
+            bridge.FinishRebind("Jogador 1 está no teclado: conecte um controle");
+        } else if (active.presses != oot_rebind_presses && !active.input.empty() &&
+                   active.guid == current.Get("guid", "") &&
+                   active.port == current.Get("port", 0)) {
+            const Common::ParamPackage input{active.input};
+            controller->SetButtonParam(static_cast<std::size_t>(target), input);
+            controller->SaveCurrentConfig();
+            config->SaveAllValues();
+            OotSaveControllerProfile(current);
+            nx2_active_pad_presses = active.presses;
+            oot_rebind_target = -1;
+            const std::string msg = std::string("Botão trocado: ") +
+                                    kNames[static_cast<std::size_t>(target)] + " = " +
+                                    OotInputName(input);
+            LOG_INFO(Frontend, "OoT menu: {} ({})", msg, active.input);
+            bridge.FinishRebind(msg);
+            OotRefreshBindingNames();
+        } else if (++oot_rebind_ticks > 120) { // 6 s
+            oot_rebind_target = -1;
+            bridge.FinishRebind("Tempo esgotado: nenhum botão apertado");
+        }
+    }
+    if (bridge.IsOpen() && ++oot_names_ticks >= 20) {
+        oot_names_ticks = 0;
+        OotRefreshBindingNames();
+    } else if (!bridge.IsOpen()) {
+        oot_names_ticks = 20; // refresh as soon as the menu opens
+    }
 }
 
 void MainWindow::OotApplyPadLayout(int layout) {

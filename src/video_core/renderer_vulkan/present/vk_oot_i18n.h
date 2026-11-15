@@ -280,6 +280,28 @@ inline const char* Tr(const char* pt_br) noexcept {
          "Saves all settings to disk and immediately restarts the game."},
         {"Salva e fecha o emulador com segurança.",
          "Saves settings and cleanly exits the emulator."},
+
+        // T6a: presets and drop-down list
+        {"Predefinições", "Presets"},
+        {"Predefinição (perfis)", "Preset (profiles)"},
+        {"Aplica de uma vez o upscaler e as resoluções dos perfis medidos do projeto (pack-aa). A resolução interna só muda após reiniciar.",
+         "Applies the upscaler and resolutions of the project's measured profiles (pack-aa) at once. Internal resolution changes after a restart."},
+        {"Atalho: FSR 4.1 Full HD", "Shortcut: FSR 4.1 Full HD"},
+        {"FSR 4.1 saída 4K", "FSR 4.1 4K output"},
+        {"Leve: FSR 3.1 720p > 1080p", "Light: FSR 3.1 720p > 1080p"},
+        {"Nativo (sem FSR)", "Native (no FSR)"},
+        {"Lista", "List"},
+        // T6b: button-by-button remap
+        {"Trocar um botão", "Remap a button"},
+        {"Escolha o botão do Switch e aperte no controle o botão que vai fazer essa função. Fica salvo no perfil deste controle (oot-controles).",
+         "Pick the Switch button, then press the controller button that should do it. Saved in this controller's profile (oot-controles)."},
+        {"Aperte no controle o botão para", "Press the controller button for"},
+        {"Esc ou botão direito cancela", "Esc or right click cancels"},
+        {"Troca cancelada", "Remap cancelled"},
+        {"Tempo esgotado: nenhum botão apertado", "Timed out: no button pressed"},
+        {"Botão trocado", "Button remapped"},
+        {"Jogador 1 está no teclado: conecte um controle", "Player 1 is on the keyboard: connect a controller"},
+        {"Aplicar", "Apply"},
     };
     const auto it = kEnTable.find(pt_br);
     return it != kEnTable.end() ? it->second : pt_br;

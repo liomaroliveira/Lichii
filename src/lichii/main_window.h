@@ -507,6 +507,9 @@ private:
     /// OoT in-game menu (E45): Layout preset on player 1's pad, by position (0 Nintendo, 1 Xbox / PC, 2 swapped A/B).
     void OotApplyPadLayout(int layout);
     void RegisterOotMenuCallbacks();
+    void OotMenuTick();
+    void OotRefreshBindingNames();
+    void OotSaveControllerProfile(const Common::ParamPackage& any_button);
     void HideMouseCursor();
     void ShowMouseCursor();
     void OpenURL(const QUrl& url);
@@ -624,6 +627,13 @@ private:
     QTimer nx2_automap_timer;
     QTimer nx2_active_pad_timer;
     u64 nx2_active_pad_presses = 0;
+    // OoT menu (E45 T6b): button-by-button remap and the Controls tab's names
+    QTimer oot_menu_timer;
+    int oot_rebind_target = -1;
+    u64 oot_rebind_presses = 0;
+    int oot_rebind_ticks = 0;
+    int oot_names_ticks = 0;
+    bool oot_profile_backed_up = false;
     std::optional<std::set<std::string>> nx2_automap_seen; ///< controllers at the last check
 
     QString startup_icon_theme;

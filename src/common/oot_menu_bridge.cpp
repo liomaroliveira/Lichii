@@ -702,6 +702,65 @@ void Bridge::RequestResetControls() {
     prompts_gen_.fetch_add(1, std::memory_order_release);
 }
 
+void Bridge::SetBindingNames(const std::array<std::string, kSwitchButtonCount>& pad_names,
+                             const std::array<std::string, kSwitchButtonCount>& key_names) {
+    std::scoped_lock lk{state_mutex_};
+    bindings_.pad_names = pad_names;
+    bindings_.key_names = key_names;
+}
+
+void Bridge::BeginRebind(int switch_button) {
+    if (switch_button < 0 || switch_button >= static_cast<int>(kSwitchButtonCount)) {
+        return;
+    }
+    std::function<void(int)> cb;
+    {
+        std::scoped_lock lk{state_mutex_};
+        cb = callbacks_.begin_rebind;
+        rebind_message_.clear();
+    }
+    if (!cb) {
+        FinishRebind("Troca de botão indisponível nesta janela");
+        return;
+    }
+    rebind_target_.store(switch_button, std::memory_order_release);
+    cb(switch_button);
+}
+
+void Bridge::CancelRebind() {
+    if (rebind_target_.exchange(-1, std::memory_order_acq_rel) < 0) {
+        return;
+    }
+    std::function<void()> cb;
+    {
+        std::scoped_lock lk{state_mutex_};
+        cb = callbacks_.cancel_rebind;
+    }
+    if (cb) {
+        cb();
+    }
+    FinishRebind("Troca cancelada");
+}
+
+void Bridge::FinishRebind(std::string message) {
+    rebind_target_.store(-1, std::memory_order_release);
+    std::scoped_lock lk{state_mutex_};
+    rebind_message_ = std::move(message);
+    rebind_message_at_ = std::chrono::steady_clock::now();
+}
+
+std::string Bridge::RebindMessage(double* age_sec) const {
+    std::scoped_lock lk{state_mutex_};
+    if (age_sec) {
+        *age_sec = rebind_message_.empty()
+                       ? 1e9
+                       : std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       rebind_message_at_)
+                             .count();
+    }
+    return rebind_message_;
+}
+
 void Bridge::RequestToggleGamemode() {
     std::function<void()> cb;
     {

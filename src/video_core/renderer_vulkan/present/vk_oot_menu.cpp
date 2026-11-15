@@ -59,6 +59,23 @@ constexpr std::array<Settings::OcarinaFsrRender, 3> kFsrRenderChoices{
     Settings::OcarinaFsrRender::Render1440p,
 };
 
+// Presets mirror the measured project profiles (bench/profiles/packaa_*). Indices into
+// upscaler (0 Native, 1 FSR 3.1, 2 FSR 4.1), kFsrOutputChoices and kFsrRenderChoices.
+struct UpscalePreset {
+    const char* label;
+    int upscaler;
+    int output_idx;
+    int render_idx;
+};
+constexpr std::array<UpscalePreset, 6> kPresets{{
+    {"Atalho: FSR 4.1 Full HD", 2, 0, 1},
+    {"FSR 3.1 Full HD", 1, 0, 1},
+    {"FSR 4.1 1440p", 2, 1, 2},
+    {"FSR 4.1 saída 4K", 2, 2, 1},
+    {"Leve: FSR 3.1 720p > 1080p", 1, 0, 0},
+    {"Nativo (sem FSR)", 0, -1, -1},
+}};
+
 template <typename T, std::size_t N>
 int IndexIn(const std::array<T, N>& arr, const T& val, int fallback = 0) noexcept {
     for (std::size_t i = 0; i < N; ++i) {
@@ -263,6 +280,10 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
     using T = OotMenuController::Tab;
     static const std::vector<OotMenuController::RowDef> kRows{
         // Tab 0: Graphics
+        {T::Graphics, RK::Heading, "h_preset", "Predefinições", "", false, 0, 0, 1},
+        {T::Graphics, RK::Choice, "preset", "Predefinição (perfis)",
+         "Aplica de uma vez o upscaler e as resoluções dos perfis medidos do projeto (pack-aa). A resolução interna só muda após reiniciar.",
+         false, 1, static_cast<int>(kPresets.size()), 1},
         {T::Graphics, RK::Heading, "h_upscale", "Reconstrução e Nitidez", "", false, 0, 0, 1},
         {T::Graphics, RK::Choice, "upscaler", "Upscaler (OoT)",
          "Substitui a reconstrução do jogo ao vivo sem reiniciar: Nativo, FSR 3.1 ou AMD FSR 4.1 (INT8/FP8).",
@@ -358,6 +379,9 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
         {T::Controls, RK::Toggle, "kbd_layer", "Camada Teclado NX2",
          "Ativa a camada de teclado/mouse do NX2 ao vivo para câmera e movimento sem controle.", false,
          0, 1, 1},
+        {T::Controls, RK::Choice, "rebind", "Trocar um botão",
+         "Escolha o botão do Switch e aperte no controle o botão que vai fazer essa função. Fica salvo no perfil deste controle (oot-controles).",
+         false, 0, 15, 1},
         {T::Controls, RK::Action, "reset_controls", "Resetar Controles",
          "Mostra os botões e teclas atuais do Jogador 1 e permite restaurar os padrões.", false, 0,
          0, 1},
@@ -498,6 +522,24 @@ std::vector<const OotMenuController::RowDef*> OotMenuController::RowsForTab(Tab 
 }
 
 int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const {
+    if (std::strcmp(id, "rebind") == 0) {
+        return rebind_pick_;
+    }
+    if (std::strcmp(id, "preset") == 0) {
+        const int up = ReadRowValue("upscaler", opts);
+        const int out = ReadRowValue("fsr_output", opts);
+        const int ren = ReadRowValue("fsr_render", opts);
+        for (int i = 0; i < static_cast<int>(kPresets.size()); ++i) {
+            const auto& p = kPresets[static_cast<std::size_t>(i)];
+            if (p.upscaler != up) {
+                continue;
+            }
+            if (p.upscaler == 0 || (p.output_idx == out && p.render_idx == ren)) {
+                return i + 1;
+            }
+        }
+        return 0; // Custom
+    }
     if (std::strcmp(id, "upscaler") == 0) {
         if (!Settings::values.ocarina_fsr.GetValue()) {
             return 0;
@@ -662,7 +704,28 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
     bool bump_prompts = false;
     bool request_save = true;
 
-    if (std::strcmp(id, "upscaler") == 0) {
+    if (std::strcmp(id, "rebind") == 0) {
+        rebind_pick_ = std::clamp(val, 0, static_cast<int>(kSwitchActionLabels.size()) - 1);
+        bridge.BeginRebind(rebind_pick_);
+        return;
+    }
+    if (std::strcmp(id, "preset") == 0) {
+        if (val < 1 || val > static_cast<int>(kPresets.size())) {
+            return;
+        }
+        const auto& p = kPresets[static_cast<std::size_t>(val - 1)];
+        ApplySettingValue(Settings::values.ocarina_fsr, p.upscaler > 0);
+        ApplySettingValue(Settings::values.amd_fsr4, p.upscaler == 2);
+        if (p.output_idx >= 0) {
+            ApplySettingValue(Settings::values.ocarina_fsr_output,
+                              kFsrOutputChoices[static_cast<std::size_t>(p.output_idx)]);
+        }
+        if (p.render_idx >= 0) {
+            ApplySettingValue(Settings::values.ocarina_fsr_render,
+                              kFsrRenderChoices[static_cast<std::size_t>(p.render_idx)]);
+        }
+        dirty_settings = true;
+    } else if (std::strcmp(id, "upscaler") == 0) {
         val = std::clamp(val, 0, 2);
         ApplySettingValue(Settings::values.ocarina_fsr, val > 0);
         ApplySettingValue(Settings::values.amd_fsr4, val == 2);
@@ -887,6 +950,15 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
         }
         return "";
     }
+    if (std::strcmp(id, "rebind") == 0) {
+        return Tr(kSwitchActionLabels[static_cast<std::size_t>(std::clamp(val, 0, 15))]);
+    }
+    if (std::strcmp(id, "preset") == 0) {
+        if (val < 1 || val > static_cast<int>(kPresets.size())) {
+            return Tr("Personalizado");
+        }
+        return Tr(kPresets[static_cast<std::size_t>(val - 1)].label);
+    }
     if (std::strcmp(id, "upscaler") == 0) {
         if (val == 0) {
             return Tr("Nativo (Desligado)");
@@ -1074,6 +1146,15 @@ void OotMenuController::AdjustRow(const RowDef& r, int delta, Bridge& bridge) {
     }
     int cur = ReadRowValue(r.id, opts);
     int next = cur;
+    if (std::strcmp(r.id, "rebind") == 0) {
+        // Arrows only pick the button; A (or a click) starts the capture.
+        if (delta == 0) {
+            WriteRowValue(r.id, cur, opts, bridge);
+        } else {
+            rebind_pick_ = r.lo + ((cur - r.lo + delta + (r.hi - r.lo + 1)) % (r.hi - r.lo + 1));
+        }
+        return;
+    }
     if (r.kind == RowKind::Slider) {
         next = std::clamp(cur + delta * r.step, r.lo, r.hi);
     } else if (r.kind == RowKind::Toggle) {
@@ -1092,10 +1173,64 @@ void OotMenuController::AdjustRow(const RowDef& r, int delta, Bridge& bridge) {
     }
 }
 
+void OotMenuController::OpenDropdown(const RowDef& r, const PcOptions& opts) {
+    dd_row_ = &r;
+    const int cur = ReadRowValue(r.id, opts);
+    dd_sel_ = (cur >= r.lo && cur <= r.hi) ? cur : r.lo;
+    dd_scroll_ = 0;
+    dd_hover_ = -1;
+    confirm_action_id_.clear();
+}
+
+void OotMenuController::CloseDropdown() {
+    dd_row_ = nullptr;
+    dd_hover_ = -1;
+}
+
+void OotMenuController::MoveDropdown(int delta) {
+    if (dd_row_ == nullptr) {
+        return;
+    }
+    dd_sel_ = std::clamp(dd_sel_ + delta, dd_row_->lo, dd_row_->hi);
+}
+
+void OotMenuController::ApplyDropdown(Bridge& bridge) {
+    if (dd_row_ == nullptr) {
+        return;
+    }
+    const RowDef& r = *dd_row_;
+    CloseDropdown();
+    if (IsRowDisabled(r.id, bridge.GetTelemetry())) {
+        return;
+    }
+    auto opts = bridge.GetOptions();
+    if (ReadRowValue(r.id, opts) != dd_sel_ || std::strcmp(r.id, "rebind") == 0) {
+        WriteRowValue(r.id, dd_sel_, opts, bridge);
+    }
+}
+
 void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
     if (!bridge.IsOpen()) {
         prev_pad_mask_ = 0;
         held_dir_ = 0;
+        CloseDropdown();
+        return;
+    }
+    if (bridge.RebindTarget() >= 0) {
+        // Capturing a button for the remap: the press belongs to the host, not to the menu.
+        std::vector<Common::OotMenu::KeyEvent> keys;
+        bridge.DrainKeyEvents(keys);
+        for (const auto& ev : keys) {
+            if (ev.down && (ev.key == Key::Back || ev.key == Key::Esc)) {
+                bridge.CancelRebind();
+            }
+        }
+        prev_pad_mask_ = bridge.GamepadNavMask();
+        held_dir_ = 0;
+        const auto ptr = bridge.ConsumePointer();
+        if ((ptr.pressed_mask & 2u) != 0) {
+            bridge.CancelRebind();
+        }
         return;
     }
     auto tab_rows = RowsForTab(cur_tab_);
@@ -1110,6 +1245,19 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
     };
 
     auto apply_nav = [&](int up_down, int left_right, bool confirm, bool back, int tab_delta) {
+        if (DropdownOpen()) {
+            if (tab_delta != 0) {
+                CloseDropdown();
+            } else {
+                MoveDropdown(up_down + left_right);
+                if (confirm) {
+                    ApplyDropdown(bridge);
+                } else if (back) {
+                    CloseDropdown();
+                }
+                return;
+            }
+        }
         if (tab_delta != 0) {
             switch_tab(tab_delta);
         }
@@ -1122,7 +1270,12 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
         }
         if (confirm && !tab_rows.empty()) {
             const int sel = tab_sel_[static_cast<std::size_t>(cur_tab_)];
-            AdjustRow(*tab_rows[static_cast<std::size_t>(sel)], 0, bridge);
+            const RowDef& row = *tab_rows[static_cast<std::size_t>(sel)];
+            if (row.kind == RowKind::Choice && !IsRowDisabled(row.id, bridge.GetTelemetry())) {
+                OpenDropdown(row, bridge.GetOptions());
+            } else {
+                AdjustRow(row, 0, bridge);
+            }
         }
         if (back) {
             if (!confirm_action_id_.empty()) {
@@ -1135,7 +1288,11 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
 
     std::vector<Common::OotMenu::KeyEvent> keys;
     bridge.DrainKeyEvents(keys);
+    bool kbd_confirm_or_back = false;
     for (const auto& ev : keys) {
+        if (ev.down && (ev.key == Key::Confirm || ev.key == Key::Back || ev.key == Key::Esc)) {
+            kbd_confirm_or_back = true;
+        }
         if (!ev.down) {
             continue;
         }
@@ -1153,16 +1310,32 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
             apply_nav(0, 1, false, false, 0);
             break;
         case Key::PageUp:
-            MoveSelection(-5, tab_rows);
+            if (DropdownOpen()) {
+                MoveDropdown(-5);
+            } else {
+                MoveSelection(-5, tab_rows);
+            }
             break;
         case Key::PageDown:
-            MoveSelection(5, tab_rows);
+            if (DropdownOpen()) {
+                MoveDropdown(5);
+            } else {
+                MoveSelection(5, tab_rows);
+            }
             break;
         case Key::Home:
+            if (DropdownOpen()) {
+                MoveDropdown(-1000);
+                break;
+            }
             tab_sel_[static_cast<std::size_t>(cur_tab_)] = 0;
             ClampSelection(tab_rows);
             break;
         case Key::End:
+            if (DropdownOpen()) {
+                MoveDropdown(1000);
+                break;
+            }
             tab_sel_[static_cast<std::size_t>(cur_tab_)] =
                 static_cast<int>(tab_rows.size()) - 1;
             MoveSelection(0, tab_rows);
@@ -1243,10 +1416,12 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
     if ((pressed & kBitR) != 0) {
         apply_nav(0, 0, false, false, 1);
     }
-    if ((pressed & kBitA) != 0) {
+    // A keyboard key mapped to Player 1 can arrive here as A/B in the same tick as the key event;
+    // handling both would open and apply a drop-down in one press.
+    if ((pressed & kBitA) != 0 && !kbd_confirm_or_back) {
         apply_nav(0, 0, true, false, 0);
     }
-    if ((pressed & (kBitB | kBitPlus)) != 0) {
+    if ((pressed & (kBitB | kBitPlus)) != 0 && !kbd_confirm_or_back) {
         apply_nav(0, 0, false, true, 0);
     }
 
@@ -1258,6 +1433,38 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
     const float mx = ptr.x - menu_ox_;
     const float my = ptr.y;
     const std::size_t tab_idx = static_cast<std::size_t>(cur_tab_);
+
+    if (DropdownOpen()) {
+        hover_tab_ = -1;
+        hover_apply_ = false;
+        if ((ptr.pressed_mask & 2u) != 0) {
+            CloseDropdown();
+            return;
+        }
+        if (ptr.wheel_y != 0.0f) {
+            MoveDropdown(ptr.wheel_y > 0.0f ? -1 : 1);
+        }
+        const bool pressed = (ptr.pressed_mask & 1u) != 0;
+        for (const auto& hb : hits_) {
+            if (hb.kind != HitKind::DropItem) {
+                continue;
+            }
+            if (mx >= hb.x0 && mx <= hb.x1 && my >= hb.y0 && my <= hb.y1) {
+                if (ptr.moved) {
+                    dd_sel_ = hb.index;
+                }
+                if (pressed) {
+                    dd_sel_ = hb.index;
+                    ApplyDropdown(bridge);
+                }
+                return;
+            }
+        }
+        if (pressed) {
+            CloseDropdown();
+        }
+        return;
+    }
 
     if (ptr.wheel_y != 0.0f && !bridge.IsCompact()) {
         const float max_scroll = std::max(0.0f, static_cast<float>(tab_rows.size()) - 8.0f);
@@ -1336,6 +1543,8 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
                 bridge.ToggleCompact();
             }
             return;
+        case HitKind::DropItem:
+            continue;
         case HitKind::Row:
         case HitKind::SliderTrack:
             if (hb.index >= 0 && hb.index < static_cast<int>(tab_rows.size())) {
@@ -1367,7 +1576,18 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
                             } else if (r.kind == RowKind::Action) {
                                 TriggerRowAction(r.id, bridge);
                             } else {
-                                AdjustRow(r, mx < vmid ? -1 : 1, bridge);
+                                // Arrow zones step the value; the centre opens the list.
+                                const float arrow_w = 38.0f * (hb.y1 - hb.y0) / 37.0f;
+                                if (mx < hb.vx0 + arrow_w) {
+                                    AdjustRow(r, -1, bridge);
+                                } else if (mx > hb.vx1 - arrow_w) {
+                                    AdjustRow(r, 1, bridge);
+                                } else if (r.kind == RowKind::Choice &&
+                                           !IsRowDisabled(r.id, bridge.GetTelemetry())) {
+                                    OpenDropdown(r, bridge.GetOptions());
+                                } else {
+                                    AdjustRow(r, mx < vmid ? -1 : 1, bridge);
+                                }
                             }
                         } else if (r.kind == RowKind::Action) {
                             TriggerRowAction(r.id, bridge);
@@ -1378,6 +1598,85 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
             return;
         }
     }
+}
+
+void OotMenuController::DrawDropdown(Ctx& c, ImVec2 a, ImVec2 b, bool prefer_up,
+                                     const TelemetrySnapshot& tel, const PcOptions& opts) {
+    if (dd_row_ == nullptr) {
+        return;
+    }
+    const RowDef& r = *dd_row_;
+    const float s = c.s;
+    const int count = r.hi - r.lo + 1;
+    const int vis = std::min(count, 8);
+    const float item_h = 32.0f * s;
+    const float pad = 4.0f * s;
+    const float px = 16.5f * s;
+    const int cur = ReadRowValue(r.id, opts);
+
+    std::vector<std::string> labels;
+    labels.reserve(static_cast<std::size_t>(count));
+    float widest = 0.0f;
+    for (int v = r.lo; v <= r.hi; ++v) {
+        labels.push_back(FormatRowValue(r, v, tel));
+        widest = std::max(widest, SizeOfRaw(c.f.strong, px, labels.back().c_str()).x);
+    }
+    const float w = std::clamp(widest + 56.0f * s, b.x - a.x, c.w - 2.0f * c.safe);
+    float x0 = std::min(a.x, c.w - c.safe - w);
+    x0 = std::max(x0, c.safe);
+    const float x1 = x0 + w;
+    const float h = static_cast<float>(vis) * item_h + 2.0f * pad;
+    const bool fits_below = b.y + 4.0f * s + h <= c.h - c.safe;
+    const bool fits_above = a.y - 4.0f * s - h >= c.safe;
+    const bool up = (prefer_up && fits_above) || (!fits_below && fits_above);
+    const float y0 = up ? (a.y - 4.0f * s - h) : (b.y + 4.0f * s);
+    const float y1 = y0 + h;
+
+    const int sel_idx = dd_sel_ - r.lo;
+    if (sel_idx < dd_scroll_) {
+        dd_scroll_ = sel_idx;
+    }
+    if (sel_idx >= dd_scroll_ + vis) {
+        dd_scroll_ = sel_idx - vis + 1;
+    }
+    dd_scroll_ = std::clamp(dd_scroll_, 0, std::max(0, count - vis));
+
+    Shadow(c, ImVec2(x0, y0), ImVec2(x1, y1), 14.0f * s, 0.55f, 4.0f * s);
+    c.d->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), kBox, 4.0f * s);
+    c.d->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), kBoxEdge, 4.0f * s, std::max(1.0f, 1.5f * s));
+
+    std::vector<HitBox> items;
+    for (int k = 0; k < vis; ++k) {
+        const int idx = dd_scroll_ + k;
+        const int v = r.lo + idx;
+        const ImVec2 ia(x0 + pad, y0 + pad + static_cast<float>(k) * item_h);
+        const ImVec2 ib(x1 - pad, ia.y + item_h);
+        const bool is_sel = (v == dd_sel_);
+        if (is_sel) {
+            GoldFill(c, ia, ib);
+        } else if ((k & 1) == 0) {
+            c.d->AddRectFilled(ia, ib, Rgba(255, 255, 255, 10));
+        }
+        if (v == cur) {
+            Diamond(c, ImVec2(ia.x + 14.0f * s, (ia.y + ib.y) * 0.5f), 4.5f * s,
+                    is_sel ? kGoldInk : kGoldHi);
+        }
+        const std::string shown = FitEllipsis(c, c.f.strong, px, ib.x - ia.x - 40.0f * s,
+                                              labels[static_cast<std::size_t>(idx)].c_str());
+        TextMidRaw(c, is_sel ? c.f.strong : c.f.body, px, ia.x + 30.0f * s, (ia.y + ib.y) * 0.5f,
+                   is_sel ? kGoldInk : kInk, shown.c_str());
+        items.push_back({ia.x, ia.y, ib.x, ib.y, HitKind::DropItem, v, 0, 0, 0, 0});
+    }
+    if (count > vis) {
+        const float sx = x1 - 6.0f * s;
+        const float span = y1 - y0 - 2.0f * pad;
+        const float t0 = y0 + pad + span * static_cast<float>(dd_scroll_) / static_cast<float>(count);
+        const float t1 =
+            y0 + pad + span * static_cast<float>(dd_scroll_ + vis) / static_cast<float>(count);
+        c.d->AddRectFilled(ImVec2(sx - 1.5f * s, t0), ImVec2(sx + 1.5f * s, t1), kAccent, s);
+    }
+    // Drop-down items must win hit tests over the rows below them.
+    hits_.insert(hits_.begin(), items.begin(), items.end());
 }
 
 void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
@@ -1453,6 +1752,12 @@ void OotMenuController::DrawCompactBar(Ctx& c, Bridge& bridge) {
                      r.kind == RowKind::Slider ? HitKind::SliderTrack : HitKind::Row, sel, va.x,
                      vb.x, tx0, tx1});
 
+    if (dd_row_ == &r) {
+        DrawDropdown(c, va, vb, true, tel, opts);
+    } else if (dd_row_ != nullptr) {
+        CloseDropdown();
+    }
+
     const char* compact_k =
         opts.compact_key == 1 ? "RCtrl" : (opts.compact_key == 2 ? "F4" : "RShift");
     const std::array<Prompt, 4> pr{{
@@ -1469,7 +1774,7 @@ void OotMenuController::DrawControlsBindings(Ctx& c, float x0, float x1, float t
                                              const Common::OotMenu::PadBindingSnapshot& snap) {
     const float s = c.s;
     const float pad_top = top + 12.0f * s;
-    const float row_h = 26.0f * s;
+    const float row_h = 22.0f * s;
     const float col1_x = x0 + 18.0f * s;
     const float col2_x = x0 + (x1 - x0) * 0.42f;
     const float col3_x = x0 + (x1 - x0) * 0.72f;
@@ -1480,11 +1785,38 @@ void OotMenuController::DrawControlsBindings(Ctx& c, float x0, float x1, float t
                                     : "");
     TextMidRaw(c, c.f.heading, 15.0f * s, col1_x, pad_top + 10.0f * s, kAccent, header.c_str());
 
-    const float list_top = pad_top + 26.0f * s;
+    const auto& bridge = Common::OotMenu::Bridge::Instance();
+    const int target = bridge.RebindTarget();
+    double msg_age = 1e9;
+    const std::string msg = bridge.RebindMessage(&msg_age);
+    float list_top = pad_top + 26.0f * s;
+    if (target >= 0 || msg_age < 5.0) {
+        const ImVec2 na(x0 + 10.0f * s, list_top);
+        const ImVec2 nb(x1 - 10.0f * s, list_top + 30.0f * s);
+        std::string line;
+        if (target >= 0) {
+            GoldFill(c, na, nb);
+            line = std::string(Tr("Aperte no controle o botão para")) + " " +
+                   Tr(kSwitchActionLabels[static_cast<std::size_t>(target)]) + "  ·  " +
+                   Tr("Esc ou botão direito cancela");
+        } else {
+            c.d->AddRectFilled(na, nb, kCellNameSel);
+            line = Tr(msg.c_str());
+        }
+        TextMidRaw(c, c.f.strong, 14.5f * s, na.x + 10.0f * s, (na.y + nb.y) * 0.5f,
+                   target >= 0 ? kGoldInk : kInkBright, line.c_str());
+        list_top += 34.0f * s;
+    }
     const int fit = std::max(1, static_cast<int>((bottom - list_top) / row_h));
-    const int n = std::min(fit, static_cast<int>(kSwitchActionLabels.size()));
-    for (int i = 0; i < n; ++i) {
-        const float ry = list_top + static_cast<float>(i) * row_h;
+    const int first = (target >= fit) ? (target - fit + 1) : 0;
+    const int n = std::min(fit, static_cast<int>(kSwitchActionLabels.size()) - first);
+    for (int k = 0; k < n; ++k) {
+        const int i = first + k;
+        const float ry = list_top + static_cast<float>(k) * row_h;
+        if (i == target) {
+            c.d->AddRect(ImVec2(x0 + 10.0f * s, ry), ImVec2(x1 - 10.0f * s, ry + row_h - 2.0f * s),
+                         kGoldHi, 0.0f, std::max(1.5f, 2.0f * s));
+        }
         if ((i & 1) == 0) {
             c.d->AddRectFilled(ImVec2(x0 + 10.0f * s, ry), ImVec2(x1 - 10.0f * s, ry + row_h - 2.0f * s),
                                Rgba(24, 18, 12, 170));
@@ -1571,7 +1903,7 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
 
     const float list_top = hh + 14.0f * s;
     const float list_bottom =
-        (cur_tab_ == Tab::Controls) ? (hh + 218.0f * s) : (PromptBarTop(c) - 10.0f * s);
+        (cur_tab_ == Tab::Controls) ? (hh + 280.0f * s) : (PromptBarTop(c) - 10.0f * s);
     const float pitch = 44.0f * s;
     const int fit = std::max(1, static_cast<int>((list_bottom - list_top) / pitch));
 
@@ -1602,6 +1934,9 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
     const float split = rx0 + (rx1 - rx0) * 0.50f;
     const float row_h = 37.0f * s;
 
+    bool dd_anchor_found = false;
+    ImVec2 dd_a{};
+    ImVec2 dd_b{};
     c.d->PushClipRect(ImVec2(cx0, hh + 2.0f * s), ImVec2(cx1, list_bottom));
     for (int i = 0; i < n; ++i) {
         const float ry0 = list_top + (static_cast<float>(i) - at) * pitch;
@@ -1677,6 +2012,11 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
             DrawHalvesCell(c, va, vb, lo_l, hi_l, val != 0, is_sel, disabled);
         } else {
             DrawChoiceCell(c, va, vb, val_str, is_sel, !disabled, !disabled, disabled);
+        }
+        if (dd_row_ == &r) {
+            dd_anchor_found = true;
+            dd_a = va;
+            dd_b = vb;
         }
         hits_.push_back({rx0, ry0, rx1, ry1,
                          r.kind == RowKind::Slider ? HitKind::SliderTrack : HitKind::Row, i, va.x,
@@ -1769,12 +2109,27 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
 
     const char* compact_k =
         opts.compact_key == 1 ? "RCtrl" : (opts.compact_key == 2 ? "F4" : "RShift");
+    if (DropdownOpen()) {
+        const std::array<Prompt, 3> dd_prompts{{
+            {Glyph::UpDown, "Escolher"},
+            {Glyph::Confirm, "Aplicar"},
+            {Glyph::Back, "Fechar"},
+        }};
+        PromptBar(c, dd_prompts.data(), static_cast<int>(dd_prompts.size()));
+        if (dd_anchor_found) {
+            DrawDropdown(c, dd_a, dd_b, false, tel, opts);
+        } else {
+            CloseDropdown();
+        }
+        return;
+    }
+    const bool sel_choice = sel_row.kind == RowKind::Choice;
     const std::array<Prompt, 6> prompt_list{{
         {Glyph::UpDown, "Escolher"},
         {sel_row.kind == RowKind::Action ? Glyph::Confirm : Glyph::LeftRight, "Alterar"},
         {Glyph::Tabs, "Abas"},
         {Glyph::Compact, "Compacto", compact_k},
-        {Glyph::Confirm, "Confirmar"},
+        {Glyph::Confirm, sel_choice ? "Lista" : "Confirmar"},
         {Glyph::Back, "Fechar"},
     }};
     PromptBar(c, prompt_list.data(), static_cast<int>(prompt_list.size()));
