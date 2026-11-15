@@ -3004,6 +3004,9 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
 
 template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
+    if (!Settings::RescaleAllowedFor(program_id)) {
+        return false;
+    }
     if (!image.info.rescaleable) {
         return false;
     }

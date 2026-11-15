@@ -64,6 +64,13 @@ namespace VideoCore {
 /// @brief Creates an emulated GPU instance using the given system context.
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
     Settings::UpdateRescalingInfo();
+    // On the home menu, only system titles are rescaled (see Settings::SetRescaleSystemOnly).
+    Settings::SetRescaleSystemOnly(Settings::values.resolution_info.active &&
+                                   Settings::GetCurrentProgramID() == 0x0100000000001000ULL);
+    if (!Settings::RescaleAllowedFor(~0ULL)) {
+        LOG_INFO(HW_GPU, "Home menu boot: resolution scale {}x for system titles only",
+                 Settings::values.resolution_info.up_factor);
+    }
     VideoCommon::Nx2Profile::ReadSwitch();
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();

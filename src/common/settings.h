@@ -1195,6 +1195,12 @@ u64 GetCurrentProgramID();
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
+/// Booted on the home menu (qlaunch): the resolution scale is kept for system titles, and the
+/// games it starts render at 1x (the Ocarina upscaler needs unscaled images). Set once, before
+/// the GPU starts.
+void SetRescaleSystemOnly(bool system_only);
+/// Whether images drawn by a GPU channel of this program may be rescaled.
+bool RescaleAllowedFor(u64 program_id);
 
 /// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
 /// that requires it.

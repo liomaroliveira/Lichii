@@ -291,6 +291,17 @@ u64 GetCurrentProgramID() {
     return current_program_id;
 }
 
+static bool rescale_system_only = false;
+
+void SetRescaleSystemOnly(bool system_only) {
+    rescale_system_only = system_only;
+}
+
+bool RescaleAllowedFor(u64 program_id) {
+    // System titles sit below 0100000000010000; a channel without a session reports 0.
+    return !rescale_system_only || program_id < 0x0100000000010000ULL;
+}
+
 static bool current_program_is_switch2 = false;
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
