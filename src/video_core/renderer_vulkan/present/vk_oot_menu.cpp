@@ -477,6 +477,9 @@ void OotMenuController::CaptureBaselineOnce(const PcOptions& opts) {
     baseline_.captured = true;
     baseline_.ocarina_fsr_render = static_cast<int>(Settings::values.ocarina_fsr_render.GetValue());
     baseline_.ocarina_fsr = Settings::values.ocarina_fsr.GetValue();
+    baseline_.max_anisotropy = static_cast<int>(Settings::values.max_anisotropy.GetValue());
+    baseline_.vram_usage_mode = static_cast<int>(Settings::values.vram_usage_mode.GetValue());
+    baseline_.async_shaders = Settings::values.use_asynchronous_shaders.GetValue();
     baseline_.resolution_setup = static_cast<int>(Settings::values.resolution_setup.GetValue());
     baseline_.use_docked_mode = static_cast<int>(Settings::values.use_docked_mode.GetValue());
     baseline_.frame_rate_limit = static_cast<int>(Settings::values.frame_rate_limit.GetValue());
@@ -496,6 +499,17 @@ bool OotMenuController::IsRowPendingRestart(const char* id, const PcOptions& opt
     if (std::strcmp(id, "fsr_render") == 0) {
         return static_cast<int>(Settings::values.ocarina_fsr_render.GetValue()) !=
                baseline_.ocarina_fsr_render;
+    }
+    if (std::strcmp(id, "aniso") == 0) {
+        return static_cast<int>(Settings::values.max_anisotropy.GetValue()) !=
+               baseline_.max_anisotropy;
+    }
+    if (std::strcmp(id, "vram") == 0) {
+        return static_cast<int>(Settings::values.vram_usage_mode.GetValue()) !=
+               baseline_.vram_usage_mode;
+    }
+    if (std::strcmp(id, "async_shaders") == 0) {
+        return Settings::values.use_asynchronous_shaders.GetValue() != baseline_.async_shaders;
     }
     if (std::strcmp(id, "upscaler") == 0 || std::strcmp(id, "preset") == 0) {
         // Native <-> FSR changes the render scale patched into the game at boot (E47.T2)
@@ -818,6 +832,10 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
         dirty_settings = true;
     } else if (std::strcmp(id, "frame_gen") == 0) {
         val = std::clamp(val, 0, kFrameGenMax);
+        if (kFrameGenMax == 2 && val == 2 && Settings::values.frame_gen.GetValue() &&
+            Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::NvidiaDlssG) {
+            return; // already running the optical flow fallback; keep the user's DLSS-G choice
+        }
         ApplySettingValue(Settings::values.frame_gen, val > 0);
         if (val == 1) {
             ApplySettingValue(Settings::values.frame_gen_type, Settings::FrameGenType::Lsfg);
@@ -1467,7 +1485,8 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
                   held_dir_ == 3 ? -1 : (held_dir_ == 4 ? 1 : 0), false, false, 0);
     }
     if ((pressed & kBitStickR) != 0 && (mask & kBitStickL) == 0 && !DropdownOpen()) {
-        bridge.ToggleCompact(); // E47.T4: R3 switches full menu <-> compact bar
+        // E47.T4: R3 switches full menu <-> compact bar (ToggleCompact closes from compact)
+        bridge.IsCompact() ? bridge.ToggleMenu() : bridge.ToggleCompact();
     }
     if ((pressed & kBitL) != 0) {
         apply_nav(0, 0, false, false, -1);
@@ -1602,7 +1621,7 @@ void OotMenuController::ProcessPointer(Bridge& bridge, const std::vector<const R
         case HitKind::BackToCompact:
             hover_compact_ = true;
             if (l_pressed) {
-                bridge.ToggleCompact();
+                bridge.IsCompact() ? bridge.ToggleMenu() : bridge.ToggleCompact();
             }
             return;
         case HitKind::DropItem:

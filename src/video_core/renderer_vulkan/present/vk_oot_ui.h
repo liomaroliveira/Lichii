@@ -145,14 +145,20 @@ inline float Para(Ctx& c, ImFont* font, float px, ImVec2 p, ImU32 col, const cha
 // capitals and lowercase sits in the middle of its box whatever the font's ascent/descent are.
 inline float MidTop(ImFont* font, float px, float y) {
     ImFontBaked* baked = font->GetFontBaked(px);
+    // Copy the values: the second lookup may bake 'x' and reallocate baked->Glyphs
     const ImFontGlyph* cap = baked->FindGlyphNoFallback(static_cast<ImWchar>('H'));
+    if (cap == nullptr || cap->Y1 <= cap->Y0 || baked->Size <= 0.0f) {
+        return y - baked->Ascent + 0.35f * px;
+    }
+    const float cap_y0 = cap->Y0;
+    const float cap_y1 = cap->Y1;
     const ImFontGlyph* low = baked->FindGlyphNoFallback(static_cast<ImWchar>('x'));
-    if (cap == nullptr || low == nullptr || cap->Y1 <= cap->Y0 || baked->Size <= 0.0f) {
+    if (low == nullptr) {
         return y - baked->Ascent + 0.35f * px;
     }
     const float scale = px / baked->Size;
-    const float top = 0.5f * (cap->Y0 + low->Y0) * scale;
-    const float base = cap->Y1 * scale;
+    const float top = 0.5f * (cap_y0 + low->Y0) * scale;
+    const float base = cap_y1 * scale;
     return y - 0.5f * (top + base);
 }
 

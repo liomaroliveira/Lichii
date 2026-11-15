@@ -77,6 +77,9 @@ public:
         bool captured{false};
         int ocarina_fsr_render{};
         bool ocarina_fsr{};
+        int max_anisotropy{};
+        int vram_usage_mode{};
+        bool async_shaders{};
         int resolution_setup{};
         int use_docked_mode{};
         int frame_rate_limit{};
