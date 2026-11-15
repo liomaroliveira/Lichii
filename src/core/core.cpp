@@ -649,6 +649,15 @@ struct System::Impl {
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
+        // The general channel event is made on first use and closes kernel objects when it goes:
+        // left for ~Impl, it ran at exit() on a kernel already shut down (SIGSEGV in
+        // KAutoObject::Close, E47). Drop it here while the kernel lives; the next game remakes it.
+        {
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel.clear();
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         kernel.Shutdown();
         stop_event = {};
         Network::RestartSocketOperations();
