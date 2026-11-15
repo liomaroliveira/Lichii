@@ -2506,6 +2506,19 @@ void OotMenuController::DriveSelfTest(Ctx& c, Bridge& bridge) {
         selftest_values_done_ = true;
         RunValueSelfTest(bridge);
     }
+    // E47.T9: switch the upscaler live once the scene runs (the value test runs before the game
+    // loads); the rasterizer must log "rebuilding it" and then evaluate the new upscaler.
+    if (selftest_live_step_ == 0 && t >= 95.0f) {
+        selftest_live_step_ = 1;
+        LOG_INFO(Render_Vulkan, "OoT menu selftest: live upscaler -> FSR 3.1");
+        auto opts = bridge.GetOptions();
+        WriteRowValue("upscaler", 1, opts, bridge);
+    } else if (selftest_live_step_ == 1 && t >= 105.0f) {
+        selftest_live_step_ = 2;
+        LOG_INFO(Render_Vulkan, "OoT menu selftest: live upscaler -> FSR 4.1");
+        auto opts = bridge.GetOptions();
+        WriteRowValue("upscaler", 2, opts, bridge);
+    }
     static constexpr std::array<const char*, 7> kPhases{
         "Gráficos", "Desempenho", "Controles", "Áudio & UI", "Lista aberta", "Barra compacta",
         "HUD Dev"};

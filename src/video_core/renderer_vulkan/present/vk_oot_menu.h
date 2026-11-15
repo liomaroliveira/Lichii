@@ -173,6 +173,7 @@ private:
     bool selftest_values_done_{false};
     int selftest_phase_{-1};
     int selftest_saved_hud_{-1};
+    int selftest_live_step_{0};
 };
 
 } // namespace Vulkan::OotUi
