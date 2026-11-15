@@ -163,7 +163,7 @@ struct UpscalePreset {
     int render_idx;
 };
 constexpr std::array<UpscalePreset, 7> kPresets{{
-    {"Atalho: FSR 4.1 > 1440p no passo do jogo", 2, 3, 1},
+    {"Atalho: FSR 4.1 + nitidez do jogo", 2, 3, 1},
     {"FSR 4.1 Full HD", 2, 0, 1},
     {"FSR 3.1 Full HD", 1, 0, 1},
     {"FSR 4.1 1440p", 2, 1, 2},
@@ -398,7 +398,7 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Reconstrução da imagem do jogo: Nativo, AMD FSR 3.1 ou AMD FSR 4.1 (INT8 nas Radeon RX 6000/7000). Entre FSR 3.1 e 4.1 a troca é ao vivo; ligar ou desligar o FSR (Nativo) vale depois de reiniciar.",
          false, 0, 2, 1},
         {T::Graphics, RK::Choice, "fsr_output", "Resolução Saída FSR",
-         "Resolução que o FSR 3.1/4.1 reconstrói. \"1440p no passo do jogo\": com o jogo em 1080p, o FSR reconstrói até 1440p no lugar do passo de escala do próprio jogo, e os passos seguintes do jogo (nitidez e HUD) rodam normalmente; é o mais nítido. Full HD, 1440p e 4K reconstroem e depois esticam a imagem para 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
+         "Resolução que o FSR 3.1/4.1 reconstrói. \"1440p + nitidez do jogo\" (padrão): com o jogo em 1080p, o FSR 4.1 reconstrói até 1440p no lugar do passo de escala do próprio jogo, e a nitidez padrão do jogo roda por cima; é o mais nítido. Full HD, 1440p e 4K reconstroem e depois esticam a imagem para 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
          false, 0, 3, 1},
         {T::Graphics, RK::Choice, "fsr_render", "Resolução Interna FSR",
          "Resolução interna renderizada pelo jogo antes do upscaler FSR. 1080p ou 720p aliviam bastante GPU/Templo do Fogo.",
@@ -1155,7 +1155,7 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
     }
     if (std::strcmp(id, "fsr_output") == 0) {
         static constexpr std::array<const char*, 4> kLabs{"1080p (Full HD)", "1440p (QHD)",
-                                                         "4K (UHD)", "1440p no passo do jogo"};
+                                                         "4K (UHD)", "1440p + nitidez do jogo"};
         return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
     }
     if (std::strcmp(id, "fsr_render") == 0) {
