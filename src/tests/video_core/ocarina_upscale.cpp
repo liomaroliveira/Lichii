@@ -63,6 +63,8 @@ TEST_CASE("OoT FSR output extent supports 4K, 1440p, and 1080p with render floor
     CHECK(eq(ResolveOcarinaFsrOutput(Output4K, 2560, 1440), 3840, 2160));
     CHECK(eq(ResolveOcarinaFsrOutput(Output1440p, 1920, 1080), 2560, 1440));
     CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 1920, 1080), 1920, 1080));
+    // OutputGame reconstructs into the game's own 1440p target (E47).
+    CHECK(eq(ResolveOcarinaFsrOutput(OutputGame, 1920, 1080), 2560, 1440));
     CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 1280, 720), 1920, 1080));
     // Never shrink output below the active render extent.
     CHECK(eq(ResolveOcarinaFsrOutput(Output1080p, 2560, 1440), 2560, 1440));

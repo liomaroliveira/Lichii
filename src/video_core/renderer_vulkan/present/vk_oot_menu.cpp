@@ -57,10 +57,11 @@ constexpr int kFrameGenMax = 3;
 #else
 constexpr int kFrameGenMax = 2;
 #endif
-constexpr std::array<Settings::OcarinaFsrOutput, 3> kFsrOutputChoices{
+constexpr std::array<Settings::OcarinaFsrOutput, 4> kFsrOutputChoices{
     Settings::OcarinaFsrOutput::Output1080p,
     Settings::OcarinaFsrOutput::Output1440p,
     Settings::OcarinaFsrOutput::Output4K,
+    Settings::OcarinaFsrOutput::OutputGame,
 };
 constexpr std::array<Settings::OcarinaFsrRender, 3> kFsrRenderChoices{
     Settings::OcarinaFsrRender::Render720p,
@@ -76,8 +77,9 @@ struct UpscalePreset {
     int output_idx;
     int render_idx;
 };
-constexpr std::array<UpscalePreset, 6> kPresets{{
-    {"Atalho: FSR 4.1 Full HD", 2, 0, 1},
+constexpr std::array<UpscalePreset, 7> kPresets{{
+    {"Atalho: FSR 4.1 > 1440p no passo do jogo", 2, 3, 1},
+    {"FSR 4.1 Full HD", 2, 0, 1},
     {"FSR 3.1 Full HD", 1, 0, 1},
     {"FSR 4.1 1440p", 2, 1, 2},
     {"FSR 4.1 saída 4K", 2, 2, 1},
@@ -311,8 +313,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Reconstrução da imagem do jogo: Nativo, AMD FSR 3.1 ou AMD FSR 4.1 (INT8 nas Radeon RX 6000/7000). Entre FSR 3.1 e 4.1 a troca é ao vivo; ligar ou desligar o FSR (Nativo) vale depois de reiniciar.",
          false, 0, 2, 1},
         {T::Graphics, RK::Choice, "fsr_output", "Resolução Saída FSR",
-         "Resolução que o FSR 3.1/4.1 reconstrói: Full HD (1080p), 1440p ou 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
-         false, 0, 2, 1},
+         "Resolução que o FSR 3.1/4.1 reconstrói. \"1440p no passo do jogo\": com o jogo em 1080p, o FSR reconstrói até 1440p no lugar do passo de escala do próprio jogo, e os passos seguintes do jogo (nitidez e HUD) rodam normalmente; é o mais nítido. Full HD, 1440p e 4K reconstroem e depois esticam a imagem para 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
+         false, 0, 3, 1},
         {T::Graphics, RK::Choice, "fsr_render", "Resolução Interna FSR",
          "Resolução interna renderizada pelo jogo antes do upscaler FSR. 1080p ou 720p aliviam bastante GPU/Templo do Fogo.",
          true, 0, 2, 1},
@@ -792,7 +794,7 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
         ApplySettingValue(Settings::values.amd_fsr4, val == 2);
         dirty_settings = true;
     } else if (std::strcmp(id, "fsr_output") == 0) {
-        val = std::clamp(val, 0, 2);
+        val = std::clamp(val, 0, 3);
         ApplySettingValue(Settings::values.ocarina_fsr_output,
                           kFsrOutputChoices[static_cast<std::size_t>(val)]);
         dirty_settings = true;
@@ -1044,9 +1046,9 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
         return Tr("FSR 3.1");
     }
     if (std::strcmp(id, "fsr_output") == 0) {
-        static constexpr std::array<const char*, 3> kLabs{"1080p (Full HD)", "1440p (QHD)",
-                                                         "4K (UHD)"};
-        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 2))]);
+        static constexpr std::array<const char*, 4> kLabs{"1080p (Full HD)", "1440p (QHD)",
+                                                         "4K (UHD)", "1440p no passo do jogo"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
     }
     if (std::strcmp(id, "fsr_render") == 0) {
         static constexpr std::array<const char*, 3> kLabs{"720p (Leve)", "1080p (Equilibrado)",

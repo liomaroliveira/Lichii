@@ -61,6 +61,7 @@ constexpr OcarinaExtent ResolveOcarinaFsrOutput(Settings::OcarinaFsrOutput outpu
     OcarinaExtent target{3840, 2160};
     switch (output) {
     case Settings::OcarinaFsrOutput::Output1440p:
+    case Settings::OcarinaFsrOutput::OutputGame:
         target = {2560, 1440};
         break;
     case Settings::OcarinaFsrOutput::Output1080p:

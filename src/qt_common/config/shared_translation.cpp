@@ -576,7 +576,9 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
     translations->insert({Settings::EnumMetadata<Settings::OcarinaFsrOutput>::Index(),
                           {PAIR(OcarinaFsrOutput, Output4K, tr("3840x2160")),
                            PAIR(OcarinaFsrOutput, Output1440p, tr("2560x1440, stretched to 4K")),
-                           PAIR(OcarinaFsrOutput, Output1080p, tr("1920x1080, stretched to 4K"))}});
+                           PAIR(OcarinaFsrOutput, Output1080p, tr("1920x1080, stretched to 4K")),
+                           PAIR(OcarinaFsrOutput, OutputGame,
+                                tr("2560x1440 in the game's own pass (1080p render)"))}});
     translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
                           {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (game resolution)")),
                            PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),

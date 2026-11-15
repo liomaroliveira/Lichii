@@ -3876,9 +3876,14 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool native_size = upscale_hash == ComputePipeline::OcarinaFullSizeShader;
     // At the DLSS Performance render scale (1920x1080) the game upscales to 2560x1440 with its
     // 3/4 pass instead (QuincyForbes' f7d0938b5b). The scale is the one the game started with,
-    // whatever quality is chosen since.
+    // whatever quality is chosen since. OutputGame (E47) leaves that pass to the game's own
+    // chain instead: FSR reconstructs 1080p -> 1440p straight into the game's 1440p target and
+    // the game's later passes run as usual, with no linear stretch to the 4K composite.
+    const bool game_pass_output =
+        Settings::values.ocarina_fsr_output.GetValue() == Settings::OcarinaFsrOutput::OutputGame;
     const bool three_quarter_1440p = upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
-                                     oot_performance_scale && target.size.width == 2560 &&
+                                     oot_performance_scale && !game_pass_output &&
+                                     target.size.width == 2560 &&
                                      target.size.height == 1440;
     const bool pass_1440p = upscale_hash == ComputePipeline::Ocarina1440pShader ||
                             upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
