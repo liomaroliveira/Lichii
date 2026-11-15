@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <string_view>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
@@ -100,6 +107,81 @@ VkBool32 DebugUtilCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 }
 
 } // Anonymous namespace
+
+namespace {
+
+u64 AddressReportTarget() {
+    static const u64 target = [] {
+        const char* value = std::getenv("EDEN_NX2_ADDR_REPORT");
+        const char* comma = value ? std::strchr(value, ',') : nullptr;
+        return comma ? std::strtoull(comma + 1, nullptr, 16) : 0x800100200000ULL;
+    }();
+    return target;
+}
+
+VkBool32 AddressBindingCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+                                VkDebugUtilsMessageTypeFlagsEXT,
+                                const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    const auto* report = static_cast<const VkBaseInStructure*>(data->pNext);
+    while (report && report->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) {
+        report = report->pNext;
+    }
+    if (!report) {
+        return VK_FALSE;
+    }
+    const auto& binding = *reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(report);
+    constexpr u64 mask = (1ULL << 48) - 1;
+    const u64 base = binding.baseAddress & mask;
+    const u64 target = AddressReportTarget() & mask;
+    if (target < base || target >= base + binding.size) {
+        return VK_FALSE;
+    }
+    const auto& object = data->objectCount > 0 ? data->pObjects[0] : VkDebugUtilsObjectNameInfoEXT{};
+    std::string stack;
+#if defined(__linux__)
+    void* frames[24];
+    const int count = backtrace(frames, 24);
+    for (int i = 1; i < count; ++i) {
+        Dl_info info{};
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            const char* name = std::strrchr(info.dli_fname, '/');
+            stack += fmt::format(" {}+{:#x}", name ? name + 1 : info.dli_fname,
+                                 reinterpret_cast<uintptr_t>(frames[i]) -
+                                     reinterpret_cast<uintptr_t>(info.dli_fbase));
+        }
+    }
+#endif
+    LOG_WARNING(Render_Vulkan,
+                "Address report: {} [{:#x}, {:#x}) size {:#x} object type {} handle {:#x} "
+                "name '{}' flags {:#x}; stack:{}",
+                binding.bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "BIND" : "UNBIND",
+                base, base + binding.size, binding.size, static_cast<int>(object.objectType),
+                object.objectHandle, object.pObjectName ? object.pObjectName : "",
+                static_cast<u32>(binding.flags), stack);
+    return VK_FALSE;
+}
+
+} // Anonymous namespace
+
+bool AddressReportEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_ADDR_REPORT") != nullptr;
+    return enabled;
+}
+
+vk::DebugUtilsMessenger CreateAddressBindingCallback(const vk::Instance& instance) {
+    LOG_WARNING(Render_Vulkan, "Address report on for {:#x}", AddressReportTarget());
+    return instance.CreateDebugUtilsMessenger(VkDebugUtilsMessengerCreateInfoEXT{
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
+        .pfnUserCallback = AddressBindingCallback,
+        .pUserData = nullptr,
+    });
+}
 
 vk::DebugUtilsMessenger CreateDebugUtilsCallback(const vk::Instance& instance) {
     return instance.CreateDebugUtilsMessenger(VkDebugUtilsMessengerCreateInfoEXT{

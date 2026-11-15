@@ -1569,8 +1569,22 @@ bool Device::GetSuitability(bool requires_swapchain) {
         SetNext(next, device_fault_features);
     }
 
+    // VK_EXT_device_address_binding_report, only for the EDEN_NX2_ADDR_REPORT diagnostic.
+    const bool has_address_report = std::getenv("EDEN_NX2_ADDR_REPORT") != nullptr &&
+        supported_extensions.contains(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (has_address_report) {
+        address_binding_report_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT;
+        SetNext(next, address_binding_report_features);
+    }
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
+
+    if (has_address_report && address_binding_report_features.reportAddressBinding) {
+        loaded_extensions.insert(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        LOG_WARNING(Render_Vulkan, "VK_EXT_device_address_binding_report enabled (diagnostic)");
+    }
 
     if (has_device_fault_extension) {
         loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <cstdlib>
 #include <future>
 #include <optional>
 #include <span>
@@ -97,7 +98,8 @@ namespace {
     if (AreExtensionsSupported(dld, properties, std::array{VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME}))
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 #endif
-    if (enable_validation && AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
+    if ((enable_validation || std::getenv("EDEN_NX2_ADDR_REPORT") != nullptr) &&
+        AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #ifdef EGLANTINE_STREAMLINE
     // What NVIDIA's DLSS asks for through Streamline, where available. Static: the returned

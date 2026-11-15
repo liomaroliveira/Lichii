@@ -1404,6 +1404,7 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
