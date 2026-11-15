@@ -4388,8 +4388,11 @@ template <class P>
 void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
     ASSERT(False(image.flags & ImageFlagBits::Tracked));
     image.flags |= ImageFlagBits::Tracked;
+    // Marked before the pages trap: a new image is tracked (and uploaded) before RegisterImage
+    // marks it, and RasterizerVulkan::OnCPUWrite skips the texture cache on unmarked pages.
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
+            page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, 1);
         }
         return;
@@ -4402,12 +4405,14 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
             const auto& map = slot_map_views[map_view_id];
             const DAddr cpu_addr = map.cpu_addr;
             const std::size_t size = map.size;
+            page_filter.Mark(cpu_addr, size);
             device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
         }
         return;
     }
     ForEachSparseSegment(image,
                          [this]([[maybe_unused]] GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+                             page_filter.Mark(cpu_addr, size);
                              device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
                          });
 }
