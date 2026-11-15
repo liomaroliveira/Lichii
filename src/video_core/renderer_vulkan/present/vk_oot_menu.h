@@ -130,6 +130,12 @@ private:
                               const Common::OotMenu::PadBindingSnapshot& snap);
     void DrawFpsHud(Ctx& c, const Common::OotMenu::Bridge& bridge, bool menu_open, bool compact);
 
+    // EDEN_NX2_OOT_MENU_SELFTEST=1 (T6d): writes every value of every row, reads it back, logs
+    // PASS/FAIL and restores it; then cycles the tabs, a drop-down, the compact bar and the HUD
+    // (8 s each, labelled) for the harness's screenshots.
+    void RunValueSelfTest(Common::OotMenu::Bridge& bridge);
+    void DriveSelfTest(Ctx& c, Common::OotMenu::Bridge& bridge);
+
     RestartBaseline baseline_{};
     Tab cur_tab_{Tab::Graphics};
     std::array<int, static_cast<int>(Tab::Count)> tab_sel_{1, 1, 1, 1};
@@ -158,6 +164,10 @@ private:
     std::chrono::steady_clock::time_point last_tick_{};
 
     std::vector<float> graph_frames_;
+    std::chrono::steady_clock::time_point selftest_start_{};
+    bool selftest_values_done_{false};
+    int selftest_phase_{-1};
+    int selftest_saved_hud_{-1};
 };
 
 } // namespace Vulkan::OotUi

@@ -7,8 +7,10 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 
@@ -2139,9 +2141,12 @@ void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open,
     // Levels after Longshot's counter (gpu/vk/fps_stats.h): Off, FPS, Frame time, Graph,
     // Detailed (graph + where the frame goes) and Dev (the renderer's own numbers).
     const auto opts = bridge.GetOptions();
-    const int level = std::clamp(opts.fps_hud, 0, 5);
+    int level = std::clamp(opts.fps_hud, 0, 5);
     if (level <= 0) {
         return;
+    }
+    if (menu_open && !compact) {
+        level = std::min(level, 2); // the panel would cover the help card, which has the numbers
     }
     const auto tel = bridge.GetTelemetry();
     const float s = c.s;
@@ -2328,6 +2333,115 @@ void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open,
     }
 }
 
+void OotMenuController::RunValueSelfTest(Bridge& bridge) {
+    int pass = 0;
+    int fail = 0;
+    for (const auto& r : AllRows()) {
+        if (r.kind == RowKind::Heading || r.kind == RowKind::Action ||
+            std::strcmp(r.id, "rebind") == 0 || std::strcmp(r.id, "gamemode") == 0) {
+            continue; // no value, or a side effect outside the menu (controller capture, gamemode)
+        }
+        auto opts = bridge.GetOptions();
+        const int original = ReadRowValue(r.id, opts);
+        std::vector<int> values;
+        if (r.kind == RowKind::Slider) {
+            const int mid = r.lo + ((r.hi - r.lo) / 2 / r.step) * r.step;
+            values = {r.lo, mid, r.hi};
+        } else {
+            for (int v = r.lo; v <= r.hi; ++v) {
+                values.push_back(v);
+            }
+        }
+        std::string bad;
+        for (const int v : values) {
+            opts = bridge.GetOptions();
+            WriteRowValue(r.id, v, opts, bridge);
+            const int got = ReadRowValue(r.id, bridge.GetOptions());
+            if (got == v) {
+                ++pass;
+            } else {
+                ++fail;
+                bad += " " + std::to_string(v) + "->" + std::to_string(got);
+            }
+        }
+        opts = bridge.GetOptions();
+        WriteRowValue(r.id, original, opts, bridge);
+        const int restored = ReadRowValue(r.id, bridge.GetOptions());
+        if (restored != original) {
+            ++fail;
+            bad += " restore " + std::to_string(original) + "->" + std::to_string(restored);
+        }
+        if (bad.empty()) {
+            LOG_INFO(Render_Vulkan, "OoT menu selftest: PASS {} ({} values)", r.id, values.size());
+        } else {
+            LOG_WARNING(Render_Vulkan, "OoT menu selftest: FAIL {}:{}", r.id, bad);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "OoT menu selftest: values done, {} pass, {} fail", pass, fail);
+}
+
+void OotMenuController::DriveSelfTest(Ctx& c, Bridge& bridge) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_OOT_MENU_SELFTEST");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (selftest_start_ == std::chrono::steady_clock::time_point{}) {
+        selftest_start_ = now;
+    }
+    const float t = std::chrono::duration<float>(now - selftest_start_).count();
+    if (!selftest_values_done_ && t >= 3.0f) {
+        selftest_values_done_ = true;
+        RunValueSelfTest(bridge);
+    }
+    static constexpr std::array<const char*, 7> kPhases{
+        "Gráficos", "Desempenho", "Controles", "Áudio & UI", "Lista aberta", "Barra compacta",
+        "HUD Dev"};
+    const int phase = t < 5.0f ? -1 : (static_cast<int>((t - 5.0f) / 8.0f) % 7);
+    if (phase != selftest_phase_) {
+        auto opts = bridge.GetOptions();
+        if (selftest_phase_ == 6 && selftest_saved_hud_ >= 0) {
+            opts.fps_hud = selftest_saved_hud_;
+            bridge.SetOptions(opts);
+        }
+        CloseDropdown();
+        selftest_phase_ = phase;
+        if (phase >= 0 && phase <= 3) {
+            bridge.SetOpen(true, false);
+            cur_tab_ = static_cast<Tab>(phase);
+        } else if (phase == 4) {
+            bridge.SetOpen(true, false);
+            cur_tab_ = Tab::Graphics;
+            const auto rows = RowsForTab(cur_tab_);
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+                if (std::strcmp(rows[static_cast<std::size_t>(i)]->id, "preset") == 0) {
+                    tab_sel_[0] = i;
+                    OpenDropdown(*rows[static_cast<std::size_t>(i)], opts);
+                }
+            }
+        } else if (phase == 5) {
+            bridge.SetOpen(true, true);
+        } else if (phase == 6) {
+            bridge.SetOpen(false);
+            selftest_saved_hud_ = opts.fps_hud;
+            opts.fps_hud = static_cast<int>(Common::OotMenu::FpsHudLevel::Dev);
+            opts.fps_corner = 0;
+            bridge.SetOptions(opts);
+        }
+        if (phase >= 0) {
+            LOG_INFO(Render_Vulkan, "OoT menu selftest: showing {} at {:.1f} s", kPhases[phase], t);
+        }
+    }
+    if (phase >= 0) {
+        char label[64];
+        std::snprintf(label, sizeof(label), "SELFTEST %d/7: %s", phase + 1, kPhases[phase]);
+        OutlinedText(c, c.f.strong, 16.0f * c.s, c.safe, c.h - c.safe - 20.0f * c.s, kGoldHi, label);
+    }
+}
+
 void OotMenuController::TickAndDraw(Ctx& c) {
     auto& bridge = Bridge::Instance();
     if (!bridge.IsOcarina()) {
@@ -2382,6 +2496,7 @@ void OotMenuController::TickAndDraw(Ctx& c) {
     }
 
     DrawFpsHud(c, bridge, open, compact);
+    DriveSelfTest(c, bridge);
 }
 
 } // namespace Vulkan::OotUi
