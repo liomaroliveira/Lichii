@@ -193,6 +193,12 @@ public:
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
+    /// GetSubmappedRange and GetSubmappedDeviceRange by walking the page tables.
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+    GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+    GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
     }
@@ -226,10 +232,20 @@ private:
         struct Run {
             GPUVAddr begin;
             GPUVAddr end;
+            DAddr device_addr; ///< Where begin is mapped; the run is contiguous there too.
         };
         std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
+
+    /// The segments GetSubmappedRangeImpl walks to, from the snapshot's runs: each run is one
+    /// segment, clipped to the range. Returns false for a range outside the address space.
+    template <bool is_gpu_address>
+    bool SubmappedRangeFromRuns(
+        GPUVAddr gpu_addr, std::size_t size,
+        boost::container::small_vector<
+            std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
+            result) const;
 
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
