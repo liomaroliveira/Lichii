@@ -501,6 +501,9 @@ private:
     void UpdateInputDrivers();
     /// EDEN_NX2_AUTOMAP=1: maps a newly connected controller to player 1 when its own is gone.
     void Nx2AutoMapController();
+    /// OoT in-game menu (E45): Layout preset on player 1's pad, by position (0 Nintendo, 1 Xbox / PC, 2 swapped A/B).
+    void OotApplyPadLayout(int layout);
+    void RegisterOotMenuCallbacks();
     void HideMouseCursor();
     void ShowMouseCursor();
     void OpenURL(const QUrl& url);

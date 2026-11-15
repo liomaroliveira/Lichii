@@ -11,6 +11,7 @@
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/oot_menu_bridge.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -486,6 +487,27 @@ void NPad::RequestPadStateUpdate(Kernel::KernelCore& kernel, u64 aruid, Core::HI
         pad_entry.npad_buttons.zr.Assign(button_state.r);
         pad_entry.npad_buttons.l.Assign(button_state.zl);
         pad_entry.npad_buttons.r.Assign(button_state.zr);
+    }
+
+    // OoT in-game menu (E45): player 1's buttons navigate it, Plus+Minus or L3+R3 open and close
+    // it, and the game sees a pad at rest while it is open.
+    if (npad_id == Core::HID::NpadIdType::Player1 || npad_id == Core::HID::NpadIdType::Handheld) {
+        auto& oot_menu = Common::OotMenu::Bridge::Instance();
+        if (oot_menu.IsOcarina()) {
+            const u64 raw = static_cast<u64>(button_state.raw);
+            if (oot_menu.ConsumeGamepadToggleCombo(raw)) {
+                oot_menu.ToggleMenu();
+            }
+            oot_menu.UpdateGamepadNav(raw, true, false);
+            if (oot_menu.ShouldSuppressGameInput()) {
+                pad_entry.npad_buttons.raw = Core::HID::NpadButton::None;
+                pad_entry.l_stick = {};
+                pad_entry.r_stick = {};
+                trigger_entry.l_analog = 0;
+                trigger_entry.r_analog = 0;
+                return;
+            }
+        }
     }
 
     if (pad_entry.npad_buttons.raw != Core::HID::NpadButton::None) {

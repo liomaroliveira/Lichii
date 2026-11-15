@@ -125,6 +125,15 @@ Bridge::Bridge() {
 
 void Bridge::SetProgramId(u64 program_id) {
     program_id_.store(program_id, std::memory_order_release);
+    // EDEN_NX2_OOT_MENU_OPEN=full|compact: open the menu when the game starts (screenshots, tests)
+    if (program_id == kOcarinaProgramId) {
+        if (const char* open = std::getenv("EDEN_NX2_OOT_MENU_OPEN"); open != nullptr) {
+            const std::string_view mode{open};
+            if (mode == "full" || mode == "compact") {
+                SetOpen(true, mode == "compact");
+            }
+        }
+    }
     if (program_id == kOcarinaProgramId) {
         std::scoped_lock lk{state_mutex_};
         options_.occlusion_mod = IsOcclusionAddonEnabledFromSettings();

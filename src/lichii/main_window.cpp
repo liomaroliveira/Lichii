@@ -16,6 +16,7 @@
 #include <QSysInfo>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
+#include "common/oot_menu_bridge.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -2251,6 +2252,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
     config->SaveAllValues();
+
+    RegisterOotMenuCallbacks();
 
     u64 title_id{0};
 
@@ -5602,6 +5605,71 @@ void MainWindow::UpdatePostShaderText() {
     post_shader_status_button->setText(QString::fromStdString(preset).toUpper());
 }
 #endif
+
+void MainWindow::RegisterOotMenuCallbacks() {
+    // The menu runs on the present thread; the window's work goes to the GUI thread.
+    const auto on_gui = [this](std::function<void()> fn) {
+        QMetaObject::invokeMethod(this, std::move(fn), Qt::QueuedConnection);
+    };
+    Common::OotMenu::HostCallbacks callbacks;
+    callbacks.save_config = [this, on_gui] { on_gui([this] { config->SaveAllValues(); }); };
+    callbacks.restart_game = [this, on_gui] { on_gui([this] { OnRestartGame(); }); };
+    callbacks.quit_game = [this, on_gui] { on_gui([this] { OnStopGame(); }); };
+    callbacks.apply_pad_layout = [this, on_gui](int layout) {
+        on_gui([this, layout] { OotApplyPadLayout(layout); });
+    };
+    callbacks.reset_controls = [this, on_gui] {
+        on_gui([this] {
+            OotApplyPadLayout(Common::OotMenu::Bridge::Instance().GetOptions().pad_layout);
+        });
+    };
+    Common::OotMenu::Bridge::Instance().RegisterCallbacks(std::move(callbacks));
+}
+
+void MainWindow::OotApplyPadLayout(int layout) {
+    if (!QtCommon::system) {
+        return;
+    }
+    auto* controller =
+        QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller == nullptr || controller->IsConfiguring()) {
+        return;
+    }
+    const Common::ParamPackage a = controller->GetButtonParam(Settings::NativeButton::A);
+    if (a.Get("engine", "") != "sdl") {
+        return; // keyboard: no face-button positions
+    }
+    Common::ParamPackage device;
+    device.Set("engine", "sdl");
+    device.Set("guid", a.Get("guid", ""));
+    device.Set("port", a.Get("port", 0));
+    const auto buttons = input_subsystem->GetButtonMappingForDevice(device);
+    if (buttons.empty()) {
+        return;
+    }
+    // The device's mapping puts the Switch's buttons by position (A on the right, B at the bottom).
+    for (const Settings::NativeButton::Values index :
+         {Settings::NativeButton::A, Settings::NativeButton::B, Settings::NativeButton::X,
+          Settings::NativeButton::Y}) {
+        if (const auto it = buttons.find(index); it != buttons.end()) {
+            controller->SetButtonParam(index, it->second);
+        }
+    }
+    const auto swap = [controller](int first, int second) {
+        const auto saved = controller->GetButtonParam(first);
+        controller->SetButtonParam(first, controller->GetButtonParam(second));
+        controller->SetButtonParam(second, saved);
+    };
+    if (layout == 1) { // Xbox / PC: A bottom, B right, X left, Y top (as Longshot's preset)
+        swap(Settings::NativeButton::A, Settings::NativeButton::B);
+        swap(Settings::NativeButton::X, Settings::NativeButton::Y);
+    } else if (layout == 2) { // swapped face buttons: A bottom, B right, X top, Y left
+        swap(Settings::NativeButton::A, Settings::NativeButton::B);
+    }
+    controller->SaveCurrentConfig();
+    config->SaveAllValues();
+    LOG_INFO(Frontend, "OoT menu: pad layout {} applied to player 1", layout);
+}
 
 void MainWindow::Nx2AutoMapController() {
     auto* controller =

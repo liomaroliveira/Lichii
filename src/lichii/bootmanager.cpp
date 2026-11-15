@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <string>
 
 #ifdef HAS_OPENGL
@@ -62,11 +63,95 @@
 #include "qt_common/qt_common.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+#include "common/oot_menu_bridge.h"
 #include "lichii/bootmanager.h"
 #include "lichii/main_window.h"
 
 #include "qt_common/render/context.h"
 #include "qt_common/render/emu_thread.h"
+
+namespace {
+
+// OoT in-game menu (E45): keys the menu takes while it is open (arrows/WASD move, Enter/Space
+// confirm, Backspace back, Esc closes, Q/E or PageUp/PageDown change tabs).
+std::optional<Common::OotMenu::Key> OotMenuKey(int key) {
+    using K = Common::OotMenu::Key;
+    switch (key) {
+    case Qt::Key_Up:
+    case Qt::Key_W:
+        return K::Up;
+    case Qt::Key_Down:
+    case Qt::Key_S:
+        return K::Down;
+    case Qt::Key_Left:
+    case Qt::Key_A:
+        return K::Left;
+    case Qt::Key_Right:
+    case Qt::Key_D:
+        return K::Right;
+    case Qt::Key_PageUp:
+        return K::PageUp;
+    case Qt::Key_PageDown:
+        return K::PageDown;
+    case Qt::Key_Home:
+        return K::Home;
+    case Qt::Key_End:
+        return K::End;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+    case Qt::Key_Space:
+        return K::Confirm;
+    case Qt::Key_Backspace:
+        return K::Back;
+    case Qt::Key_Q:
+        return K::TabPrev;
+    case Qt::Key_E:
+        return K::TabNext;
+    case Qt::Key_Delete:
+        return K::Clear;
+    case Qt::Key_Escape:
+        return K::Esc;
+    default:
+        return std::nullopt;
+    }
+}
+
+/// Handles a key for the OoT menu; true when the game must not see it.
+bool OotMenuKeyEvent(const QKeyEvent* event, bool down) {
+    auto& menu = Common::OotMenu::Bridge::Instance();
+    if (!menu.IsOcarina()) {
+        return false;
+    }
+    const int key = event->key();
+    // X11/XWayland and Wayland key codes (evdev + 8) of the right Shift and right Ctrl
+    const quint32 scan = event->nativeScanCode();
+    const bool is_rshift = key == Qt::Key_Shift && scan == 62;
+    const bool is_rctrl = key == Qt::Key_Control && scan == 105;
+    if (down && !event->isAutoRepeat()) {
+        if (menu.MatchesMenuHotkey(key == Qt::Key_Insert, key == Qt::Key_F1)) {
+            menu.ToggleMenu();
+            return true;
+        }
+        if (menu.MatchesCompactHotkey(is_rshift, is_rctrl, key == Qt::Key_F4)) {
+            menu.ToggleCompact();
+            return true;
+        }
+        if (!menu.IsOpen() && key == Qt::Key_Escape && menu.EscOpensMenu()) {
+            menu.ToggleMenu();
+            return true;
+        }
+    }
+    if (!menu.IsOpen()) {
+        return false;
+    }
+    if (const auto menu_key = OotMenuKey(key)) {
+        menu.PushKeyEvent(*menu_key, down);
+    }
+    return true;
+}
+
+} // Anonymous namespace
+
 
 class QObject;
 class QPaintEngine;
@@ -429,6 +514,9 @@ int GRenderWindow::QtModifierToSwitchModifier(Qt::KeyboardModifiers qt_modifiers
 }
 
 void GRenderWindow::keyPressEvent(QKeyEvent* event) {
+    if (OotMenuKeyEvent(event, true)) {
+        return;
+    }
     /**
      * This feature can be enhanced with the following functions, but they do not provide
      * cross-platform behavior.
@@ -448,6 +536,9 @@ void GRenderWindow::keyPressEvent(QKeyEvent* event) {
 }
 
 void GRenderWindow::keyReleaseEvent(QKeyEvent* event) {
+    if (OotMenuKeyEvent(event, false)) {
+        return;
+    }
     /**
      * This feature can be enhanced with the following functions, but they do not provide
      * cross-platform behavior.
@@ -486,6 +577,14 @@ InputCommon::MouseButton GRenderWindow::QtButtonToMouseButton(Qt::MouseButton bu
 }
 
 void GRenderWindow::mousePressEvent(QMouseEvent* event) {
+    if (auto& menu = Common::OotMenu::Bridge::Instance(); menu.ShouldSuppressGameInput()) {
+        const auto menu_pos = mapFromGlobal(QCursor::pos()) * devicePixelRatioF();
+        menu.SetMousePosition(static_cast<float>(menu_pos.x()), static_cast<float>(menu_pos.y()));
+        if (event->button() == Qt::LeftButton || event->button() == Qt::RightButton) {
+            menu.SetMouseButton(event->button() == Qt::LeftButton ? 0 : 1, true);
+        }
+        return;
+    }
     // Touch input is handled in TouchBeginEvent
     if (event->source() == Qt::MouseEventSynthesizedBySystem) {
         return;
@@ -505,6 +604,11 @@ void GRenderWindow::mousePressEvent(QMouseEvent* event) {
 }
 
 void GRenderWindow::mouseMoveEvent(QMouseEvent* event) {
+    if (auto& menu = Common::OotMenu::Bridge::Instance(); menu.ShouldSuppressGameInput()) {
+        const auto menu_pos = mapFromGlobal(QCursor::pos()) * devicePixelRatioF();
+        menu.SetMousePosition(static_cast<float>(menu_pos.x()), static_cast<float>(menu_pos.y()));
+        return;
+    }
     // Touch input is handled in TouchUpdateEvent
     if (event->source() == Qt::MouseEventSynthesizedBySystem) {
         return;
@@ -537,6 +641,14 @@ void GRenderWindow::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void GRenderWindow::mouseReleaseEvent(QMouseEvent* event) {
+    if (auto& menu = Common::OotMenu::Bridge::Instance(); menu.ShouldSuppressGameInput()) {
+        const auto menu_pos = mapFromGlobal(QCursor::pos()) * devicePixelRatioF();
+        menu.SetMousePosition(static_cast<float>(menu_pos.x()), static_cast<float>(menu_pos.y()));
+        if (event->button() == Qt::LeftButton || event->button() == Qt::RightButton) {
+            menu.SetMouseButton(event->button() == Qt::LeftButton ? 0 : 1, false);
+        }
+        return;
+    }
     // Touch input is handled in TouchEndEvent
     if (event->source() == Qt::MouseEventSynthesizedBySystem) {
         return;
@@ -569,6 +681,10 @@ void GRenderWindow::UpdateMouse() {
 }
 
 void GRenderWindow::wheelEvent(QWheelEvent* event) {
+    if (auto& menu = Common::OotMenu::Bridge::Instance(); menu.ShouldSuppressGameInput()) {
+        menu.AddMouseWheel(static_cast<float>(event->angleDelta().y()) / 120.0f);
+        return;
+    }
     const int x = event->angleDelta().x();
     const int y = event->angleDelta().y();
     input_subsystem->GetMouse()->MouseWheelChange(x, y);
