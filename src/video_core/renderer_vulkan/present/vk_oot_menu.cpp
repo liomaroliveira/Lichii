@@ -467,6 +467,14 @@ bool OotMenuController::ShouldDraw(const Common::OotMenu::Bridge& bridge) const 
     if (bridge.IsOpen()) {
         return true;
     }
+    // E47.T9: keep ticking the self-test until its live upscaler switches ran, menu open or not
+    static const bool selftest = [] {
+        const char* v = std::getenv("EDEN_NX2_OOT_MENU_SELFTEST");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (selftest && selftest_live_step_ < 2) {
+        return true;
+    }
     return bridge.GetOptions().fps_hud > 0;
 }
 
