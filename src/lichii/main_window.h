@@ -486,6 +486,7 @@ private:
     void UpdateWindowTitle(std::string_view title_name = {}, std::string_view title_version = {},
                            std::string_view gpu_vendor = {});
     void OnApplicationChanged(u64 program_id);
+    void LoadPerGameConfigForApplication(u64 program_id);
     void UpdateDockedButton();
     void UpdateAPIText();
     void UpdateFilterText();
@@ -665,6 +666,8 @@ private:
 
     // Last game booted, used for multi-process apps
     QString last_filename_booted;
+    /// Program whose per-game config is loaded: the booted title, then each one the home menu starts.
+    u64 per_game_config_program_id{0};
 
     // Applets
     QtAmiiboSettingsDialog* cabinet_applet = nullptr;

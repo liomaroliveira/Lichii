@@ -2284,6 +2284,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
     }
+    per_game_config_program_id = title_id;
 
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     Settings::LogSettings();
@@ -5312,9 +5313,28 @@ void MainWindow::OnEmulatorUpdateAvailable() {
 }
 #endif
 
+void MainWindow::LoadPerGameConfigForApplication(u64 program_id) {
+    if (program_id == per_game_config_program_id) {
+        return;
+    }
+    // A game the home menu starts never goes through BootGame, which loads only the booted
+    // title's config (the menu's). Load the new application's own config over it, as a boot
+    // would, so its per-game values (such as the FPS limit) apply.
+    LOG_INFO(Frontend, "Loading the per-game config of {:016X} (was {:016X})", program_id,
+             per_game_config_program_id);
+    per_game_config_program_id = program_id;
+    QtConfig per_game_config(fmt::format("{:016X}", program_id), Config::ConfigType::PerGameConfig);
+    QtCommon::system->ApplySettings();
+    LOG_INFO(Frontend, "Per-game config of {:016X}: Renderer.fps_limit={} nx2_frame_rate_limit={}",
+             program_id, Settings::values.fps_limit.GetValue(),
+             Settings::values.frame_rate_limit.GetValue());
+}
+
 void MainWindow::OnApplicationChanged(u64 program_id) {
     if (!emulation_running || program_id == 0)
         return;
+
+    LoadPerGameConfigForApplication(program_id);
 
     if (report_session && report_session->program_id != program_id) {
         report_session.reset();
