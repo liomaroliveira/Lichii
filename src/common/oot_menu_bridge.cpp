@@ -355,6 +355,8 @@ void Bridge::LoadFromDisk() {
             else if (key == "menu_key") opts.menu_key = std::clamp(ParseInt(val, 2), 0, 2);
             else if (key == "compact_key") opts.compact_key = std::clamp(ParseInt(val, 0), 0, 2);
             else if (key == "esc_opens") opts.esc_opens = ParseBool(val, false);
+            else if (key == "mute_in_background") opts.mute_in_background = ParseBool(val, false);
+            else if (key == "pause_in_background") opts.pause_in_background = ParseBool(val, false);
         }
     }
 
@@ -427,7 +429,9 @@ void Bridge::SaveToDisk() const {
             << "pin_ccx=" << (opts.pin_ccx ? 1 : 0) << "\n"
             << "menu_key=" << opts.menu_key << "\n"
             << "compact_key=" << opts.compact_key << "\n"
-            << "esc_opens=" << (opts.esc_opens ? 1 : 0) << "\n";
+            << "esc_opens=" << (opts.esc_opens ? 1 : 0) << "\n"
+            << "mute_in_background=" << (opts.mute_in_background ? 1 : 0) << "\n"
+            << "pause_in_background=" << (opts.pause_in_background ? 1 : 0) << "\n";
         if (shortcut_session_) {
             // pin_ccx / gamemode / read_areas above were seeded by the shortcut: it may apply them
             out << "shortcut_sync=1\n";

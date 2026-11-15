@@ -443,6 +443,12 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          false, 0, 2, 1},
         {T::AudioUi, RK::Choice, "compact_key", "Tecla Barra Compacta",
          "Tecla para abrir diretamente ou alternar com a Barra Compacta ao vivo.", false, 0, 2, 1},
+        {T::AudioUi, RK::Toggle, "mute_bg", "Mudo em 2º Plano",
+         "Silencia o jogo enquanto a janela do emulador não está em foco e volta o som ao voltar o foco. Ao vivo.",
+         false, 0, 1, 1},
+        {T::AudioUi, RK::Toggle, "pause_bg", "Pausar em 2º Plano",
+         "Pausa a emulação enquanto a janela não está em foco e continua ao voltar. O controle segue funcionando com a janela em 2º plano quando esta opção está desligada. Ao vivo (só na interface gráfica).",
+         false, 0, 1, 1},
         {T::AudioUi, RK::Toggle, "esc_opens", "Esc Abre o Menu",
          "Permite usar a tecla Esc também para abrir o menu completo (além de fechá-lo).", false, 0,
          1, 1},
@@ -755,6 +761,12 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
     if (std::strcmp(id, "compact_key") == 0) {
         return opts.compact_key;
     }
+    if (std::strcmp(id, "mute_bg") == 0) {
+        return opts.mute_in_background ? 1 : 0;
+    }
+    if (std::strcmp(id, "pause_bg") == 0) {
+        return opts.pause_in_background ? 1 : 0;
+    }
     if (std::strcmp(id, "esc_opens") == 0) {
         return opts.esc_opens ? 1 : 0;
     }
@@ -951,6 +963,12 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
         dirty_bridge = true;
     } else if (std::strcmp(id, "esc_opens") == 0) {
         opts.esc_opens = (val != 0);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "mute_bg") == 0) {
+        opts.mute_in_background = (val != 0);
+        dirty_bridge = true;
+    } else if (std::strcmp(id, "pause_bg") == 0) {
+        opts.pause_in_background = (val != 0);
         dirty_bridge = true;
     }
 

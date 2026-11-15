@@ -1577,7 +1577,9 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
     if (!emulation_running) {
         return;
     }
-    if (UISettings::values.pause_when_in_background) {
+    // E47.T13: the in-game menu's toggles add to the emulator's own settings
+    const auto menu_opts = Common::OotMenu::Bridge::Instance().GetOptions();
+    if (UISettings::values.pause_when_in_background || menu_opts.pause_in_background || auto_paused) {
         if (QtCommon::emu_thread->IsRunning() &&
             (state & (Qt::ApplicationHidden | Qt::ApplicationInactive))) {
             auto_paused = true;
@@ -1588,7 +1590,7 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
             OnStartGame();
         }
     }
-    if (UISettings::values.mute_when_in_background) {
+    if (UISettings::values.mute_when_in_background || menu_opts.mute_in_background || auto_muted) {
         if (!Settings::values.audio_muted &&
             (state & (Qt::ApplicationHidden | Qt::ApplicationInactive))) {
             Settings::values.audio_muted = true;

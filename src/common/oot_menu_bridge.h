@@ -132,6 +132,9 @@ struct PcOptions {
     int menu_key = static_cast<int>(MenuHotkey::Both);
     int compact_key = static_cast<int>(CompactHotkey::RightShift);
     bool esc_opens = false;
+    // E47.T13 (Longshot parity): on top of the emulator's own UI settings
+    bool mute_in_background = false;
+    bool pause_in_background = false;
 };
 
 struct PadBindingSnapshot {

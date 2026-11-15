@@ -211,6 +211,12 @@ inline const char* Tr(const char* pt_br) noexcept {
         {"RCtrl", "Right Ctrl"},
         {"F4", "F4"},
         {"Esc Abre o Menu", "Esc Opens Menu"},
+        {"Mudo em 2º Plano", "Mute in Background"},
+        {"Silencia o jogo enquanto a janela do emulador não está em foco e volta o som ao voltar o foco. Ao vivo.",
+         "Mutes the game while the emulator window is not focused and restores the sound when it is. Live."},
+        {"Pausar em 2º Plano", "Pause in Background"},
+        {"Pausa a emulação enquanto a janela não está em foco e continua ao voltar. O controle segue funcionando com a janela em 2º plano quando esta opção está desligada. Ao vivo (só na interface gráfica).",
+         "Pauses emulation while the window is not focused and resumes when it is. With this off, the controller keeps working with the window in the background. Live (graphical interface only)."},
 
         // Help descriptions (key strings)
         {"Substitui a reconstrução do jogo ao vivo sem reiniciar: Nativo, FSR 3.1 ou AMD FSR 4.1 (INT8/FP8).",
