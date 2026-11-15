@@ -3863,6 +3863,18 @@ void MainWindow::ShowFullscreen() {
             // E47.T10: on Wayland Qt asks for fullscreen on the window's screen, by default the first
             // output the compositor announced (an always-connected HDMI dongle wins over the main
             // monitor). The shortcut names the main monitor's connector when it is on.
+            // Off by default (the compositor decides, like any PC game); the log below shows which
+            // screen Qt asked for, to tell an HDMI dongle taking the fullscreen from the real cause.
+            QStringList names;
+            for (const QScreen* screen : QGuiApplication::screens()) {
+                names << screen->name();
+            }
+            LOG_INFO(Frontend, "Fullscreen: window on screen {} (primary {}, screens {})",
+                     window->screen() ? window->screen()->name().toStdString() : "none",
+                     QGuiApplication::primaryScreen()
+                         ? QGuiApplication::primaryScreen()->name().toStdString()
+                         : "none",
+                     names.join(QStringLiteral(",")).toStdString());
             const QString wanted = qEnvironmentVariable("LICHII_FULLSCREEN_OUTPUT").trimmed();
             if (!wanted.isEmpty()) {
                 for (QScreen* screen : QGuiApplication::screens()) {

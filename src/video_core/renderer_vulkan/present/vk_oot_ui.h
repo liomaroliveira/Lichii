@@ -272,8 +272,25 @@ inline float DrawGlyph(Ctx& c, float px, ImVec2 p, const Prompt& pr, bool draw) 
         return draw_key(p.x, pr.key);
     }
     if (pr.g == Glyph::Compact) {
-        // Keyboard: the chosen key; controller: R3 (E47.T4, vk_oot_menu.cpp ProcessInput)
-        return draw_key(p.x, c.pad ? "R3" : (pr.key ? pr.key : "RShift"));
+        // Controller: the left face button by position, lit (X on Xbox, Y on Nintendo), as Longshot
+        if (!c.pad) {
+            return draw_key(p.x, pr.key ? pr.key : "RShift");
+        }
+        const float r = hh * 0.5f;
+        const ImVec2 m(p.x + r, my);
+        if (draw) {
+            c.d->AddCircleFilled(m, r, cap);
+            const ImVec2 at[4] = {m + ImVec2(0.0f, -r * 0.5f), m + ImVec2(r * 0.5f, 0.0f),
+                                  m + ImVec2(-r * 0.5f, 0.0f), m + ImVec2(0.0f, r * 0.5f)};
+            for (int i = 0; i < 4; i++) {
+                if (i == 2) {
+                    c.d->AddCircleFilled(at[i], r * 0.27f, ink);
+                } else {
+                    c.d->AddCircle(at[i], r * 0.22f, dim, 0, std::max(1.0f, s));
+                }
+            }
+        }
+        return 2.0f * r;
     }
     if (!c.pad) {
         switch (pr.g) {

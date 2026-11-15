@@ -1441,8 +1441,15 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
     constexpr u64 kBitL = 1ULL << 6;
     constexpr u64 kBitR = 1ULL << 7;
     constexpr u64 kBitPlus = 1ULL << 10;
-    constexpr u64 kBitStickL = 1ULL << 4;
-    constexpr u64 kBitStickR = 1ULL << 5;
+    constexpr u64 kBitX = 1ULL << 2;
+    constexpr u64 kBitY = 1ULL << 3;
+    // E47.T4: the left face button by position switches full menu <-> compact bar, as in
+    // Longshot (HOS_PAD_WEST). Switch Y is on the left in the Nintendo layout; with the Xbox PC
+    // layout the buttons follow the Xbox labels, so the left one is X.
+    const u64 kBitWest =
+        bridge.GetOptions().pad_layout == static_cast<int>(Common::OotMenu::PadLayout::Nintendo)
+            ? kBitY
+            : kBitX;
     constexpr u64 kBitLeft = (1ULL << 12) | (1ULL << 16);
     constexpr u64 kBitUp = (1ULL << 13) | (1ULL << 17);
     constexpr u64 kBitRight = (1ULL << 14) | (1ULL << 18);
@@ -1484,8 +1491,8 @@ void OotMenuController::ProcessInput(Bridge& bridge, float dt_sec) {
         apply_nav(held_dir_ == 1 ? -1 : (held_dir_ == 2 ? 1 : 0),
                   held_dir_ == 3 ? -1 : (held_dir_ == 4 ? 1 : 0), false, false, 0);
     }
-    if ((pressed & kBitStickR) != 0 && (mask & kBitStickL) == 0 && !DropdownOpen()) {
-        // E47.T4: R3 switches full menu <-> compact bar (ToggleCompact closes from compact)
+    if ((pressed & kBitWest) != 0 && !from_kbd && !DropdownOpen()) {
+        // ToggleCompact alone would close the menu from the compact bar
         bridge.IsCompact() ? bridge.ToggleMenu() : bridge.ToggleCompact();
     }
     if ((pressed & kBitL) != 0) {
