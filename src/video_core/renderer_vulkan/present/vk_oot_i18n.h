@@ -291,6 +291,16 @@ inline const char* Tr(const char* pt_br) noexcept {
         {"Leve: FSR 3.1 720p > 1080p", "Light: FSR 3.1 720p > 1080p"},
         {"Nativo (sem FSR)", "Native (no FSR)"},
         {"Lista", "List"},
+        // T6c: performance overlay
+        {"Gráfico", "Graph"},
+        {"Detalhado", "Detailed"},
+        {"Render > saída", "Render > output"},
+        {"Velocidade", "Speed"},
+        {"Compilando shaders", "Building shaders"},
+        {"Mín / média / máx", "Min / avg / max"},
+        {"Travadas > 50 ms", "Stutters > 50 ms"},
+        {"Contador no canto da tela, como no Longshot: FPS, Frame time + 1% low, Gráfico (pior quadro por coluna), Detalhado (resolução, velocidade, shaders, VRAM) ou Dev (mín/máx, travadas, ajustes).",
+         "Corner counter as in Longshot: FPS, Frame time + 1% low, Graph (slowest frame per column), Detailed (resolution, speed, shaders, VRAM) or Dev (min/max, stutters, settings)."},
         // T6b: button-by-button remap
         {"Trocar um botão", "Remap a button"},
         {"Escolha o botão do Switch e aperte no controle o botão que vai fazer essa função. Fica salvo no perfil deste controle (oot-controles).",

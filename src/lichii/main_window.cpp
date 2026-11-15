@@ -5455,6 +5455,9 @@ void MainWindow::UpdateStatusBar() {
     auto results = QtCommon::system->GetAndResetPerfStats();
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
+    Common::OotMenu::Bridge::Instance().UpdateHostStats(results.emulation_speed,
+                                                        results.average_game_fps,
+                                                        shaders_building);
 
     // Before statsUpdated, so the performance overlay reads this update's generated frame rate.
     const auto frame_gen = QtCommon::system->GPU().Renderer().GetFrameGenStatus();

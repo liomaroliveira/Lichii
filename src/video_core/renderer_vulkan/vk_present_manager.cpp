@@ -750,6 +750,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             fsr4_on ? "FSR 4.1" : (fsr3_on ? "FSR 3.1" : "Native"), fsr4.model.has_value(),
             fsr4.model == VideoCommon::Fsr4PortModel::Int8, false, true,
             frame->color_space != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
+        if (oot_bridge.GetOptions().fps_hud >= static_cast<int>(Common::OotMenu::FpsHudLevel::Detailed) &&
+            device.CanReportMemoryUsage()) {
+            // Cached 50 ms inside the device: no driver query per frame
+            oot_bridge.UpdateVramStats(device.GetDeviceMemoryUsage(), device.GetDeviceMemoryBudget());
+        }
         if (!oot_overlay) {
             oot_overlay = std::make_unique<OotOverlay>(instance, device, memory_allocator, swapchain);
         }

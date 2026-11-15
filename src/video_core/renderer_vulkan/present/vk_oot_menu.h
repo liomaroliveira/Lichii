@@ -157,10 +157,7 @@ private:
     float dir_repeat_timer_{0.0f};
     std::chrono::steady_clock::time_point last_tick_{};
 
-    std::array<double, 120> fps_graph_{};
-    std::size_t fps_graph_head_{0};
-    std::size_t fps_graph_count_{0};
-    double prev_recorded_sample_{-1.0};
+    std::vector<float> graph_frames_;
 };
 
 } // namespace Vulkan::OotUi

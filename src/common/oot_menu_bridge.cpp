@@ -334,7 +334,12 @@ void Bridge::LoadFromDisk() {
             const std::string val = Trim(std::string_view(line).substr(eq + 1));
             if (key == "menu_size") opts.menu_size = std::clamp(ParseInt(val, 0), 0, 3);
             else if (key == "menu_lang") opts.menu_lang = std::clamp(ParseInt(val, 0), 0, 1);
-            else if (key == "fps_hud") opts.fps_hud = std::clamp(ParseInt(val, 0), 0, 3);
+            // fps_hud: levels before T6c (3 = Detailed); fps_hud2: Off..Dev (Graph = 3)
+            else if (key == "fps_hud") {
+                const int old = std::clamp(ParseInt(val, 0), 0, 3);
+                opts.fps_hud = old == 3 ? static_cast<int>(FpsHudLevel::Detailed) : old;
+            }
+            else if (key == "fps_hud2") opts.fps_hud = std::clamp(ParseInt(val, 0), 0, 5);
             else if (key == "fps_corner") opts.fps_corner = std::clamp(ParseInt(val, 0), 0, 3);
             else if (key == "button_prompts") opts.button_prompts = std::clamp(ParseInt(val, 0), 0, 6);
             else if (key == "pad_layout") {
@@ -394,7 +399,8 @@ void Bridge::SaveToDisk() const {
         out << "# Ocarina PC Menu options\n"
             << "menu_size=" << opts.menu_size << "\n"
             << "menu_lang=" << opts.menu_lang << "\n"
-            << "fps_hud=" << opts.fps_hud << "\n"
+            << "fps_hud=" << std::min(opts.fps_hud, 3) << "\n"
+            << "fps_hud2=" << opts.fps_hud << "\n"
             << "fps_corner=" << opts.fps_corner << "\n"
             << "button_prompts=" << opts.button_prompts << "\n"
             << "pad_layout=" << opts.pad_layout << "\n"
@@ -536,6 +542,10 @@ void Bridge::RecordPresentSample(double frame_ms, bool is_generated) {
         window_start_ = now;
     }
     if (frame_ms > 0.01 && frame_ms < 2000.0) {
+        ++total_frames_;
+        if (frame_ms > 50.0) {
+            ++stutters_;
+        }
         recent_frame_ms_[perf_head_] = frame_ms;
         perf_head_ = (perf_head_ + 1) % recent_frame_ms_.size();
         if (perf_count_ < recent_frame_ms_.size()) {
@@ -579,8 +589,36 @@ TelemetrySnapshot Bridge::GetTelemetry() const {
         snap.frametime_ms = sum / static_cast<double>(perf_count_);
         const std::size_t p99_idx = std::min(perf_count_ - 1, (perf_count_ * 99) / 100);
         snap.frametime_p99_ms = sorted[p99_idx];
+        snap.frametime_min_ms = sorted[0];
+        snap.frametime_max_ms = sorted[perf_count_ - 1];
     }
+    snap.total_frames = total_frames_;
+    snap.stutters = stutters_;
     return snap;
+}
+
+void Bridge::CopyRecentFrames(std::vector<float>& out) const {
+    std::scoped_lock lk{perf_mutex_};
+    out.resize(perf_count_);
+    const std::size_t n = recent_frame_ms_.size();
+    const std::size_t first = (perf_head_ + n - perf_count_) % n;
+    for (std::size_t i = 0; i < perf_count_; ++i) {
+        out[i] = static_cast<float>(recent_frame_ms_[(first + i) % n]);
+    }
+}
+
+void Bridge::UpdateHostStats(double emulation_speed, double game_fps, int shaders_building) {
+    std::scoped_lock lk{state_mutex_};
+    telemetry_.host_stats_valid = true;
+    telemetry_.emulation_speed = emulation_speed;
+    telemetry_.game_fps = game_fps;
+    telemetry_.shaders_building = shaders_building;
+}
+
+void Bridge::UpdateVramStats(u64 used_bytes, u64 budget_bytes) {
+    std::scoped_lock lk{state_mutex_};
+    telemetry_.vram_used = used_bytes;
+    telemetry_.vram_budget = budget_bytes;
 }
 
 void Bridge::SetRomFsFontData(std::vector<u8> body_otf_bytes,

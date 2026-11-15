@@ -397,8 +397,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
 
         {T::AudioUi, RK::Heading, "h_hud", "Medidor FPS e Interface", "", false, 0, 0, 1},
         {T::AudioUi, RK::Choice, "fps_hud", "Contador de FPS",
-         "Exibe o contador nativo no canto da tela: FPS simples, Frame Time + 1% Low ou diagnóstico detalhado.",
-         false, 0, 3, 1},
+         "Contador no canto da tela, como no Longshot: FPS, Frame time + 1% low, Gráfico (pior quadro por coluna), Detalhado (resolução, velocidade, shaders, VRAM) ou Dev (mín/máx, travadas, ajustes).",
+         false, 0, 5, 1},
         {T::AudioUi, RK::Choice, "fps_corner", "Posição do FPS",
          "Canto da tela onde o contador de FPS é exibido.", false, 0, 3, 1},
         {T::AudioUi, RK::Choice, "menu_size", "Tamanho do Menu",
@@ -864,7 +864,7 @@ void OotMenuController::WriteRowValue(const char* id, int val, PcOptions& opts, 
         ApplySettingValue(Settings::values.sink_id,
                           static_cast<Settings::AudioEngine>(std::clamp(val, 0, 3)));
     } else if (std::strcmp(id, "fps_hud") == 0) {
-        opts.fps_hud = std::clamp(val, 0, 3);
+        opts.fps_hud = std::clamp(val, 0, 5);
         dirty_bridge = true;
     } else if (std::strcmp(id, "fps_corner") == 0) {
         opts.fps_corner = std::clamp(val, 0, 3);
@@ -1069,9 +1069,9 @@ std::string OotMenuController::FormatRowValue(const RowDef& r, int val,
         return kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))];
     }
     if (std::strcmp(id, "fps_hud") == 0) {
-        static constexpr std::array<const char*, 4> kLabs{
-            "Desligado", "Simples", "Frame time + 1%", "Detalhado"};
-        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 3))]);
+        static constexpr std::array<const char*, 6> kLabs{
+            "Desligado", "Simples", "Frame time + 1%", "Gráfico", "Detalhado", "Dev"};
+        return Tr(kLabs[static_cast<std::size_t>(std::clamp(val, 0, 5))]);
     }
     if (std::strcmp(id, "fps_corner") == 0) {
         static constexpr std::array<const char*, 4> kLabs{
@@ -2136,84 +2136,195 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
 }
 
 void OotMenuController::DrawFpsHud(Ctx& c, const Bridge& bridge, bool menu_open, bool compact) {
+    // Levels after Longshot's counter (gpu/vk/fps_stats.h): Off, FPS, Frame time, Graph,
+    // Detailed (graph + where the frame goes) and Dev (the renderer's own numbers).
     const auto opts = bridge.GetOptions();
-    if (opts.fps_hud <= 0) {
+    const int level = std::clamp(opts.fps_hud, 0, 5);
+    if (level <= 0) {
         return;
     }
     const auto tel = bridge.GetTelemetry();
-    if (tel.frametime_ms > 0.0 && tel.frametime_ms != prev_recorded_sample_) {
-        prev_recorded_sample_ = tel.frametime_ms;
-        fps_graph_[fps_graph_head_] = tel.frametime_ms;
-        fps_graph_head_ = (fps_graph_head_ + 1) % fps_graph_.size();
-        fps_graph_count_ = std::min(fps_graph_count_ + 1, fps_graph_.size());
-    }
-
     const float s = c.s;
     const float big = 27.0f * s;
     const float small = 13.0f * s;
+    const float line = 16.0f * s;
     const int corner = std::clamp(opts.fps_corner, 0, 3);
     const bool left = (corner & 1) != 0;
     const bool bottom = corner >= 2;
-    const float edge = left ? c.safe : (c.w - c.safe);
-    const float top =
-        bottom ? (c.h - c.safe - (opts.fps_hud >= 3 ? 115.0f * s : 56.0f * s))
-               : ((menu_open && !compact && corner < 2) ? (BannerHeight(c) + 10.0f * s) : c.safe);
+    const ImU32 green = Rgba(72, 255, 110);
+    const ImU32 amber = Rgba(255, 200, 60);
+    const ImU32 red = Rgba(255, 95, 80);
+    const auto fps_col = [&](double fps) { return fps >= 55.0 ? green : (fps >= 38.0 ? amber : red); };
+
+    // Lines of text below the number: built first so the panel can be sized and anchored
+    struct HudLine {
+        std::string label;
+        std::string value;
+        ImU32 col;
+    };
+    std::vector<HudLine> lines;
+    char b[128];
+    if (tel.output_height > 0) {
+        std::snprintf(b, sizeof(b), "%up %s", tel.output_height, tel.upscaler_name.c_str());
+    } else {
+        std::snprintf(b, sizeof(b), "%s", tel.upscaler_name.c_str());
+    }
+    lines.push_back({"", b, kInkBright});
+    if (level >= 2) {
+        const double low = tel.frametime_p99_ms > 0.0 ? 1000.0 / tel.frametime_p99_ms : 0.0;
+        std::snprintf(b, sizeof(b), "%.1f ms", tel.frametime_ms);
+        lines.push_back({"Frame time", b, kSoft});
+        std::snprintf(b, sizeof(b), "%.0f FPS (%.1f ms)", low, tel.frametime_p99_ms);
+        lines.push_back({"1% low", b, fps_col(low)});
+    }
+    if (level >= 4) {
+        std::snprintf(b, sizeof(b), "%ux%u > %ux%u", tel.render_width, tel.render_height,
+                      tel.output_width, tel.output_height);
+        lines.push_back({"Render > saída", b, kSoft});
+        if (tel.base_fps > 0.0 && tel.fps > tel.base_fps * 1.15) {
+            std::snprintf(b, sizeof(b), "%.0f base > %.0f exibidos", tel.base_fps, tel.fps);
+            lines.push_back({"Frame gen", b, kSoft});
+        }
+        if (tel.host_stats_valid) {
+            std::snprintf(b, sizeof(b), "%.0f%%  ·  jogo %.0f FPS", tel.emulation_speed * 100.0,
+                          tel.game_fps);
+            lines.push_back({"Velocidade", b, kSoft});
+            if (tel.shaders_building > 0) {
+                std::snprintf(b, sizeof(b), "%d", tel.shaders_building);
+                lines.push_back({"Compilando shaders", b, amber});
+            }
+        }
+        if (tel.vram_budget > 0) {
+            const double gb = 1024.0 * 1024.0 * 1024.0;
+            std::snprintf(b, sizeof(b), "%.1f de %.1f GB", static_cast<double>(tel.vram_used) / gb,
+                          static_cast<double>(tel.vram_budget) / gb);
+            lines.push_back({"VRAM", b,
+                             tel.vram_used > tel.vram_budget * 9 / 10 ? amber : kSoft});
+        }
+    }
+    if (level >= 5) {
+        std::snprintf(b, sizeof(b), "%.1f / %.1f / %.1f ms", tel.frametime_min_ms,
+                      tel.frametime_ms, tel.frametime_max_ms);
+        lines.push_back({"Mín / média / máx", b, kSoft});
+        std::snprintf(b, sizeof(b), "%llu de %llu quadros",
+                      static_cast<unsigned long long>(tel.stutters),
+                      static_cast<unsigned long long>(tel.total_frames));
+        lines.push_back({"Travadas > 50 ms", b, tel.stutters > 0 ? amber : kSoft});
+        static constexpr std::array<const char*, 4> kVsync{"Imediato", "Mailbox", "FIFO",
+                                                          "FIFO relaxado"};
+        std::snprintf(
+            b, sizeof(b), "GPU %s · %s · async %s",
+            Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High ? "alta"
+                                                                                    : "normal",
+            kVsync[static_cast<std::size_t>(
+                std::clamp(static_cast<int>(Settings::values.vsync_mode.GetValue()), 0, 3))],
+            Settings::values.use_asynchronous_shaders.GetValue() ? "sim" : "não");
+        lines.push_back({"Dev", b, kDim});
+    }
+
+    // Size: number row, text lines, graph
+    const float label_w = level >= 2 ? 118.0f * s : 0.0f;
+    float text_w = 0.0f;
+    for (const auto& l : lines) {
+        text_w = std::max(text_w, (l.label.empty() ? 0.0f : label_w) +
+                                      SizeOfRaw(c.f.body, small, l.value.c_str()).x);
+    }
+    const bool graph = level >= 3;
+    const float gw = graph ? std::max(220.0f * s, text_w) : 0.0f;
+    const float gh = 48.0f * s;
+    const float pad = level >= 3 ? 8.0f * s : 0.0f;
+    const float w = std::max({gw, text_w, 90.0f * s}) + 2.0f * pad;
+    const float h = 30.0f * s + static_cast<float>(lines.size()) * line + (graph ? gh + 8.0f * s : 0.0f) +
+                    2.0f * pad;
+    const float x0 = left ? c.safe : (c.w - c.safe - w);
+    const float y0 = bottom ? (c.h - c.safe - h)
+                            : ((menu_open && !compact && corner < 2) ? (BannerHeight(c) + 10.0f * s)
+                                                                     : c.safe);
+    if (level >= 3) {
+        c.d->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), Rgba(10, 8, 5, 168), 5.0f * s);
+        c.d->AddRect(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), Alpha(kEdge, 0.7f), 5.0f * s, 1.0f);
+    }
+    const float ix0 = x0 + pad;
+    const float ix1 = x0 + w - pad;
+    float y = y0 + pad;
 
     char fps_buf[32];
     std::snprintf(fps_buf, sizeof(fps_buf), "%d", static_cast<int>(std::lround(tel.fps)));
     const float nw = SizeOfRaw(c.f.strong, big, fps_buf).x;
     const float lw = SizeOfRaw(c.f.strong, small, "FPS").x;
-    const ImU32 green = Rgba(72, 255, 110);
-    const ImU32 col =
-        tel.fps >= 55.0 ? green : (tel.fps >= 38.0 ? Rgba(255, 200, 60) : Rgba(255, 95, 80));
+    const float x_num = left ? ix0 : (ix1 - nw - 4.0f * s - lw);
+    OutlinedText(c, c.f.strong, big, x_num, y, fps_col(tel.fps), fps_buf);
+    OutlinedText(c, c.f.strong, small, x_num + nw + 4.0f * s, y + 12.0f * s, fps_col(tel.fps), "FPS");
+    y += 30.0f * s;
 
-    const float x_num = left ? edge : (edge - nw - 4.0f * s - lw);
-    OutlinedText(c, c.f.strong, big, x_num, top, col, fps_buf);
-    OutlinedText(c, c.f.strong, small, x_num + nw + 4.0f * s, top + 12.0f * s, col, "FPS");
-
-    float y = top + 30.0f * s;
-    char mode_buf[96];
-    if (tel.output_height > 0) {
-        std::snprintf(mode_buf, sizeof(mode_buf), "%up %s", tel.output_height,
-                      tel.upscaler_name.c_str());
-    } else {
-        std::snprintf(mode_buf, sizeof(mode_buf), "%s", tel.upscaler_name.c_str());
-    }
-    const float mw = SizeOfRaw(c.f.strong, small, mode_buf).x;
-    OutlinedText(c, c.f.strong, small, left ? edge : (edge - mw), y, kInkBright, mode_buf);
-    y += 16.0f * s;
-
-    if (opts.fps_hud >= 2) {
-        char ft_buf[64];
-        std::snprintf(ft_buf, sizeof(ft_buf), "%.1f ms  p99 %.1f ms", tel.frametime_ms,
-                      tel.frametime_p99_ms);
-        const float fw = SizeOfRaw(c.f.body, small, ft_buf).x;
-        OutlinedText(c, c.f.body, small, left ? edge : (edge - fw), y, kSoft, ft_buf);
-        y += 18.0f * s;
-    }
-
-    if (opts.fps_hud >= 3 && fps_graph_count_ >= 4) {
-        const float gw = 196.0f * s;
-        const float gh = 42.0f * s;
-        const float gx0 = left ? edge : (edge - gw);
-        c.d->AddRectFilled(ImVec2(gx0, y), ImVec2(gx0 + gw, y + gh), Rgba(12, 9, 6, 170), 3.0f * s);
-        c.d->AddRect(ImVec2(gx0, y), ImVec2(gx0 + gw, y + gh), Alpha(kEdge, 0.8f), 3.0f * s, 1.0f);
-        const double max_ms = 33.3;
-        const float dx = gw / static_cast<float>(fps_graph_.size() - 1);
-        for (std::size_t i = 1; i < fps_graph_count_; ++i) {
-            const std::size_t idx0 = (fps_graph_head_ + fps_graph_.size() - fps_graph_count_ + i - 1) %
-                                     fps_graph_.size();
-            const std::size_t idx1 =
-                (fps_graph_head_ + fps_graph_.size() - fps_graph_count_ + i) % fps_graph_.size();
-            const float f0 = static_cast<float>(std::clamp(fps_graph_[idx0] / max_ms, 0.0, 1.0));
-            const float f1 = static_cast<float>(std::clamp(fps_graph_[idx1] / max_ms, 0.0, 1.0));
-            const float px0 = gx0 + static_cast<float>(i - 1) * dx;
-            const float px1 = gx0 + static_cast<float>(i) * dx;
-            const float py0 = y + gh - f0 * (gh - 4.0f * s) - 2.0f * s;
-            const float py1 = y + gh - f1 * (gh - 4.0f * s) - 2.0f * s;
-            c.d->AddLine(ImVec2(px0, py0), ImVec2(px1, py1), f1 > 0.6f ? kGoldHi : green,
-                         std::max(1.2f, 1.4f * s));
+    for (const auto& l : lines) {
+        if (l.label.empty()) {
+            const float vw = SizeOfRaw(c.f.strong, small, l.value.c_str()).x;
+            OutlinedText(c, c.f.strong, small, left ? ix0 : (ix1 - vw), y, l.col, l.value.c_str());
+        } else {
+            const float vw = SizeOfRaw(c.f.body, small, l.value.c_str()).x;
+            const float lx = left ? ix0 : (ix1 - label_w - vw);
+            OutlinedText(c, c.f.body, small, lx, y, kDim, Tr(l.label.c_str()));
+            OutlinedText(c, c.f.body, small, lx + label_w, y, l.col, l.value.c_str());
         }
+        y += line;
+    }
+
+    if (graph) {
+        y += 4.0f * s;
+        bridge.CopyRecentFrames(graph_frames_);
+        const float gx0 = left ? ix0 : (ix1 - gw);
+        const float gx1 = gx0 + gw;
+        c.d->AddRectFilled(ImVec2(gx0, y), ImVec2(gx1, y + gh), Rgba(0, 0, 0, 120), 3.0f * s);
+        // Column = the slowest frame among the frames it covers (a spike is never averaged away)
+        const int cols = 80;
+        const int n = static_cast<int>(graph_frames_.size());
+        float worst = 0.0f;
+        for (const float f : graph_frames_) {
+            worst = std::max(worst, f);
+        }
+        const float scale = std::clamp(worst * 1.1f, 33.4f, 100.0f);
+        for (const float guide : {16.7f, 33.3f}) {
+            const float gy = y + gh - (guide / scale) * gh;
+            c.d->AddLine(ImVec2(gx0, gy), ImVec2(gx1, gy), Rgba(255, 255, 255, 46), 1.0f);
+            char gb[16];
+            std::snprintf(gb, sizeof(gb), "%.0f", guide);
+            c.d->AddText(c.f.body, 10.0f * s, ImVec2(gx0 + 2.0f * s, gy - 11.0f * s),
+                         Rgba(255, 255, 255, 110), gb);
+        }
+        if (n > 0) {
+            const float cw = gw / static_cast<float>(cols);
+            // Many frames: each column is the slowest of the frames it covers.
+            // Few frames: one frame per column, right-aligned.
+            for (int col = 0; col < cols; ++col) {
+                int i0 = 0;
+                int i1 = 0;
+                if (n >= cols) {
+                    i0 = (n * col) / cols;
+                    i1 = std::max(i0 + 1, (n * (col + 1)) / cols);
+                } else {
+                    i0 = n - cols + col;
+                    i1 = i0 + 1;
+                    if (i0 < 0) {
+                        continue;
+                    }
+                }
+                float f = 0.0f;
+                for (int i = i0; i < i1 && i < n; ++i) {
+                    f = std::max(f, graph_frames_[static_cast<std::size_t>(i)]);
+                }
+                const float bh = std::min(1.0f, f / scale) * gh;
+                const ImU32 bc = f > 33.4f ? red : (f > 20.0f ? amber : green);
+                c.d->AddRectFilled(ImVec2(gx0 + static_cast<float>(col) * cw, y + gh - bh),
+                                   ImVec2(gx0 + static_cast<float>(col + 1) * cw - 1.0f, y + gh),
+                                   bc);
+            }
+        }
+        char sb[32];
+        std::snprintf(sb, sizeof(sb), "%.0f ms", scale);
+        const float sw = SizeOfRaw(c.f.body, 10.0f * s, sb).x;
+        c.d->AddText(c.f.body, 10.0f * s, ImVec2(gx1 - sw - 2.0f * s, y + 1.0f * s),
+                     Rgba(255, 255, 255, 110), sb);
     }
 }
 

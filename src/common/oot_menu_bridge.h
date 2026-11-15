@@ -71,7 +71,9 @@ enum class FpsHudLevel : int {
     Off = 0,
     Simple = 1,
     Frametime = 2,
-    Detailed = 3,
+    Graph = 3,
+    Detailed = 4,
+    Dev = 5,
 };
 
 enum class FpsCorner : int {
@@ -166,6 +168,17 @@ struct TelemetrySnapshot {
     bool has_prompts = false;
     bool needs_restart = false;
     std::string upscaler_name = "Native";
+    // T6c performance overlay
+    double frametime_min_ms = 0.0;
+    double frametime_max_ms = 0.0;
+    u64 total_frames = 0;
+    u64 stutters = 0;          // frames over 50 ms since boot
+    bool host_stats_valid = false;
+    double emulation_speed = 0.0; // 1.0 = 100%
+    double game_fps = 0.0;        // the guest's own frame rate (PerfStats)
+    int shaders_building = 0;
+    u64 vram_used = 0;
+    u64 vram_budget = 0;
     std::vector<std::string> restart_reasons;
 };
 
@@ -275,6 +288,12 @@ public:
                            bool fsr4_failed, bool fsr3_supported, bool hdr_active);
     void RecordPresentSample(double frame_ms, bool is_generated = false);
     [[nodiscard]] TelemetrySnapshot GetTelemetry() const;
+    // The last frames' present-to-present times, oldest first (up to 240), for the graph
+    void CopyRecentFrames(std::vector<float>& out) const;
+    // From the Qt status bar update (emulation speed, guest FPS, shaders being built)
+    void UpdateHostStats(double emulation_speed, double game_fps, int shaders_building);
+    // From the present thread when the overlay shows VRAM (VK_EXT_memory_budget)
+    void UpdateVramStats(u64 used_bytes, u64 budget_bytes);
 
     // RomFS fonts + prompts directory discovered at boot
     void SetRomFsFontData(std::vector<u8> body_otf_bytes,
@@ -347,6 +366,8 @@ private:
     u64 window_real_frames_ = 0;
     double last_fps_ = 0.0;
     double last_base_fps_ = 0.0;
+    u64 total_frames_ = 0;
+    u64 stutters_ = 0;
 };
 
 } // namespace Common::OotMenu
