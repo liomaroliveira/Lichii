@@ -5,6 +5,7 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
 #include <cstdlib>
 #include <cstdio>
 #include <chrono>
@@ -16,6 +17,7 @@
 #endif
 
 #include "common/logging.h"
+#include "common/oot_menu_bridge.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -27,6 +29,73 @@
 #include "input_common/main.h"
 #include "lichii_cmd/emu_window/emu_window_sdl3.h"
 #include "lichii_cmd/lichii_icon.h"
+
+
+namespace {
+
+// OoT in-game menu (E45), as the Qt window: true when the game must not see the key.
+bool OotMenuKey(SDL_Scancode code, bool down, bool repeat) {
+    auto& menu = Common::OotMenu::Bridge::Instance();
+    if (!menu.IsOcarina()) {
+        return false;
+    }
+    if (down && !repeat) {
+        if (menu.MatchesMenuHotkey(code == SDL_SCANCODE_INSERT, code == SDL_SCANCODE_F1)) {
+            menu.ToggleMenu();
+            return true;
+        }
+        if (menu.MatchesCompactHotkey(code == SDL_SCANCODE_RSHIFT, code == SDL_SCANCODE_RCTRL,
+                                      code == SDL_SCANCODE_F4)) {
+            menu.ToggleCompact();
+            return true;
+        }
+        if (!menu.IsOpen() && code == SDL_SCANCODE_ESCAPE && menu.EscOpensMenu()) {
+            menu.ToggleMenu();
+            return true;
+        }
+    }
+    if (!menu.IsOpen()) {
+        return false;
+    }
+    using K = Common::OotMenu::Key;
+    std::optional<K> key;
+    switch (code) {
+    case SDL_SCANCODE_UP: case SDL_SCANCODE_W: key = K::Up; break;
+    case SDL_SCANCODE_DOWN: case SDL_SCANCODE_S: key = K::Down; break;
+    case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: key = K::Left; break;
+    case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: key = K::Right; break;
+    case SDL_SCANCODE_PAGEUP: key = K::PageUp; break;
+    case SDL_SCANCODE_PAGEDOWN: key = K::PageDown; break;
+    case SDL_SCANCODE_HOME: key = K::Home; break;
+    case SDL_SCANCODE_END: key = K::End; break;
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE: key = K::Confirm; break;
+    case SDL_SCANCODE_BACKSPACE: key = K::Back; break;
+    case SDL_SCANCODE_Q: key = K::TabPrev; break;
+    case SDL_SCANCODE_E: key = K::TabNext; break;
+    case SDL_SCANCODE_DELETE: key = K::Clear; break;
+    case SDL_SCANCODE_ESCAPE: key = K::Esc; break;
+    default: break;
+    }
+    if (key && !repeat) {
+        menu.PushKeyEvent(*key, down);
+    }
+    return true;
+}
+
+/// Mouse for the OoT menu; true when the game must not see it.
+bool OotMenuMouse(float x, float y, int button, int state) {
+    auto& menu = Common::OotMenu::Bridge::Instance();
+    if (!menu.ShouldSuppressGameInput()) {
+        return false;
+    }
+    menu.SetMousePosition(x, y);
+    if (button == SDL_BUTTON_LEFT || button == SDL_BUTTON_RIGHT) {
+        menu.SetMouseButton(button == SDL_BUTTON_LEFT ? 0 : 1, state != 0);
+    }
+    return true;
+}
+
+} // Anonymous namespace
 
 EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
@@ -245,14 +314,33 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
         return;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
+        if (OotMenuKey(event.key.scancode, event.key.down, event.key.repeat)) {
+            return;
+        }
         return OnKeyEvent(int(event.key.scancode), event.key.down ? 1 : 0);
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (auto& menu = Common::OotMenu::Bridge::Instance(); menu.ShouldSuppressGameInput()) {
+            menu.AddMouseWheel(event.wheel.y);
+        }
+        return;
     case SDL_EVENT_MOUSE_MOTION:
+        if (event.motion.which != SDL_TOUCH_MOUSEID &&
+            OotMenuMouse(event.motion.x * SDL_GetWindowPixelDensity(render_window),
+                         event.motion.y * SDL_GetWindowPixelDensity(render_window), 0, 0)) {
+            return;
+        }
         // ignore if it came from touch
         if (event.button.which != SDL_TOUCH_MOUSEID)
             OnMouseMotion(event.motion.x, event.motion.y);
         return;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (event.button.which != SDL_TOUCH_MOUSEID &&
+            OotMenuMouse(event.button.x * SDL_GetWindowPixelDensity(render_window),
+                         event.button.y * SDL_GetWindowPixelDensity(render_window),
+                         event.button.button, event.button.down ? 1 : 0)) {
+            return;
+        }
         // ignore if it came from touch
         if (event.button.which != SDL_TOUCH_MOUSEID)
             OnMouseButton(event.button.button, event.button.down ? 1 : 0, s32(event.button.x), s32(event.button.y));
