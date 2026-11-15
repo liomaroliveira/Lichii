@@ -176,6 +176,9 @@ void OotOverlay::Shutdown() {
         return;
     }
     ImGui::SetCurrentContext(ctx);
+    if (backend_ready_) {
+        (void)device.GetLogical().WaitIdle(); // nothing of ours may still be in flight
+    }
     CleanupRetired(true);
     for (auto& tex : live_textures_) {
         if (tex && tex->ds != VK_NULL_HANDLE && backend_ready_) {
@@ -184,6 +187,17 @@ void OotOverlay::Shutdown() {
         }
     }
     live_textures_.clear();
+    // E47: the atlas textures carry our GpuTex in BackendUserData (uploaded here, not by the
+    // backend). ImGui_ImplVulkan_Shutdown would read it as an ImGui_ImplVulkan_Texture and destroy
+    // garbage handles (SIGSEGV in RADV on every exit since pack-ab), so detach them first, as the
+    // RomFS font rebuild above already does.
+    if (ctx) {
+        for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
+            tex->SetTexID(ImTextureID_Invalid);
+            tex->BackendUserData = nullptr;
+            tex->SetStatus(ImTextureStatus_Destroyed);
+        }
+    }
     framebuffers_.clear();
     image_views_.clear();
     render_pass_.reset();
