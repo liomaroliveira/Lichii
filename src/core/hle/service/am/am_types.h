@@ -7,8 +7,20 @@
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/uuid.h"
 
 namespace Service::AM {
+
+/// Launch parameter with the user an application starts with (AccountPreselectedUser).
+constexpr u32 LaunchParameterAccountPreselectedUserMagic = 0xC79497CA;
+
+struct LaunchParameterAccountPreselectedUser {
+    u32 magic;
+    u32 is_account_selected;
+    Common::UUID current_user;
+    INSERT_PADDING_BYTES(0x70);
+};
+static_assert(sizeof(LaunchParameterAccountPreselectedUser) == 0x88);
 
 namespace Frontend {
 class FrontendApplet;

@@ -23,16 +23,6 @@ namespace Service::AM {
 
 namespace {
 
-constexpr u32 LaunchParameterAccountPreselectedUserMagic = 0xC79497CA;
-
-struct LaunchParameterAccountPreselectedUser {
-    u32 magic;
-    u32 is_account_selected;
-    Common::UUID current_user;
-    INSERT_PADDING_BYTES(0x70);
-};
-static_assert(sizeof(LaunchParameterAccountPreselectedUser) == 0x88);
-
 AppletStorageChannel& InitializeFakeCallerApplet(Core::System& system, std::shared_ptr<Applet>& applet) {
     applet->caller_applet_broker = std::make_shared<AppletDataBroker>(system);
     return applet->caller_applet_broker->GetInData();

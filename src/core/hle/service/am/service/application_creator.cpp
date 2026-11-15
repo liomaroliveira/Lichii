@@ -9,6 +9,7 @@
 #include "core/core.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/hle/kernel/k_system_control.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/am/applet.h"
@@ -64,6 +65,25 @@ Result CreateGuestApplication(SharedPointer<IApplicationAccessor>* out_applicati
     applet->applet_id = AppletId::Application;
     applet->type = AppletType::Application;
     applet->library_applet_mode = LibraryAppletMode::AllForeground;
+
+    // The home menu pushes a preselected user only when the game's NACP asks for an account at
+    // startup; the NACP a NUP builds does not, and without one the game panics reading the
+    // profile of user 0. Give it the current user, as a frontend boot does. A user the menu
+    // pushes later is popped first (the channel is read from the back).
+    {
+        LaunchParameterAccountPreselectedUser lp{};
+        lp.magic = LaunchParameterAccountPreselectedUserMagic;
+        lp.is_account_selected = 1;
+        Account::ProfileManager profile_manager{};
+        if (const auto uuid =
+                profile_manager.GetUser(static_cast<s32>(Settings::values.current_user));
+            uuid.has_value() && uuid->IsValid()) {
+            lp.current_user = *uuid;
+            std::vector<u8> buffer(sizeof(LaunchParameterAccountPreselectedUser));
+            std::memcpy(buffer.data(), &lp, buffer.size());
+            applet->preselected_user_launch_parameter.push_back(std::move(buffer));
+        }
+    }
 
     window_system.TrackApplet(applet, true);
 
