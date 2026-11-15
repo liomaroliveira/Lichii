@@ -486,8 +486,6 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
-    oot_performance_scale =
-        Settings::AppliedOcarinaRenderScale() == Settings::NvidiaDlssQuality::Performance;
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -3881,8 +3879,13 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // the game's later passes run as usual, with no linear stretch to the 4K composite.
     const bool game_pass_output =
         Settings::values.ocarina_fsr_output.GetValue() == Settings::OcarinaFsrOutput::OutputGame;
+    // Read every frame, not at rasterizer creation: in console mode (qlaunch) the rasterizer is
+    // made before the game applies its render-scale patch, which silently forced the game-pass
+    // path whatever output the menu showed (E47).
+    const bool performance_scale =
+        Settings::AppliedOcarinaRenderScale() == Settings::NvidiaDlssQuality::Performance;
     const bool three_quarter_1440p = upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
-                                     oot_performance_scale && !game_pass_output &&
+                                     performance_scale && !game_pass_output &&
                                      target.size.width == 2560 &&
                                      target.size.height == 1440;
     const bool pass_1440p = upscale_hash == ComputePipeline::Ocarina1440pShader ||

@@ -410,7 +410,7 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Força do filtro de nitidez AMD RCAS aplicado depois do FSR 3.1/4.1, na mesma escala da janela de configurações do Lichii: 0% desliga, 100% é o máximo. Muda ao vivo.",
          false, 0, 200, 10},
         {T::Graphics, RK::Toggle, "oot_aa", "Nitidez do Jogo (Nativo)",
-         "Só vale com o Upscaler em Nativo: mantém a reconstrução com nitidez original do jogo ou a troca por uma versão sem nitidez (sem halos). Com FSR 3.1/4.1 ligado, o FSR substitui esse passo do jogo e a nitidez passa a ser a do RCAS acima.",
+         "Nitidez original do jogo ou uma versão sem nitidez (sem halos). Com FSR 3.1/4.1 ligado a nitidez original fica sempre ativa e a opção trava em \"Nitidez Original\"; o RCAS acima soma nitidez por cima. \"Sem Nitidez\" só vale com o Upscaler em Nativo.",
          false, 0, 1, 1},
 
         {T::Graphics, RK::Heading, "h_win", "Janela e Pós-Processamento", "", false, 0, 0, 1},
@@ -713,6 +713,11 @@ int OotMenuController::ReadRowValue(const char* id, const PcOptions& opts) const
         return 200 - std::clamp(Settings::values.fsr_sharpening_slider.GetValue(), 0, 200);
     }
     if (std::strcmp(id, "oot_aa") == 0) {
+        // Show what runs, not what is stored (E47): with FSR on the rasterizer turns the bypass
+        // off (OotNetworkBypass), so the game's own sharpening is always there.
+        if (Settings::values.ocarina_fsr.GetValue()) {
+            return 0;
+        }
         return Settings::values.oot_anti_aliasing.GetValue() ==
                        Settings::OotAntiAliasing::NoSharpening
                    ? 1
