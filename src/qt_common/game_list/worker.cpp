@@ -485,6 +485,15 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         const auto res2 = loader->ReadProgramId(program_id);
 
         if (target == ScanTarget::FillManualContentProvider) {
+            // A NUP holds loose trees, not NCAs: register the archive itself as the program so the
+            // home menu (qlaunch) lists it (ns ListApplicationRecord) and can start it
+            // (am CreateApplication reads the raw Program entry and picks the loader by format).
+            if (res2 == Loader::ResultStatus::Success && file_type == Loader::FileType::NUP &&
+                program_id != 0 &&
+                provider->GetEntryRaw(program_id, FileSys::ContentRecordType::Program) == nullptr) {
+                provider->AddEntry(FileSys::TitleType::Application,
+                                   FileSys::ContentRecordType::Program, program_id, file);
+            }
             if (res2 == Loader::ResultStatus::Success && file_type == Loader::FileType::NCA) {
                 provider->AddEntry(FileSys::TitleType::Application,
                                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),

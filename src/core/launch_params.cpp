@@ -55,6 +55,29 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         // clang-format on
     };
 
+    // The Qt shortcuts pass "-qlaunch", "-hlaunch" and "-setup" as single words. getopt_long
+    // reads them as clusters of short options ("-q", "-l", ...) and rejects them, so they only
+    // worked after "--". Take them out before getopt sees them.
+    {
+        int kept = 1;
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "-qlaunch") == 0) {
+                p.launch_qlaunch = true;
+            } else if (strcmp(argv[i], "-hlaunch") == 0) {
+                p.launch_hlaunch = true;
+            } else if (strcmp(argv[i], "-setup") == 0) {
+                p.launch_setup = true;
+            } else {
+                argv[kept] = argv[i];
+                if (argv_w != nullptr) {
+                    argv_w[kept] = argv_w[i];
+                }
+                ++kept;
+            }
+        }
+        argc = kept;
+    }
+
     while (optind < argc) {
         if (int arg = getopt_long(argc, argv, "d:c:fhg:m:p:u:vi:nsx", long_options, &option_index); arg != -1) {
             switch (arg) {

@@ -34,6 +34,7 @@
 #include "core/hle/service/set/settings_server.h"
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
+#include "core/loader/nup.h"
 #include "core/memory/cheat_engine.h"
 
 namespace FileSys {
@@ -1622,6 +1623,22 @@ PatchManager::Metadata PatchManager::GetControlMetadata() const {
             const auto control_id = content_provider.HasEntry(*parent_title_id, ContentRecordType::Control) ? *parent_title_id : GetUpdateTitleID(*parent_title_id);
             const PatchManager parent{control_id, fs_controller, content_provider};
             return parent.GetControlMetadata();
+        }
+        // A NUP registered as the program has no control NCA: its loader builds the NACP and
+        // carries the icon from the archive's metadata (home menu title and icon).
+        if (const auto program = content_provider.GetEntryRaw(title_id, ContentRecordType::Program);
+            program != nullptr && NupContainer::IsNupFile(program)) {
+            Loader::AppLoader_NUP loader{program};
+            auto nacp = std::make_unique<NACP>();
+            if (loader.ReadControlData(*nacp) != Loader::ResultStatus::Success) {
+                return {};
+            }
+            std::vector<u8> icon;
+            VirtualFile icon_file;
+            if (loader.ReadIcon(icon) == Loader::ResultStatus::Success && !icon.empty()) {
+                icon_file = std::make_shared<VectorVfsFile>(std::move(icon), "icon.dat");
+            }
+            return {std::move(nacp), std::move(icon_file)};
         }
         return {};
     }
