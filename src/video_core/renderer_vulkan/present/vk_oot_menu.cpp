@@ -149,12 +149,13 @@ constexpr std::array<Settings::OcarinaFsrOutput, 4> kFsrOutputChoices{
     Settings::OcarinaFsrOutput::OutputGame,
 };
 // FSR modes, lightest first (E47): the game's render size; the name comes from the real ratio.
-constexpr std::array<Settings::OcarinaFsrRender, 5> kFsrRenderChoices{
-    Settings::OcarinaFsrRender::Render720p,  Settings::OcarinaFsrRender::Render844p,
-    Settings::OcarinaFsrRender::Render956p,  Settings::OcarinaFsrRender::Render1080p,
+// 956p and 844p are left out: FSR does not engage at those scales (E47 test 2026-11-15).
+constexpr std::array<Settings::OcarinaFsrRender, 3> kFsrRenderChoices{
+    Settings::OcarinaFsrRender::Render720p,
+    Settings::OcarinaFsrRender::Render1080p,
     Settings::OcarinaFsrRender::Render1440p,
 };
-constexpr int kFsrRenderDefaultIdx = 3; // 1920x1080
+constexpr int kFsrRenderDefaultIdx = 1; // 1920x1080
 
 /// Render size the game gets at boot for a render setting and FSR output (docked, 2560x1440 max).
 std::pair<u32, u32> FsrRenderSize(Settings::OcarinaFsrRender render,
@@ -284,11 +285,11 @@ struct UpscalePreset {
     int render_idx;
 };
 constexpr std::array<UpscalePreset, 7> kPresets{{
-    {"Atalho: FSR 4.1 + nitidez do jogo", 2, 3, 3},
-    {"FSR 4.1 Full HD", 2, 0, 3},
-    {"FSR 3.1 Full HD", 1, 0, 3},
-    {"FSR 4.1 1440p", 2, 1, 4},
-    {"FSR 4.1 saída 4K", 2, 2, 3},
+    {"Atalho: FSR 4.1 + nitidez do jogo", 2, 3, 1},
+    {"FSR 4.1 Full HD", 2, 0, 1},
+    {"FSR 3.1 Full HD", 1, 0, 1},
+    {"FSR 4.1 1440p", 2, 1, 2},
+    {"FSR 4.1 saída 4K", 2, 2, 1},
     {"Leve: FSR 3.1 720p > 1080p", 1, 0, 0},
     {"Nativo (sem FSR)", 0, -1, -1},
 }};
@@ -522,8 +523,8 @@ const std::vector<OotMenuController::RowDef>& AllRows() {
          "Resolução que o FSR 3.1/4.1 reconstrói. \"1440p + nitidez do jogo\" (padrão): com o jogo em 1080p, o FSR 4.1 reconstrói até 1440p no lugar do passo de escala do próprio jogo, e a nitidez padrão do jogo roda por cima; é o mais nítido. Full HD, 1440p e 4K reconstroem e depois esticam a imagem para 4K. Muda ao vivo (o FSR recomeça do zero por um instante).",
          false, 0, 3, 1},
         {T::Graphics, RK::Choice, "fsr_render", "Modo do FSR (render)",
-         "Resolução em que o jogo renderiza antes do FSR, como nos jogos de PC. O nome vem da razão real entre a saída do FSR e o render: Nativo (AA) 1:1, Ultra Qualidade 1,33x, Qualidade 1,5x, Equilibrado 1,7x, Desempenho 2x. Menos render alivia a GPU (Templo do Fogo) e deixa mais para o FSR reconstruir. Vale depois de reiniciar o jogo.",
-         true, 0, 4, 1},
+         "Resolução em que o jogo renderiza antes do FSR, como nos jogos de PC. O nome vem da razão real entre a saída do FSR e o render: Nativo (AA) 1:1, Ultra Qualidade 1,33x, Desempenho 2x. Menos render alivia a GPU (Templo do Fogo) e deixa mais para o FSR reconstruir. Vale depois de reiniciar o jogo.",
+         true, 0, 2, 1},
         {T::Graphics, RK::Choice, "res_scale", "Escala de Resolução",
          "Fator de escala geral do emulador quando o upscaler de cena está desligado ou em jogos gerais.",
          true, 0, 6, 1},

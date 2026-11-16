@@ -124,7 +124,9 @@ std::optional<NvidiaDlssQuality> OcarinaFsrRenderScale() {
         return NvidiaDlssQuality::UltraPerformance;
     case OcarinaFsrRender::Render956p:
     case OcarinaFsrRender::Render844p:
-        return std::nullopt; // OcarinaFsrOnlyRenderScale's patches
+        // E47: at these scales the game renders 1712x960 / 1504x848 and FSR never engages (the
+        // game's own upscale runs), so a stored value falls back to the 1080p default.
+        return NvidiaDlssQuality::Performance;
     default:
         // Don't leave boot render at 1440p when targeting 1080p output (would downscale/fail FSR).
         if (values.ocarina_fsr_output.GetValue() == OcarinaFsrOutput::Output1080p) {
@@ -144,10 +146,9 @@ std::optional<OcarinaFsrRender> OcarinaFsrOnlyRenderScale() {
         return std::nullopt;
     }
     const auto render = values.ocarina_fsr_render.GetValue();
-    if (render != OcarinaFsrRender::Render956p && render != OcarinaFsrRender::Render844p) {
-        return std::nullopt;
-    }
-    return render;
+    // Disabled (E47 test 2026-11-15): FSR is not taken at 956p/844p; see OcarinaFsrRenderScale.
+    (void)render;
+    return std::nullopt;
 }
 
 void SetAppliedOcarinaRenderHeight(u32 height) {
