@@ -1201,6 +1201,17 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (tonemapped.Address() == 0) {
         return false;
     }
+    // The heavy dispatch between the prepass and the network feeds only the network (port of
+    // the unused-dispatch skip of Lichii #1941), so it is skipped with them.
+    if (native_key == UnusedDispatchProgramKey &&
+        bypass->output_replaced.load(std::memory_order_relaxed)) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Skipping unused AA dispatch {:016x} after output replacement",
+                     native_key);
+        }
+        return true;
+    }
     if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
         return bypass->output_replaced.load(std::memory_order_relaxed);
     }

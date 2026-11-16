@@ -24,6 +24,8 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 
 // Native program keys of the network's compute passes.
 constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
+// The heavy dispatch between them (lowered shader hash d9ee412f00ce399a); match the native key.
+constexpr u64 UnusedDispatchProgramKey = 0x9387db798781f081ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
 

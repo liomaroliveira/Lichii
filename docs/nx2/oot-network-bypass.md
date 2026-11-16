@@ -66,5 +66,6 @@ The game's constants (shader hashes, program keys, the cb0 offset) are in
   keys the bypass does nothing.
 - B10G11R11 has little precision in dark tones: without the network's smoothing some banding
   shows in deep shadows.
-- The heavy dispatch between the prepass and the network still runs; its result goes unused.
+- The heavy dispatch between the prepass and the network (`9387db798781f081`) feeds only the
+  network, so it is skipped with them (port of Lichii #1941).
 - Vulkan only: other backends never learn the tonemapped image, so the setting has no effect there.
