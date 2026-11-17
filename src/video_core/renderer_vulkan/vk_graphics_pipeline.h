@@ -89,6 +89,16 @@ inline bool DrawReuseProbeEnabled() {
     return enabled;
 }
 
+/// EDEN_NX2_DRAW_REPEAT=1: counts consecutive draw state repetition across UBO, VB, IB, textures,
+/// SSBOs, pipeline, render target and dynamic state (RasterizerVulkan::NoteDrawRepeat).
+inline bool DrawRepeatEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_REPEAT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
@@ -172,6 +182,10 @@ public:
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }
+
+    /// EDEN_NX2_DRAW_REPEAT: FNV-1a 64-bit hash of the last draw's sampled textures, comparable
+    /// across full and delta paths.
+    [[nodiscard]] u64 DrawRepeatTexturesHash(bool is_delta) const noexcept;
 
     bool SupportsAlphaToCoverage() const noexcept {
         return fragment_has_color0_output;

@@ -2057,6 +2057,59 @@ u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool tex
 }
 
 template <class P>
+typename BufferCache<P>::DrawRepeatBufferState BufferCache<P>::CaptureDrawRepeatState() const {
+    DrawRepeatBufferState state{};
+    u64 ubo_hash = 0xcbf29ce484222325ULL;
+    const auto mix_ubo = [&](u64 value) { ubo_hash = (ubo_hash ^ value) * 0x100000001b3ULL; };
+    const auto* const sizes = channel_state->uniform_buffer_sizes;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const u32 mask = channel_state->enabled_uniform_buffer_masks[stage];
+        state.ubo_masks[stage] = mask;
+        mix_ubo(mask);
+        ForEachEnabledBit(mask, [&](u32 index) {
+            if (index == 17 && maxwell3d->root_tables.loaded &&
+                channel_state->uniform_buffers[stage][index].size == 0) {
+                const auto& words = maxwell3d->root_tables.tables[0];
+                const u32 size = sizes ? (*sizes)[stage][index] : static_cast<u32>(sizeof(words));
+                const u32 word_count =
+                    (std::min)(size, static_cast<u32>(sizeof(words))) / static_cast<u32>(sizeof(u32));
+                u64 root_hash = 0xcbf29ce484222325ULL;
+                for (u32 w = 0; w < word_count; ++w) {
+                    root_hash = (root_hash ^ words[w]) * 0x100000001b3ULL;
+                }
+                state.ubo_slots[stage][index] = {root_hash, size};
+                mix_ubo(index);
+                mix_ubo(root_hash);
+                mix_ubo(size);
+            } else {
+                const Binding& binding = channel_state->uniform_buffers[stage][index];
+                state.ubo_slots[stage][index] = {binding.device_addr, binding.size};
+                mix_ubo(index);
+                mix_ubo(binding.device_addr);
+                mix_ubo(binding.size);
+            }
+        });
+    }
+    state.ubo_all_hash = ubo_hash;
+
+    u64 vb_hash = 0xcbf29ce484222325ULL;
+    const auto mix_vb = [&](u64 value) { vb_hash = (vb_hash ^ value) * 0x100000001b3ULL; };
+    mix_vb(enabled_vertex_buffers_mask);
+    ForEachEnabledBit(enabled_vertex_buffers_mask, [&](u32 index) {
+        const Binding& binding = VertexBufferSlot(index);
+        const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
+        mix_vb(index);
+        mix_vb(binding.device_addr);
+        mix_vb(binding.size);
+        mix_vb(stride);
+    });
+    state.vb_hash = vb_hash;
+
+    state.ssbo_hash = KeptGraphicsBindingsHash(false, true, false);
+    return state;
+}
+
+template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (is_indexed) {
         BindHostIndexBuffer();

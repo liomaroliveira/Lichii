@@ -584,6 +584,46 @@ private:
     void TickDrawReuse();
     DrawReuseProbe draw_reuse;
 
+    /// EDEN_NX2_DRAW_REPEAT: counts how often consecutive draws repeat each state group.
+    struct DrawRepeatStats {
+        bool has_prev{};
+        u64 prev_ubo_all_hash{};
+        std::array<u32, VideoCommon::NUM_STAGES> prev_ubo_masks{};
+        std::array<std::array<std::pair<u64, u32>, VideoCommon::NUM_GRAPHICS_UNIFORM_BUFFERS>,
+                   VideoCommon::NUM_STAGES>
+            prev_ubo_slots{};
+        u64 prev_vb_hash{};
+        bool has_prev_ib{};
+        u64 prev_ib_hash{};
+        u64 prev_tex_hash{};
+        u64 prev_ssbo_hash{};
+        const GraphicsPipeline* prev_pipeline{};
+        VkFramebuffer prev_fb{VK_NULL_HANDLE};
+        VkRenderPass prev_rp{VK_NULL_HANDLE};
+        u64 prev_dyn_hash{};
+        Maxwell::PrimitiveTopology prev_topology{};
+
+        u64 window_start{};
+        u64 draws{};
+        u64 full_draws{};
+        u64 delta_draws{};
+        u64 ubo_all_same{};
+        u64 ubo_slots_total{};
+        u64 ubo_slots_same{};
+        u64 vb_same{};
+        u64 indexed_draws{};
+        u64 ib_same{};
+        u64 tex_same{};
+        u64 full_tex_same{};
+        u64 ssbo_same{};
+        u64 pipe_same{};
+        u64 rt_same{};
+        u64 dyn_clean{};
+        u64 dyn_same{};
+    };
+    void NoteDrawRepeat(const GraphicsPipeline& pipeline, bool is_indexed, DrawPath path);
+    DrawRepeatStats draw_repeat;
+
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     bool taken_relookup{};

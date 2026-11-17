@@ -549,6 +549,18 @@ public:
     /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
     [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
+    /// EDEN_NX2_DRAW_REPEAT: snapshot of the graphics UBO, VB and SSBO bindings for consecutive
+    /// draw repetition counters.
+    struct DrawRepeatBufferState {
+        u64 ubo_all_hash{};
+        u64 vb_hash{};
+        u64 ssbo_hash{};
+        std::array<u32, NUM_STAGES> ubo_masks{};
+        std::array<std::array<std::pair<u64, u32>, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+            ubo_slots{};
+    };
+    [[nodiscard]] DrawRepeatBufferState CaptureDrawRepeatState() const;
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {

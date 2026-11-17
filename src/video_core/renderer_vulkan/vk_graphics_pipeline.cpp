@@ -1038,7 +1038,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         ReportTextureMemo();
     }
-    if (RecordingSampledTextures() || DrawReuseProbeEnabled()) {
+    if (RecordingSampledTextures() || DrawReuseProbeEnabled() || DrawRepeatEnabled()) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};
@@ -1353,6 +1353,38 @@ void GraphicsPipeline::TakeDeltaStateFrom(GraphicsPipeline& other) noexcept {
     kept_images_valid = std::exchange(other.kept_images_valid, false);
     NextDeltaGeneration();
     other.NextDeltaGeneration();
+}
+
+u64 GraphicsPipeline::DrawRepeatTexturesHash(bool is_delta) const noexcept {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+    if (is_delta) {
+        mix(delta_samplers.size());
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < configured_stages.size(); ++stage) {
+            if (!configured_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                if (view_index < delta_views.size() && sampler_index < delta_samplers.size()) {
+                    mix((u64{delta_views[view_index].id.index} << 32) |
+                        delta_samplers[sampler_index].index);
+                }
+            }
+            view_index += Shader::NumDescriptors(info.image_descriptors);
+        }
+    } else {
+        mix(sampled_images.size());
+        for (const auto& img : sampled_images) {
+            mix((u64{img.id.index} << 32) | img.sampler.index);
+        }
+    }
+    return hash;
 }
 
 bool GraphicsPipeline::ReadRawHandles(std::vector<u32>& out, std::vector<u32>* computed) const {

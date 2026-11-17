@@ -13,8 +13,10 @@
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <tuple>
+#include <type_traits>
 #include <set>
 #include <span>
 #include <fstream>
@@ -990,6 +992,255 @@ void RasterizerVulkan::TickDrawReuse() {
     probe.window_start = now;
 }
 
+void RasterizerVulkan::NoteDrawRepeat(const GraphicsPipeline& pipeline, bool is_indexed,
+                                      DrawPath path) {
+    auto& stats = draw_repeat;
+    ++stats.draws;
+    if (path == DrawPath::Delta) {
+        ++stats.delta_draws;
+    } else {
+        ++stats.full_draws;
+    }
+
+    const auto cur = buffer_cache.CaptureDrawRepeatState();
+    if (stats.has_prev && cur.ubo_all_hash == stats.prev_ubo_all_hash) {
+        ++stats.ubo_all_same;
+    }
+    for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
+        u32 mask = cur.ubo_masks[stage];
+        while (mask != 0) {
+            const u32 index = static_cast<u32>(std::countr_zero(mask));
+            mask &= mask - 1;
+            ++stats.ubo_slots_total;
+            if (stats.has_prev && ((stats.prev_ubo_masks[stage] >> index) & 1U) != 0 &&
+                stats.prev_ubo_slots[stage][index] == cur.ubo_slots[stage][index]) {
+                ++stats.ubo_slots_same;
+            }
+        }
+    }
+    if (stats.has_prev && cur.vb_hash == stats.prev_vb_hash) {
+        ++stats.vb_same;
+    }
+    if (stats.has_prev && cur.ssbo_hash == stats.prev_ssbo_hash) {
+        ++stats.ssbo_same;
+    }
+
+    if (is_indexed) {
+        const auto& ib = maxwell3d->draw_manager.draw_state.index_buffer;
+        u64 ib_hash = 0xcbf29ce484222325ULL;
+        const auto mix_ib = [&](u64 value) { ib_hash = (ib_hash ^ value) * 0x100000001b3ULL; };
+        mix_ib(ib.StartAddress());
+        mix_ib(ib.EndAddress());
+        mix_ib(static_cast<u64>(ib.format));
+        ++stats.indexed_draws;
+        if (stats.has_prev_ib && ib_hash == stats.prev_ib_hash) {
+            ++stats.ib_same;
+        }
+        stats.prev_ib_hash = ib_hash;
+        stats.has_prev_ib = true;
+    }
+
+    const u64 tex_hash = pipeline.DrawRepeatTexturesHash(path == DrawPath::Delta);
+    if (stats.has_prev && tex_hash == stats.prev_tex_hash) {
+        ++stats.tex_same;
+        if (path == DrawPath::Full) {
+            ++stats.full_tex_same;
+        }
+    }
+
+    if (stats.has_prev && &pipeline == stats.prev_pipeline) {
+        ++stats.pipe_same;
+    }
+
+    const Framebuffer* const fb = texture_cache.GetFramebuffer();
+    const VkFramebuffer fb_h = fb ? fb->Handle() : VK_NULL_HANDLE;
+    const VkRenderPass rp_h = fb ? fb->RenderPass() : VK_NULL_HANDLE;
+    if (stats.has_prev && fb_h == stats.prev_fb && rp_h == stats.prev_rp) {
+        ++stats.rt_same;
+    }
+
+    static const Tegra::Engines::Maxwell3D::DirtyState::Flags dyn_dirty_mask = [] {
+        Tegra::Engines::Maxwell3D::DirtyState::Flags mask{};
+        static constexpr u8 flags_list[]{
+            Dirty::Viewports,
+            VideoCommon::Dirty::RescaleViewports,
+            Dirty::Scissors,
+            VideoCommon::Dirty::RescaleScissors,
+            Dirty::DepthBias,
+            VideoCommon::Dirty::DepthBiasGlobal,
+            Dirty::BlendConstants,
+            Dirty::DepthBounds,
+            Dirty::StencilProperties,
+            Dirty::StencilReference,
+            Dirty::StencilWriteMask,
+            Dirty::StencilCompare,
+            Dirty::LineWidth,
+            Dirty::CullMode,
+            Dirty::DepthBoundsEnable,
+            Dirty::DepthTestEnable,
+            Dirty::DepthWriteEnable,
+            Dirty::DepthCompareOp,
+            Dirty::FrontFace,
+            Dirty::StencilOp,
+            Dirty::StencilTestEnable,
+            Dirty::StateEnable,
+            Dirty::PrimitiveRestartEnable,
+            Dirty::RasterizerDiscardEnable,
+            Dirty::DepthBiasEnable,
+            Dirty::LogicOp,
+            Dirty::LogicOpEnable,
+            Dirty::DepthClampEnable,
+            Dirty::LineRasterizationMode,
+            Dirty::LineStippleEnable,
+            Dirty::LineStippleParams,
+            Dirty::ConservativeRasterizationMode,
+            Dirty::AlphaToCoverageEnable,
+            Dirty::AlphaToOneEnable,
+            Dirty::Blending,
+            Dirty::BlendEnable,
+            Dirty::BlendEquations,
+            Dirty::ColorMask,
+            Dirty::VertexInput,
+            VideoCommon::Dirty::VertexBuffers,
+        };
+        for (const u8 flag : flags_list) {
+            mask[flag] = true;
+        }
+        return mask;
+    }();
+    const auto topology = maxwell3d->draw_manager.draw_state.topology;
+    if (stats.has_prev && topology == stats.prev_topology &&
+        (maxwell3d->dirty.flags & dyn_dirty_mask).none()) {
+        ++stats.dyn_clean;
+    }
+
+    const auto& regs = maxwell3d->regs;
+    u64 dyn_hash = 0xcbf29ce484222325ULL;
+    const auto mix_dyn = [&](u64 value) { dyn_hash = (dyn_hash ^ value) * 0x100000001b3ULL; };
+    const auto mix_reg = [&](const auto& obj) {
+        using T = std::remove_cvref_t<decltype(obj)>;
+        static_assert(std::is_trivially_copyable_v<T>);
+        static_assert(sizeof(T) % sizeof(u32) == 0);
+        std::array<u32, sizeof(T) / sizeof(u32)> words;
+        std::memcpy(words.data(), &obj, sizeof(T));
+        for (const u32 w : words) {
+            mix_dyn(w);
+        }
+    };
+    mix_reg(regs.viewport_transform[0]);
+    mix_reg(regs.viewports[0]);
+    mix_reg(regs.viewport_scale_offset_enabled);
+    mix_reg(regs.window_origin);
+    mix_reg(regs.scissor_test[0]);
+    mix_reg(regs.depth_bias);
+    mix_reg(regs.depth_bias_clamp);
+    mix_reg(regs.slope_scale_depth_bias);
+    mix_reg(regs.polygon_offset_point_enable);
+    mix_reg(regs.polygon_offset_line_enable);
+    mix_reg(regs.polygon_offset_fill_enable);
+    mix_reg(regs.blend_color);
+    mix_reg(regs.depth_bounds);
+    mix_reg(regs.depth_bounds_enable);
+    mix_reg(regs.stencil_enable);
+    mix_reg(regs.stencil_two_side_enable);
+    mix_reg(regs.stencil_front_op);
+    mix_reg(regs.stencil_front_ref);
+    mix_reg(regs.stencil_front_func_mask);
+    mix_reg(regs.stencil_front_mask);
+    mix_reg(regs.stencil_back_op);
+    mix_reg(regs.stencil_back_ref);
+    mix_reg(regs.stencil_back_func_mask);
+    mix_reg(regs.stencil_back_mask);
+    mix_reg(regs.line_width_smooth);
+    mix_reg(regs.line_width_aliased);
+    mix_reg(regs.line_anti_alias_enable);
+    mix_reg(regs.line_stipple_enable);
+    mix_reg(regs.line_stipple_params);
+    mix_reg(regs.gl_cull_test_enabled);
+    mix_reg(regs.gl_cull_face);
+    mix_reg(regs.gl_front_face);
+    mix_reg(regs.depth_test_enable);
+    mix_reg(regs.depth_test_func);
+    mix_reg(regs.depth_write_enabled);
+    mix_reg(regs.primitive_restart);
+    mix_reg(regs.rasterize_enable);
+    mix_reg(regs.logic_op);
+    mix_reg(regs.viewport_clip_control);
+    mix_reg(regs.conservative_raster_enable);
+    mix_reg(regs.anti_alias_alpha_control);
+    mix_reg(regs.color_mask_common);
+    mix_reg(regs.color_mask);
+    mix_reg(regs.blend_per_target_enabled);
+    mix_reg(regs.blend);
+    mix_reg(regs.blend_per_target);
+    mix_reg(regs.vertex_attrib_format);
+    mix_reg(regs.vertex_stream_instances);
+    for (const auto& stream : regs.vertex_streams) {
+        mix_dyn(stream.frequency);
+    }
+    mix_dyn(static_cast<u64>(topology));
+    if (stats.has_prev && dyn_hash == stats.prev_dyn_hash) {
+        ++stats.dyn_same;
+    }
+
+    stats.prev_ubo_all_hash = cur.ubo_all_hash;
+    stats.prev_ubo_masks = cur.ubo_masks;
+    stats.prev_ubo_slots = cur.ubo_slots;
+    stats.prev_vb_hash = cur.vb_hash;
+    stats.prev_ssbo_hash = cur.ssbo_hash;
+    stats.prev_tex_hash = tex_hash;
+    stats.prev_pipeline = &pipeline;
+    stats.prev_fb = fb_h;
+    stats.prev_rp = rp_h;
+    stats.prev_dyn_hash = dyn_hash;
+    stats.prev_topology = topology;
+    stats.has_prev = true;
+
+    const u64 now = VideoCommon::Nx2Profile::Now();
+    if (stats.window_start == 0) {
+        stats.window_start = now;
+        return;
+    }
+    if (now - stats.window_start < 10'000'000'000ULL) {
+        return;
+    }
+    const double secs = static_cast<double>(now - stats.window_start) / 1e9;
+    const auto pct = [](u64 num, u64 den) {
+        return den == 0 ? 0.0 : 100.0 * static_cast<double>(num) / static_cast<double>(den);
+    };
+    LOG_INFO(Render_Vulkan,
+             "Nx2DrawRepeat per second: draws {:.0f} (full {:.1f}% delta {:.1f}%) | "
+             "ubo_all {:.1f}% ubo_slot {:.1f}% | vb {:.1f}% ib {:.1f}% (idx {:.0f}) | "
+             "tex {:.1f}% (full_tex {:.1f}%) | ssbo {:.1f}% | pipe {:.1f}% | rt {:.1f}% | "
+             "dyn_clean {:.1f}% dyn_same {:.1f}%",
+             static_cast<double>(stats.draws) / secs, pct(stats.full_draws, stats.draws),
+             pct(stats.delta_draws, stats.draws), pct(stats.ubo_all_same, stats.draws),
+             pct(stats.ubo_slots_same, stats.ubo_slots_total), pct(stats.vb_same, stats.draws),
+             pct(stats.ib_same, stats.indexed_draws),
+             static_cast<double>(stats.indexed_draws) / secs, pct(stats.tex_same, stats.draws),
+             pct(stats.full_tex_same, stats.full_draws), pct(stats.ssbo_same, stats.draws),
+             pct(stats.pipe_same, stats.draws), pct(stats.rt_same, stats.draws),
+             pct(stats.dyn_clean, stats.draws), pct(stats.dyn_same, stats.draws));
+
+    stats.draws = 0;
+    stats.full_draws = 0;
+    stats.delta_draws = 0;
+    stats.ubo_all_same = 0;
+    stats.ubo_slots_total = 0;
+    stats.ubo_slots_same = 0;
+    stats.vb_same = 0;
+    stats.indexed_draws = 0;
+    stats.ib_same = 0;
+    stats.tex_same = 0;
+    stats.full_tex_same = 0;
+    stats.ssbo_same = 0;
+    stats.pipe_same = 0;
+    stats.rt_same = 0;
+    stats.dyn_clean = 0;
+    stats.dyn_same = 0;
+    stats.window_start = now;
+}
+
 // Experimental adaptation of PokeDinner commit 76df4591a747: execute the reset shader's
 // indirect record writes on the host until general GPU-address translation is available.
 bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) {
@@ -1510,6 +1761,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         reuse = NoteDrawReuse(*pipeline, is_indexed);
         reuse_path = path;
         reuse_probe_ns = VideoCommon::Nx2Profile::Now() - probe_start;
+    }
+    if (DrawRepeatEnabled()) {
+        NoteDrawRepeat(*pipeline, is_indexed, path);
     }
 
     TrackOcarinaCamera();
