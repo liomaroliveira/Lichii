@@ -531,6 +531,9 @@ private:
     bool texture_memo_eligible{};
     /// Textures only, their handles read or computed (CanRetexture).
     bool retexture_eligible{};
+    /// EDEN_NX2_SSBO_KEEP: true when every storage buffer descriptor across enabled stages is
+    /// direct (indirect_offset == ~0U) and the total count is <= 32.
+    bool storage_keep_eligible{};
     VideoCommon::SampledTextureMemo texture_memo;
     bool writes_images{};
 

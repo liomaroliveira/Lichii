@@ -108,6 +108,32 @@ struct Binding {
     u32 segment_count{};
 };
 
+/// EDEN_NX2_SSBO_KEEP=1: keep unchanged graphics SSBO bindings across draws and watch their
+/// synchronized ranges.
+inline bool SsboKeepEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_SSBO_KEEP");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_SSBO_KEEP_VERIFY=1: run the full graphics SSBO path alongside EDEN_NX2_SSBO_KEEP
+/// and log any mismatch in bindings or synchronization.
+inline bool SsboKeepVerifyEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_SSBO_KEEP_VERIFY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+struct GraphicsStorageSnapshot {
+    std::array<u64, NUM_STAGES> enabled{};
+    std::array<u64, NUM_STAGES> written{};
+    std::array<std::array<Binding, NUM_STORAGE_BUFFERS>, NUM_STAGES> bindings{};
+};
+
 struct MultiRangeSegment {
     BufferId buffer_id;
     DAddr device_addr{};
@@ -574,6 +600,33 @@ public:
     /// nothing is kept).
     void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
 
+    void BindToChannel(s32 id) override {
+        VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo>::BindToChannel(id);
+        if (storage_keep.channel != channel_state) {
+            storage_keep.valid = false;
+            storage_keep.active_for_draw = false;
+        }
+    }
+
+    /// EDEN_NX2_SSBO_KEEP: true when the previous draw's direct graphics SSBO bindings still hold
+    /// for `pipeline`. Without EDEN_NX2_SSBO_KEEP_VERIFY, marks the current draw as keeping them.
+    [[nodiscard]] bool TryKeepGraphicsStorageBuffers(const void* pipeline);
+
+    void NoteStorageKeepFull() noexcept {
+        ++storage_keep_stats.full;
+    }
+
+    void BeginCaptureGraphicsStorage(const void* pipeline, bool eligible);
+
+    void EndCaptureGraphicsStorage() noexcept;
+
+    void SnapshotGraphicsStorageBuffers();
+
+    void VerifyGraphicsStorageBuffers(u64 pipeline_hash,
+                                      const std::array<bool, NUM_STAGES>& stages);
+
+    void ReportStorageKeepStats();
+
     Common::SpinRecursiveMutex mutex{Common::ContentionLock::BufferCache};
     Runtime& runtime;
     bool any_buffer_uploaded = false;
@@ -713,6 +766,9 @@ private:
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
 
+    /// SynchronizeBuffer for graphics storage buffer slots (memory tracker slots 33-63).
+    void SynchronizeStorageBuffer(u32 slot_offset, BufferId buffer_id, DAddr device_addr, u32 size);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -828,6 +884,45 @@ private:
         u64 deletions{};
     };
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    static constexpr u32 STORAGE_SYNC_BASE = 33;
+    static constexpr u32 STORAGE_SYNC_SLOTS = 31;
+    static_assert(NUM_VERTEX_BUFFERS + 1 <= STORAGE_SYNC_BASE);
+    static_assert(STORAGE_SYNC_BASE + STORAGE_SYNC_SLOTS <= 64);
+    std::array<GeometrySync, STORAGE_SYNC_SLOTS> storage_syncs{};
+
+    struct StorageSource {
+        u8 stage{};
+        u8 cbuf_index{};
+        GPUVAddr gpu_addr{};
+        DAddr dev_addr{};
+    };
+    struct StorageKeep {
+        const void* pipeline{};
+        const BufferCacheChannelInfo* channel{};
+        const Tegra::MemoryManager* gpu_memory{};
+        u64 map_serial{};
+        u64 deletions{};
+        bool native_turing{};
+        bool valid{};           ///< True if channel_state->storage_buffers is preserved from previous draw
+        bool active_for_draw{}; ///< True during the current draw if ReadHandles skipped rebinding SSBOs
+        bool has_multi_range{}; ///< True if the kept draw had any multi-range SSBO in graphics_segments
+        bool capturing{};       ///< True while recording direct SSBO sources for the current draw
+        bool capture_ok{};      ///< True if all SSBOs seen during capture are eligible for keeping
+        u32 num_sources{};
+        std::array<StorageSource, 32> sources{};
+    } storage_keep;
+    struct StorageKeepStats {
+        u64 kept{};
+        u64 full{};
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+        u64 sync_verify_mismatches{};
+        u64 window_start{};
+    } storage_keep_stats;
+    u32 storage_keep_verify_logged{};
+    u32 storage_keep_sync_verify_logged{};
+    std::unique_ptr<GraphicsStorageSnapshot> storage_verify_snapshot;
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged

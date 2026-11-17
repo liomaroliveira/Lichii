@@ -443,6 +443,21 @@ GraphicsPipeline::GraphicsPipeline(
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
                info.image_descriptors.empty();
     });
+    storage_keep_eligible = [&] {
+        size_t total_ssbos{};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!stage_enabled[stage]) {
+                continue;
+            }
+            for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                if (desc.indirect_offset != ~0U) {
+                    return false;
+                }
+                ++total_ssbos;
+            }
+        }
+        return total_ssbos <= 32;
+    }();
     writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
         return any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
@@ -820,9 +835,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     const bool resolve_in_full{!memo_hit || verify_memo};
 
+    const bool ssbo_keep_enabled = VideoCommon::SsboKeepEnabled();
+    bool keep_ssbo = false;
+    bool verify_ssbo = false;
+    if (ssbo_keep_enabled) {
+        if (buffer_cache.TryKeepGraphicsStorageBuffers(this)) {
+            if (VideoCommon::SsboKeepVerifyEnabled()) {
+                verify_ssbo = true;
+                buffer_cache.SnapshotGraphicsStorageBuffers();
+                buffer_cache.BeginCaptureGraphicsStorage(this, storage_keep_eligible);
+            } else {
+                keep_ssbo = true;
+            }
+        } else {
+            buffer_cache.NoteStorageKeepFull();
+            buffer_cache.BeginCaptureGraphicsStorage(this, storage_keep_eligible);
+        }
+    }
+
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        {
+        if (!keep_ssbo) {
             const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
             buffer_cache.UnbindGraphicsStorageBuffers(stage);
             if constexpr (Spec::has_storage_buffers) {
@@ -986,6 +1019,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             config_stage(4);
+        }
+        if (ssbo_keep_enabled) {
+            if (!keep_ssbo) {
+                buffer_cache.EndCaptureGraphicsStorage();
+                if (verify_ssbo) {
+                    buffer_cache.VerifyGraphicsStorageBuffers(key.Hash(), Spec::enabled_stages);
+                }
+            }
+            buffer_cache.ReportStorageKeepStats();
         }
     }
     Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
@@ -1592,19 +1634,41 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
-        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            if (!configured_stages[stage]) {
-                continue;
+        const auto bind_ssbos = [&]() LAMBDA_FORCEINLINE {
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!configured_stages[stage]) {
+                    continue;
+                }
+                buffer_cache.UnbindGraphicsStorageBuffers(stage);
+                size_t ssbo_index{};
+                for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                    ASSERT(desc.count == 1);
+                    buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                           desc.cbuf_offset, desc.is_written,
+                                                           desc.indirect_offset);
+                    ++ssbo_index;
+                }
             }
-            buffer_cache.UnbindGraphicsStorageBuffers(stage);
-            size_t ssbo_index{};
-            for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
-                ASSERT(desc.count == 1);
-                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
-                ++ssbo_index;
+        };
+        if (VideoCommon::SsboKeepEnabled()) {
+            const bool can_keep = buffer_cache.TryKeepGraphicsStorageBuffers(this);
+            const bool verify_ssbo = can_keep && VideoCommon::SsboKeepVerifyEnabled();
+            if (!can_keep || verify_ssbo) {
+                if (verify_ssbo) {
+                    buffer_cache.SnapshotGraphicsStorageBuffers();
+                } else {
+                    buffer_cache.NoteStorageKeepFull();
+                }
+                buffer_cache.BeginCaptureGraphicsStorage(this, storage_keep_eligible);
+                bind_ssbos();
+                buffer_cache.EndCaptureGraphicsStorage();
+                if (verify_ssbo) {
+                    buffer_cache.VerifyGraphicsStorageBuffers(key.Hash(), configured_stages);
+                }
             }
+            buffer_cache.ReportStorageKeepStats();
+        } else {
+            bind_ssbos();
         }
     }
     {
