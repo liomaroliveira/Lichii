@@ -2082,6 +2082,10 @@ void RasterizerVulkan::DrawIndirect() {
     buffer_cache.SetDrawIndirect(nullptr);
 }
 
+bool RasterizerVulkan::OotTemporalReplacing() {
+    return OcarinaTemporalEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed());
+}
+
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
     // Temporal upscaling replaces the same output pass and takes precedence until it fails.
     if (OcarinaTemporalEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {

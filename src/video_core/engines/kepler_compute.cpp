@@ -1183,6 +1183,23 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
 
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
+    // E54.T17 test: with temporal upscaling replacing the output pass, the upscaler samples the
+    // tonemapped image, so the network's passes may be unused. EDEN_NX2_OOT_TEMPORAL_SKIP_NET=1
+    // skips them while the temporal upscaler is on and has not failed.
+    static const bool skip_net_temporal = [] {
+        const char* const value = std::getenv("EDEN_NX2_OOT_TEMPORAL_SKIP_NET");
+        const bool on = value && value[0] == '1';
+        if (on) {
+            LOG_INFO(HW_GPU, "Ocarina of Time: network passes skipped under temporal upscaling");
+        }
+        return on;
+    }();
+    if (skip_net_temporal && program_id == ProgramId &&
+        (native_key == PrepassProgramKey || native_key == NetworkProgramKey ||
+         native_key == HeavyDispatchProgramKey) &&
+        rasterizer->OotTemporalReplacing()) {
+        return true;
+    }
     if (!BypassEnabled(program_id)) {
         return false;
     }

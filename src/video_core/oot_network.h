@@ -26,6 +26,8 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
+/// The heavy dispatch between the prepass and the network (Lichii #1941).
+constexpr u64 HeavyDispatchProgramKey = 0x9387db798781f081ULL;
 
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
 /// (the scene image the rest of the frame uses).

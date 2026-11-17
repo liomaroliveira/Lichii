@@ -349,6 +349,11 @@ public:
 
     /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
     /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
+    /// Ocarina of Time: the temporal upscaler is on and has not failed (it replaces the network's
+    /// output pass).
+    [[nodiscard]] virtual bool OotTemporalReplacing() {
+        return false;
+    }
     [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
         return nullptr;
     }
