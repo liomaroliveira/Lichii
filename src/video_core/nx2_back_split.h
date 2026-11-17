@@ -782,31 +782,59 @@ inline void EmitTask(RingState::AsyncFn fn, const void* data, size_t bytes) {
     g_state.PushTask(fn, data, bytes);
 }
 
+/// E04.T6d F2: the packets below are dead (GPUBackB only XORs them); they are sent only with
+/// EDEN_NX2_BACK_SPLIT_DEAD_PACKETS=1 (the old behavior, as a control).
+inline const bool g_dead_packets = [] {
+    const char* value = std::getenv("EDEN_NX2_BACK_SPLIT_DEAD_PACKETS");
+    return value != nullptr && value[0] == '1';
+}();
+
 inline void EmitCbUpload(u64 gpu_addr, const u32* data, u32 count) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushCbUpload(gpu_addr, data, count);
 }
 
 inline void EmitDraw(bool draw_indexed, bool indirect, u32 instance_count) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushDraw(draw_indexed, indirect, instance_count);
 }
 
 inline void EmitDrawTexture() {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushDrawTexture();
 }
 
 inline void EmitClear(u32 layer_count) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushClear(layer_count);
 }
 
 inline void EmitLaunchDma(u64 src_addr, u64 dst_addr, u64 byte_size_and_flags) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushLaunchDma(src_addr, dst_addr, byte_size_and_flags);
 }
 
 inline void EmitInlineUpload(u64 dst_addr, const void* data, size_t bytes) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushInlineUpload(dst_addr, data, bytes);
 }
 
 inline void EmitQuery(u64 gpu_addr, u64 payload, u64 meta) {
+    if (!g_dead_packets) [[likely]] {
+        return;
+    }
     g_state.PushQuery(gpu_addr, payload, meta);
 }
 
