@@ -16,12 +16,17 @@
 #include "video_core/nx2_back_split_rasterizer.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_stats.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/nx2_read_trace.h"
 
 namespace VideoCommon::BackSplit {
 
 void OnBThreadStart() {
     VideoCommon::GpuSplit::MarkBackThread();
+}
+
+void OnBLoopTick() {
+    Nx2Profile::Report("GPU back B thread", true);
 }
 
 namespace {
