@@ -632,7 +632,8 @@ bool RasterizerVulkan::DeltaStillHolds(GraphicsPipeline* pipeline, u64 serial, u
     if (taken_draw.tick != scheduler.CurrentTick()) {
         return full(FullDraw::Submitted);
     }
-    if (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
+    if (!(taken_revisit && VideoCommon::Nx2FastDraw::RevisitOptLevel() >= 2) &&
+        (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive())) {
         return full(FullDraw::RenderPass);
     }
     // A delta draw prepares none of the images it samples: one with an upload pending or a newer
@@ -698,8 +699,12 @@ bool RasterizerVulkan::RevisitDraw(GraphicsPipeline* pipeline, bool is_indirect)
     if (draw.memory_serial != FastDraw::MemorySerial() || draw.map_serial != gpu_memory->MapSerial()) {
         return miss(RevisitMemory);
     }
-    if (draw.tick != scheduler.CurrentTick() || draw.render_pass != scheduler.RenderPassSerial() ||
-        !scheduler.IsRenderPassActive()) {
+    if (FastDraw::RevisitOptLevel() >= 2) {
+        if (draw.tick != scheduler.CurrentTick()) {
+            return miss(RevisitSubmitted);
+        }
+    } else if (draw.tick != scheduler.CurrentTick() ||
+               draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
         return miss(RevisitSubmitted);
     }
     const auto& regs = maxwell3d->regs;
@@ -1481,7 +1486,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // hold what it resolved at its own last draw.
     if (delta_pipeline == nullptr && fast_draw_on &&
         (last_full_reason == FullDraw::NoCandidate || last_full_reason == FullDraw::OtherPipeline ||
-         last_full_reason == FullDraw::StateChanged)) {
+         last_full_reason == FullDraw::StateChanged ||
+         (FastDraw::RevisitOptLevel() >= 2 && last_full_reason == FullDraw::RenderPass))) {
         if (looked_up == nullptr) {
             Profile::Scope scope{Profile::Zone::PipelineLookup};
             looked_up = pipeline_cache.CurrentGraphicsPipeline();

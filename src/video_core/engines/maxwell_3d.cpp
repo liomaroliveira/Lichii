@@ -396,7 +396,14 @@ bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
     // FragmentBarrier only sets scheduler.DeferFragmentBarrier(), which ConfigureDelta handles
     // identically to ConfigureImpl (and any render pass break bumps RenderPassSerial).
     case MAXWELL3D_REG_INDEX(fragment_barrier):
-        return VideoCommon::Nx2FastDraw::RevisitOptEnabled();
+        return VideoCommon::Nx2FastDraw::RevisitOptLevel() >= 1;
+    // invalidate_texture_data_cache calls InvalidateGPUCache() (CPU writes to textures already
+    // call Break(Reason::Invalidation) via TextureCache::WriteMemory) + WaitForIdle().
+    // WaitForIdle only records a Vulkan memory barrier and ends the render pass; ConfigureDelta
+    // reopens the render pass and rebinds the pipeline if needed.
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+        return VideoCommon::Nx2FastDraw::RevisitOptLevel() >= 2;
     default:
         return false;
     }
