@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <dlfcn.h>
+#include <string>
+#include <vector>
 #include <array>
 #include <cstring>
 #include <exception>
@@ -25,8 +29,82 @@ void OnBThreadStart() {
     VideoCommon::GpuSplit::MarkBackThread();
 }
 
+namespace {
+/// E04.T6d F2: GPUBackB's time by task function every 10 s (EDEN_NX2_BACK_SPLIT_TASK_PROF=1).
+/// Addresses are offsets in the binary (addr2line -f -C -e <binary> <offset>).
+void MaybeReportTaskStats() {
+    auto& st = g_btask;
+    static u32 turns = 0;
+    if (!st.enabled || (++turns & 1023U) != 0) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point start_time{};
+    static u64 start_tsc = 0;
+    const auto now = Clock::now();
+    const u64 now_tsc = BTaskStats::Tsc();
+    if (start_tsc == 0) {
+        start_time = now;
+        start_tsc = now_tsc;
+        st.Reset();
+        return;
+    }
+    const double wall_ns =
+        static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time).count());
+    if (wall_ns < 10e9) {
+        return;
+    }
+    const double ns_per_tick = wall_ns / static_cast<double>(now_tsc - start_tsc);
+    const double ms_per_s = ns_per_tick / wall_ns * 1e3; // ticks -> ms per second of wall time
+    const double per_s = 1e9 / wall_ns;
+    auto offset = [](const void* fn) -> uintptr_t {
+        Dl_info info{};
+        if (dladdr(fn, &info) != 0 && info.dli_fbase != nullptr) {
+            return reinterpret_cast<uintptr_t>(fn) - reinterpret_cast<uintptr_t>(info.dli_fbase);
+        }
+        return reinterpret_cast<uintptr_t>(fn);
+    };
+    auto list = [&](const std::array<BTaskStats::Slot, BTaskStats::Slots>& slots, double scale,
+                    double& total_ms, double& total_count, size_t top) {
+        std::vector<BTaskStats::Slot> used;
+        for (const auto& slot : slots) {
+            if (slot.fn != nullptr) {
+                used.push_back(slot);
+            }
+        }
+        std::sort(used.begin(), used.end(),
+                  [](const auto& a, const auto& b) { return a.ticks > b.ticks; });
+        std::string text;
+        for (size_t i = 0; i < used.size(); ++i) {
+            const double ms = static_cast<double>(used[i].ticks) * scale * ms_per_s;
+            const double count = static_cast<double>(used[i].count) * scale * per_s;
+            total_ms += ms;
+            total_count += count;
+            if (i < top) {
+                text += fmt::format(" | {:#x} {:.1f} ms ({:.0f}/s)", offset(used[i].fn), ms, count);
+            }
+        }
+        return text;
+    };
+    double async_ms = 0, async_count = 0, sync_ms = 0, sync_count = 0;
+    const std::string async_text = list(st.async_slots, 4.0, async_ms, async_count, 14);
+    const std::string sync_text = list(st.sync_slots, 1.0, sync_ms, sync_count, 6);
+    const double busy_ms = static_cast<double>(st.busy_ticks) * ms_per_s;
+    LOG_INFO(HW_GPU,
+             "Nx2BackSplit B tasks per second: busy {:.1f} ms, async {:.1f} ms ({:.0f}/s timed x4, "
+             "{:.0f}/s all), sync {:.1f} ms ({:.0f}/s), rest (ring loop) {:.1f} ms; async by fn:{}; "
+             "sync by fn:{}",
+             busy_ms, async_ms, async_count, static_cast<double>(st.async_total) * per_s, sync_ms,
+             sync_count, busy_ms - async_ms - sync_ms, async_text, sync_text);
+    st.Reset();
+    start_time = now;
+    start_tsc = now_tsc;
+}
+} // namespace
+
 void OnBLoopTick() {
     Nx2Profile::Report("GPU back B thread", true);
+    MaybeReportTaskStats();
 }
 
 namespace {

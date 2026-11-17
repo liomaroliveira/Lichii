@@ -24,6 +24,54 @@
 
 namespace VideoCommon::BackSplit {
 
+/// E04.T6d F2 (EDEN_NX2_BACK_SPLIT_TASK_PROF=1): GPUBackB's time by task function, in TSC
+/// ticks, written and reported by GPUBackB alone (OnBLoopTick). Async tasks are sampled 1 in 4.
+struct BTaskStats {
+    struct Slot {
+        const void* fn{};
+        u64 ticks{};
+        u64 count{};
+    };
+    static constexpr size_t Slots = 256;
+    const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BACK_SPLIT_TASK_PROF");
+        return value != nullptr && value[0] == '1';
+    }();
+    std::array<Slot, Slots> async_slots{};
+    std::array<Slot, Slots> sync_slots{};
+    u64 busy_ticks{};
+    u64 async_total{}; ///< every async task, timed or not
+    u32 sample{};
+
+    void Reset() noexcept {
+        async_slots = {};
+        sync_slots = {};
+        busy_ticks = 0;
+        async_total = 0;
+    }
+
+    static u64 Tsc() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+        return __rdtsc();
+#else
+        return 0;
+#endif
+    }
+    static void Add(std::array<Slot, Slots>& slots, const void* fn, u64 ticks) noexcept {
+        size_t i = (reinterpret_cast<uintptr_t>(fn) * 0x9E3779B97F4A7C15ULL) >> 56;
+        for (size_t probe = 0; probe < Slots; ++probe, i = (i + 1) & (Slots - 1)) {
+            Slot& slot = slots[i];
+            if (slot.fn == fn || slot.fn == nullptr) {
+                slot.fn = fn;
+                slot.ticks += ticks;
+                ++slot.count;
+                return;
+            }
+        }
+    }
+};
+inline BTaskStats g_btask;
+
 inline bool g_enabled = [] {
     const char* value = std::getenv("EDEN_NX2_BACK_SPLIT");
     return value != nullptr && value[0] == '1';
@@ -611,6 +659,7 @@ private:
                 }
             }
             const u64 busy_start = NowNs();
+            const u64 busy_start_tsc = g_btask.enabled ? BTaskStats::Tsc() : 0;
             bool busy_counted = false;
             u64 last_store = read_pos;
             while (read_pos != available) {
@@ -626,7 +675,21 @@ private:
                     }
                     read_pos += 1;
                 } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Task)) {
-                    reinterpret_cast<AsyncFn>(ring[index + 1])(&ring[index + 2]);
+                    const auto fn = reinterpret_cast<AsyncFn>(ring[index + 1]);
+                    if (g_btask.enabled) [[unlikely]] {
+                        ++g_btask.async_total;
+                        if ((++g_btask.sample & 3U) == 0) {
+                            const u64 t0 = BTaskStats::Tsc();
+                            fn(&ring[index + 2]);
+                            BTaskStats::Add(g_btask.async_slots,
+                                            reinterpret_cast<const void*>(fn),
+                                            BTaskStats::Tsc() - t0);
+                        } else {
+                            fn(&ring[index + 2]);
+                        }
+                    } else {
+                        fn(&ring[index + 2]);
+                    }
                     read_pos += words;
                 } else if (((word0 >> 12) & 0xfU) == static_cast<u64>(Kind::Bind)) {
                     b_regs = ShadowOf(reinterpret_cast<const void*>(ring[index + 1]));
@@ -651,7 +714,14 @@ private:
             consumed.store(read_pos, std::memory_order_release);
             NotifyProducer();
             if (task != done) {
-                task_fn(task_arg);
+                if (g_btask.enabled) [[unlikely]] {
+                    const u64 t0 = BTaskStats::Tsc();
+                    task_fn(task_arg);
+                    BTaskStats::Add(g_btask.sync_slots, reinterpret_cast<const void*>(task_fn),
+                                    BTaskStats::Tsc() - t0);
+                } else {
+                    task_fn(task_arg);
+                }
                 done = task;
                 b_busy_ns.fetch_add(NowNs() - busy_start, std::memory_order_release);
                 busy_counted = true;
@@ -662,6 +732,9 @@ private:
             }
             if (!busy_counted) {
                 b_busy_ns.fetch_add(NowNs() - busy_start, std::memory_order_release);
+            }
+            if (g_btask.enabled) [[unlikely]] {
+                g_btask.busy_ticks += BTaskStats::Tsc() - busy_start_tsc;
             }
         }
         consumer_sink.store(sink, std::memory_order_relaxed);
