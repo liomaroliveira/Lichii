@@ -3486,6 +3486,10 @@ private:
         DAddr device{}; ///< 0: the general path writes its data
     } bound_constant_buffer;
 
+    /// EDEN_NX2_UBO_OPT: last map_serial sent to the rasterizer per (stage, slot) in ProcessCBBind.
+    std::array<std::array<u64, Regs::MaxConstBuffers>, Regs::MaxShaderStage> cb_bind_map_serial{};
+    std::array<std::array<bool, Regs::MaxConstBuffers>, Regs::MaxShaderStage> cb_bind_sent{};
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     /// Start offsets of each macro in macro_memory

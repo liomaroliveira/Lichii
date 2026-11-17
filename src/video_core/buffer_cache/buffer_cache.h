@@ -3222,8 +3222,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const Binding& binding = channel_state->uniform_buffers[stage][index];
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
-    Buffer& buffer = slot_buffers[binding.buffer_id];
-    TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
@@ -3231,6 +3229,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const bool native_bank = has_host_buffer &&
                              (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
                              size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
+    const bool ubo_opt = VideoCommon::UboOptEnabled();
+    Buffer* buffer_ptr = nullptr;
+    if (!ubo_opt) {
+        buffer_ptr = &slot_buffers[binding.buffer_id];
+        TouchBuffer(*buffer_ptr, binding.buffer_id);
+    }
     bool verify_kept = false;
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
         // Unnoticed writes would reach a kept bank too: those stream as before.
@@ -3261,18 +3265,30 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         uniform_keep.clean[stage] &= ~(1u << index);
     }
-    const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
-    const bool needs_alignment_stream = [&]() {
-        if constexpr (IS_OPENGL) {
-            return false;
-        } else {
-            if (!has_host_buffer) {
-                return false;
-            }
-            const u32 alignment = runtime.GetUniformBufferAlignment();
-            return alignment > 1 && (offset % alignment) != 0;
+    if (ubo_opt) {
+        buffer_ptr = &slot_buffers[binding.buffer_id];
+        TouchBuffer(*buffer_ptr, binding.buffer_id);
+    }
+    Buffer& buffer = *buffer_ptr;
+    u32 offset = 0;
+    bool offset_computed = false;
+    bool needs_alignment_stream = false;
+    const auto compute_offset_and_alignment = [&]() {
+        if (offset_computed) {
+            return;
         }
-    }();
+        offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+        offset_computed = true;
+        if constexpr (!IS_OPENGL) {
+            if (has_host_buffer) {
+                const u32 alignment = runtime.GetUniformBufferAlignment();
+                needs_alignment_stream = alignment > 1 && (offset % alignment) != 0;
+            }
+        }
+    };
+    if (!ubo_opt) {
+        compute_offset_and_alignment();
+    }
     // Ocarina of Time is left out (unless EDEN_NX2_PERF_VERIFY=1): a compare of its banks against
     // shadow copies found no page changed behind the tracker, and the uploads cost frame rate.
     constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
@@ -3316,9 +3332,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
-    const bool use_fast_buffer = needs_alignment_stream
-        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !memory_tracker.IsRegionGpuModified(device_addr, size));
+    bool use_fast_buffer = false;
+    if (ubo_opt) {
+        const bool small_unmodified =
+            has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
+            !memory_tracker.IsRegionGpuModified(device_addr, size);
+        if (small_unmodified) {
+            use_fast_buffer = true;
+        } else {
+            compute_offset_and_alignment();
+            use_fast_buffer = needs_alignment_stream;
+        }
+    } else {
+        use_fast_buffer =
+            needs_alignment_stream ||
+            (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
+             !memory_tracker.IsRegionGpuModified(device_addr, size));
+    }
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
@@ -3353,7 +3383,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds;
                 streamed = VideoCommon::BindSmallUniformReusing(
-                    runtime, device_memory, stage, index, binding_index, device_addr, size);
+                    runtime, device_memory, stage, index, binding_index, device_addr, size,
+                    ubo_opt && !ubo_keep_verify);
                 const u64 rebound =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds -

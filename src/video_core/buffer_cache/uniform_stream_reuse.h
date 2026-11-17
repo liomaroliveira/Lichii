@@ -51,6 +51,14 @@ inline void ReadUniformStreamReuseSwitch() {
     return g_uniform_stream_reuse;
 }
 
+[[nodiscard]] inline bool UboOptEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UBO_OPT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 template <class Ref>
 class UniformStreamReuse {
 public:
@@ -110,7 +118,8 @@ inline void ResetUniformStreamReuse() noexcept {
 template <class Runtime, class DeviceMemory>
 [[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
                                            size_t stage, u32 index, u32 binding_index,
-                                           u64 device_addr, u32 size) {
+                                           u64 device_addr, u32 size,
+                                           bool skip_slot_copy = false) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
@@ -123,6 +132,16 @@ template <class Runtime, class DeviceMemory>
         // A slot whose bytes change every bind: read straight into its bytes, no compare (from
         // skolvolt 9267908a3d). The bytes stay the last bind's, for keeps and their verify.
         --slot.direct;
+        if (skip_slot_copy && slot.direct != 0) {
+            // Still in direct mode for the next bind too: read straight into the stream allocation.
+            // The final direct bind (slot.direct == 0) fills slot.bytes for the next memcmp.
+            slot.size = size;
+            const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+            device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            slot.ref = runtime.LastStreamUniformRef();
+            slot.tick = runtime.CurrentTick();
+            return true;
+        }
         device_memory.ReadBlockUnsafe(device_addr, slot.bytes.data(), size);
         slot.size = size;
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);

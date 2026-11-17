@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -74,6 +75,7 @@ Maxwell3D::~Maxwell3D() = default;
 void Maxwell3D::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
     upload_state.BindRasterizer(rasterizer_);
+    cb_bind_sent = {};
 }
 
 void Maxwell3D::InitializeRegisterDefaults() {
@@ -1284,42 +1286,57 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     // Bind the buffer currently in CB_ADDRESS to the specified index in the desired shader
     // stage.
     const auto& bind_data = regs.bind_groups[stage_index];
+    const u32 slot = bind_data.shader_slot;
     static std::array<std::array<bool, 32>, 5> seen{};
-    if (!seen[stage_index][bind_data.shader_slot]) {
-        seen[stage_index][bind_data.shader_slot] = true;
+    if (!seen[stage_index][slot]) {
+        seen[stage_index][slot] = true;
         LOG_INFO(HW_GPU, "Constant buffer bind: stage {} slot {} address {:#x} size {:#x}", stage_index,
-                 bind_data.shader_slot.Value(), regs.const_buffer.Address(), regs.const_buffer.size);
+                 slot, regs.const_buffer.Address(), regs.const_buffer.size);
     }
-    if (bind_data.shader_slot >= Regs::MaxConstBuffers) {
+    if (slot >= Regs::MaxConstBuffers) {
         return; // slot field is 5 bits; the state array holds 18
     }
-    auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
-    if (VideoCommon::Nx2FastDraw::Enabled() &&
-        (buffer.enabled != (bind_data.valid.Value() != 0) ||
-         buffer.address != regs.const_buffer.Address() || buffer.size != regs.const_buffer.size)) {
-        VideoCommon::Nx2FastDraw::NoteBind(stage_index, bind_data.shader_slot);
-    }
-    buffer.enabled = bind_data.valid.Value() != 0;
-    if (VideoCommon::ListMacroTrace::g_enabled && buffer.enabled) {
-        VideoCommon::ListMacroTrace::NoteConstBufferBind(
-            static_cast<u32>(stage_index), bind_data.shader_slot, regs.const_buffer.Address(),
-            regs.const_buffer.size);
-    }
-    buffer.address = regs.const_buffer.Address();
-    buffer.size = regs.const_buffer.size;
-    if (split_engine != nullptr) [[unlikely]] {
-        // Before the rasterizer's bind task, in ring order with it.
-        SplitSendCbBind(stage_index, bind_data.shader_slot, buffer);
-    }
-
     const bool is_enabled = bind_data.valid.Value() != 0;
-    if (!is_enabled) {
-        rasterizer->DisableGraphicsUniformBuffer(stage_index, bind_data.shader_slot);
-        return;
-    }
     const GPUVAddr gpu_addr = regs.const_buffer.Address();
     const u32 size = regs.const_buffer.size;
-    rasterizer->BindGraphicsUniformBuffer(stage_index, bind_data.shader_slot, gpu_addr, size);
+    auto& buffer = state.shader_stages[stage_index].const_buffers[slot];
+    const bool same_bind =
+        buffer.enabled == is_enabled && buffer.address == gpu_addr && buffer.size == size;
+    if (VideoCommon::UboOptEnabled() && split_engine == nullptr && same_bind &&
+        cb_bind_sent[stage_index][slot]) {
+        const u64 cur_map_serial = memory_manager.MapSerial();
+        if (cur_map_serial == cb_bind_map_serial[stage_index][slot]) {
+            if (VideoCommon::ListMacroTrace::g_enabled && buffer.enabled) {
+                VideoCommon::ListMacroTrace::NoteConstBufferBind(
+                    static_cast<u32>(stage_index), slot, gpu_addr, size);
+            }
+            return;
+        }
+    }
+    if (VideoCommon::Nx2FastDraw::Enabled() && !same_bind) {
+        VideoCommon::Nx2FastDraw::NoteBind(stage_index, slot);
+    }
+    buffer.enabled = is_enabled;
+    if (VideoCommon::ListMacroTrace::g_enabled && buffer.enabled) {
+        VideoCommon::ListMacroTrace::NoteConstBufferBind(
+            static_cast<u32>(stage_index), slot, gpu_addr, size);
+    }
+    buffer.address = gpu_addr;
+    buffer.size = size;
+    if (split_engine != nullptr) [[unlikely]] {
+        // Before the rasterizer's bind task, in ring order with it.
+        SplitSendCbBind(stage_index, slot, buffer);
+    }
+
+    if (!is_enabled) {
+        rasterizer->DisableGraphicsUniformBuffer(stage_index, slot);
+    } else {
+        rasterizer->BindGraphicsUniformBuffer(stage_index, slot, gpu_addr, size);
+    }
+    if (VideoCommon::UboOptEnabled()) {
+        cb_bind_sent[stage_index][slot] = true;
+        cb_bind_map_serial[stage_index][slot] = memory_manager.MapSerial();
+    }
 }
 
 namespace {
