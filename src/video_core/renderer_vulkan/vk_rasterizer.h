@@ -633,6 +633,7 @@ private:
     bool taken_revisit{};
     /// Each pipeline's last recorded draw (direct-mapped by the pipeline's address).
     std::array<ReusableDraw, 256> revisit_draws{};
+    u64 revisit_epoch{1};
     [[nodiscard]] static size_t RevisitSlot(const GraphicsPipeline* pipeline) noexcept {
         return static_cast<size_t>((reinterpret_cast<uintptr_t>(pipeline) >> 4) *
                                    0x9E3779B97F4A7C15ULL >> 56);

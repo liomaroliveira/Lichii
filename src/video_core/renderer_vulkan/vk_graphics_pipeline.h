@@ -429,6 +429,27 @@ public:
         return delta_generation;
     }
 
+    /// Per-pipeline last recorded draw for RevisitDraw (EDEN_NX2_REVISIT_OPT=1).
+    struct RevisitRecord {
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 epoch{};
+        u64 serial{};
+        u64 memory_serial{};
+        u64 map_serial{};
+        u64 tick{};
+        u64 render_pass{};
+        u64 generation{};
+        std::array<u32, 7> texture_registers{};
+        Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    [[nodiscard]] RevisitRecord& RevisitState() noexcept {
+        return revisit_record;
+    }
+    [[nodiscard]] const RevisitRecord& RevisitState() const noexcept {
+        return revisit_record;
+    }
+
     /// Whether RetextureDelta can bring the kept views up to date: the pipeline samples textures
     /// only (no texture or image buffers or images), from constant buffer words or handles
     /// computed at draw time.
@@ -544,6 +565,7 @@ private:
     }
     inline static u64 delta_generations{};
     u64 delta_generation{};
+    RevisitRecord revisit_record{};
     bool delta_views_valid{};
     bool capture_delta{};
     bool verify_delta{};

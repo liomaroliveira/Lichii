@@ -393,6 +393,10 @@ bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
     // data: a delta draw that reads texture handles there takes the full path.
     case MAXWELL3D_REG_INDEX(report_semaphore.query):
         return true;
+    // FragmentBarrier only sets scheduler.DeferFragmentBarrier(), which ConfigureDelta handles
+    // identically to ConfigureImpl (and any render pass break bumps RenderPassSerial).
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+        return VideoCommon::Nx2FastDraw::RevisitOptEnabled();
     default:
         return false;
     }

@@ -663,10 +663,35 @@ bool RasterizerVulkan::RevisitDraw(GraphicsPipeline* pipeline, bool is_indirect)
     if (!pipeline->IsBuilt() || !pipeline->CanRetexture()) {
         return miss(RevisitPipeline);
     }
-    const ReusableDraw& draw = revisit_draws[RevisitSlot(pipeline)];
-    if (draw.pipeline != pipeline || draw.maxwell3d != maxwell3d) {
-        return miss(RevisitNoDraw);
+    ReusableDraw draw_copy{};
+    const ReusableDraw* draw_ptr = nullptr;
+    if (FastDraw::RevisitOptEnabled()) {
+        const auto& rec = pipeline->RevisitState();
+        if (rec.epoch != revisit_epoch || rec.maxwell3d != maxwell3d) {
+            return miss(RevisitNoDraw);
+        }
+        draw_copy = ReusableDraw{
+            .pipeline = pipeline,
+            .maxwell3d = rec.maxwell3d,
+            .serial = rec.serial,
+            .memory_serial = rec.memory_serial,
+            .map_serial = rec.map_serial,
+            .tick = rec.tick,
+            .render_pass = rec.render_pass,
+            .generation = rec.generation,
+            .texture_registers = rec.texture_registers,
+            .topology = rec.topology,
+            .is_indexed = rec.is_indexed,
+        };
+        draw_ptr = &draw_copy;
+    } else {
+        const ReusableDraw& slot_draw = revisit_draws[RevisitSlot(pipeline)];
+        if (slot_draw.pipeline != pipeline || slot_draw.maxwell3d != maxwell3d) {
+            return miss(RevisitNoDraw);
+        }
+        draw_ptr = &slot_draw;
     }
+    const ReusableDraw& draw = *draw_ptr;
     if (draw.generation != pipeline->DeltaGeneration()) {
         return miss(RevisitGeneration);
     }
@@ -746,7 +771,23 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
         .topology = topology,
         .is_indexed = is_indexed,
     };
-    revisit_draws[RevisitSlot(pipeline)] = reusable_draw;
+    if (VideoCommon::Nx2FastDraw::RevisitOptEnabled()) {
+        pipeline->RevisitState() = GraphicsPipeline::RevisitRecord{
+            .maxwell3d = reusable_draw.maxwell3d,
+            .epoch = revisit_epoch,
+            .serial = reusable_draw.serial,
+            .memory_serial = reusable_draw.memory_serial,
+            .map_serial = reusable_draw.map_serial,
+            .tick = reusable_draw.tick,
+            .render_pass = reusable_draw.render_pass,
+            .generation = reusable_draw.generation,
+            .texture_registers = reusable_draw.texture_registers,
+            .topology = reusable_draw.topology,
+            .is_indexed = reusable_draw.is_indexed,
+        };
+    } else {
+        revisit_draws[RevisitSlot(pipeline)] = reusable_draw;
+    }
 }
 
 void RasterizerVulkan::ReportFastDraws() {
@@ -1384,6 +1425,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_on = on;
         reusable_draw = {};
         revisit_draws.fill({});
+        ++revisit_epoch;
         FastDraw::g_delta = {};
         uniform_writes_lost = true;
         fast_draw_stats = {};

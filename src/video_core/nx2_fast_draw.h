@@ -97,6 +97,15 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
+/// EDEN_NX2_REVISIT_OPT=1, read once.
+[[nodiscard]] inline bool RevisitOptEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REVISIT_OPT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// On their own cache lines, away from what every thread reads (g_enabled).
 alignas(64) inline std::atomic<u64> g_serial{1};
 /// Bumped by every break but a 3D register change: register writes change no memory, so draws
