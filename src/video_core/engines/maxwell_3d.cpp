@@ -825,6 +825,12 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
     for (const u64 write : writes) {
         const u32 method = static_cast<u32>(write);
         const u32 value = static_cast<u32>(write >> 32);
+        // E04 back split: register blocks (#1585) bypass ProcessDirtyRegisters, so they feed
+        // GPUBackB's shadow here, with the same changed-value filter.
+        if (VideoCommon::BackSplit::Enabled() && split_shadow != nullptr &&
+            regs.reg_array[method] != value) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
+        }
         regs.reg_array[method] = value;
         if (tracked) {
             shadow_state.reg_array[method] = value;
