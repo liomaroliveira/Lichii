@@ -14,6 +14,8 @@
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/nx2_back_split.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
@@ -139,6 +141,11 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 }
 
 void MaxwellDMA::Launch() {
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        const VideoCommon::Nx2Profile::Scope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
+        const u64 meta = u64{regs.line_length_in} | (u64{regs.line_count} << 32);
+        VideoCommon::BackSplit::EmitLaunchDma(regs.offset_in, regs.offset_out, meta);
+    }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {

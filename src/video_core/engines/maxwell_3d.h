@@ -25,6 +25,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -73,6 +74,35 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// E04.T6: sends a register the engine wrote without ProcessDirtyRegisters (an increment, a
+    /// macro's direct write) to GPUBackB's shadow (EDEN_NX2_BACK_SPLIT=1).
+    void NoteDirectWrite(u32 method) {
+        if (VideoCommon::BackSplit::Enabled() && split_shadow != nullptr) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
+                                            regs.reg_array[method]);
+        }
+    }
+
+    /// E04.T6 step 3: the register file of this channel's shadow engine on GPUBackB
+    /// (ChannelState::Payload::maxwell_3d_b), also its identity on the A->B ring. Null without
+    /// the split, and on the shadow itself.
+    u32* split_shadow{};
+    /// E04.T6 step 3: the shadow engine itself (same lifetime as split_shadow).
+    Maxwell3D* split_engine{};
+
+    /// E04.T6 step 3, stage A after a register check: sends this engine's constant buffer
+    /// bindings and root tables for GPUBackB to compare with the shadow's.
+    void SplitSendStateCheck();
+    void SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer);
+    void SplitSendRootLoad(u32 table, u32 index, u32 value);
+    /// E04.T6 step 3, stage A before a draw: the draw state, engine hint and HLE replacement
+    /// table the rasterizer reads, for GPUBackB's shadow.
+    void SplitSendDraw();
+    void SplitSendDrawTexture();
+    /// E04.T6 step 3, stage A before a draw or clear: the dirty flags set since the last one,
+    /// which GPUBackB ORs into the shadow's (its rasterizer reads and clears those); A's reset.
+    void SplitSendFlags();
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {
@@ -3351,6 +3381,10 @@ private:
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+        }
+        if (VideoCommon::BackSplit::Enabled() && regs.reg_array[method] != argument &&
+            split_shadow != nullptr) [[unlikely]] {
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, argument);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

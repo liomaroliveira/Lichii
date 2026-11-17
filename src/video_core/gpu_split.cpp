@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <thread>
@@ -28,6 +29,8 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/nx2_back_split.h"
+#include "video_core/nx2_back_split_rasterizer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
@@ -781,6 +784,9 @@ std::string GpuSplit::MethodEndingAt(u64 end) const {
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
+    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+        VideoCommon::BackSplit::g_deferred.fetch_add(1, std::memory_order_relaxed);
+    }
     auto* const heap = new std::function<void()>(std::move(func));
     Defer(
         [heap] {
@@ -900,11 +906,77 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+        if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+            VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
+            CountCallSite(entry[1]);
+            // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
+            // it was sent without waiting.
+            if ((head & StageASafe) == 0) {
+                VideoCommon::BackSplit::DrainAsync();
+            }
+        }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
     }
     return 1;
+}
+
+namespace {
+/// E04.T6 (night 2026-11-12): Call closures per sender (thunk address), stage A only. Logged as
+/// offsets from ReportBProfile; `nm -C` on the binary names them.
+struct CallSiteCount {
+    u64 thunk;
+    u64 count;
+};
+std::array<CallSiteCount, 64> g_call_sites{};
+u64 g_call_sites_report_ns{};
+
+void ReportCallSites() {
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    if (g_call_sites_report_ns == 0) {
+        g_call_sites_report_ns = now;
+        return;
+    }
+    if (now - g_call_sites_report_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - g_call_sites_report_ns) / 1e9;
+    g_call_sites_report_ns = now;
+    auto sorted = g_call_sites;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.count > b.count; });
+    const u64 base = reinterpret_cast<u64>(&VideoCommon::BackSplit::ReportBProfile);
+    std::string line;
+    for (size_t i = 0; i < 12 && sorted[i].count != 0; ++i) {
+        line += fmt::format(" {:+#x}={:.0f}/s", static_cast<s64>(sorted[i].thunk - base),
+                            static_cast<double>(sorted[i].count) / seconds);
+    }
+    LOG_INFO(HW_GPU, "Nx2BackSplit Call sites (thunk - ReportBProfile):{}", line);
+    for (auto& site : g_call_sites) {
+        site.count = 0;
+    }
+}
+} // Anonymous namespace
+
+void GpuSplit::CountCallSite(u64 thunk) {
+    for (auto& site : g_call_sites) {
+        if (site.thunk == thunk) {
+            ++site.count;
+            break;
+        }
+        if (site.thunk == 0) {
+            site = {thunk, 1};
+            break;
+        }
+    }
+    ReportCallSites();
+}
+
+void GpuSplit::CallHook(void (*hook)(void*), void* argument) {
+    VideoCommon::BackSplit::RunHook(hook, argument);
 }
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
@@ -913,6 +985,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
+    // E04.T6 step 3g: with the back split, this thread is stage A; its FastDraw breaks ship
+    // with each draw.
+    Nx2FastDraw::t_stage_a = VideoCommon::BackSplit::Enabled();
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     if (Settings::values.pin_gpu_threads.GetValue()) {
@@ -925,8 +1000,32 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     u64 read_position = 0;
     const bool idle_trace = BackIdleTrace::Enabled();
     u64 idle_since = 0;
+    // E04.T6 step 4a: with the back split, `consumed` means GPUBackB ran it: stage A sends the
+    // position in ring order and GPUBackB stores it (published at once, or a front waiting for it
+    // while this thread sleeps would never wake).
+    const bool split_consumed = Nx2FastDraw::t_stage_a;
+    const auto store_consumed = [&](u64 position) {
+        if (split_consumed) [[unlikely]] {
+            struct Mark {
+                GpuSplit* split;
+                u64 position;
+            } const mark{this, position};
+            VideoCommon::BackSplit::EmitTask(
+                [](const u64* payload) {
+                    Mark m;
+                    std::memcpy(&m, payload, sizeof(m));
+                    m.split->StoreConsumed(m.position);
+                },
+                &mark, sizeof(mark));
+            VideoCommon::BackSplit::Flush();
+            return;
+        }
+        consumed.store(position, std::memory_order_seq_cst);
+        NotifyFront();
+    };
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
+        VideoCommon::BackSplit::MaybeReport();
         MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
@@ -961,7 +1060,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
-                        idle_hook(idle_argument);
+                        CallHook(idle_hook, idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);
                 }
@@ -1000,7 +1099,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                CallHook(idle_hook, idle_argument);
             }
             // A guest thread waits for a flush: run it now, not after the draws and compute work
             // still queued here, or after everything the front holds (the guest synchronized with
@@ -1011,13 +1110,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
-                consumed.store(read_position, std::memory_order_seq_cst);
+                store_consumed(read_position);
                 last_store = read_position;
-                NotifyFront();
             }
         }
-        consumed.store(read_position, std::memory_order_seq_cst);
-        NotifyFront();
+        store_consumed(read_position);
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);

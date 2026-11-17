@@ -167,6 +167,12 @@ public:
     static void MarkGpuThread() {
         on_gpu_thread = true;
     }
+    /// E04.T6: GPUBackB, which owns the rasterizer, is a back thread too.
+    static void MarkBackThread() {
+        on_back_thread = true;
+    }
+    /// Runs a hook of the back (idle, tick) on the thread that owns the rasterizer.
+    static void CallHook(void (*hook)(void*), void* argument);
     /// Whether the calling thread is the GPU thread (see MarkGpuThread).
     [[nodiscard]] static bool OnGpuThread() {
         return on_gpu_thread;
@@ -310,6 +316,9 @@ public:
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
+    /// Defer flag (E04 back split): `func` only touches stage A's engine state and reaches the
+    /// rasterizer through the proxy, so stage A runs it without draining GPUBackB first.
+    static constexpr u64 StageASafe = 1 << 4;
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
@@ -822,6 +831,15 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
+public:
+    /// E04.T6 step 4a: with the back split, GPUBackB stores the position once it ran everything
+    /// stage A executed before it (the front reads `consumed` as "the back ran it").
+    void StoreConsumed(u64 position) {
+        consumed.store(position, std::memory_order_seq_cst);
+        NotifyFront();
+    }
+
+private:
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
@@ -830,6 +848,7 @@ private:
         }
     }
 
+    static void CountCallSite(u64 thunk);
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
@@ -838,7 +857,7 @@ private:
         if (tick_requested.load(std::memory_order_relaxed) &&
             tick_requested.exchange(false, std::memory_order_acq_rel) && tick_hook != nullptr)
             [[unlikely]] {
-            tick_hook(tick_argument);
+            CallHook(tick_hook, tick_argument);
         }
     }
 
