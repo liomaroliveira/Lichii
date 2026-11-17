@@ -2550,10 +2550,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     if (fs.draw_pending) {
         fs.draw_pending = false;
         // A deferred draw.
-        // Stage A state and proxy calls only, as a macro run on the back (E04: no drain).
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Writes::Caches,
-                    VideoCommon::GpuSplit::FastDrawNeutral | VideoCommon::GpuSplit::StageASafe);
+                    VideoCommon::GpuSplit::Writes::Caches, VideoCommon::GpuSplit::FastDrawNeutral);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
