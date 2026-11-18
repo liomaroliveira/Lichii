@@ -130,7 +130,8 @@ void State::ProcessData(std::span<const u8> read_buffer) {
 
         // E04.T6 step 4: stage A writes this one itself (rare): GPUBackB first runs every write
         // it was sent, so they land in order.
-        if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        if (VideoCommon::BackSplit::OnStageA() &&
+            !VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
             if (VideoCommon::BackSplit::H2Async()) {
                 VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Other);
             } else {

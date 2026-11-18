@@ -1050,7 +1050,8 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
     }
     // The bytes the ids came from are what they were: the handle words, then the texture and
     // sampler descriptors they select. Nothing else decides the views and samplers.
-    if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+    if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA() &&
+        !VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         const auto matches = []<typename T>(GPUVAddr gpu_addr, const u8* host_ptr,
                                             const T& expected) -> bool {
             T tmp;

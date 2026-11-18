@@ -854,7 +854,11 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         // GPUBackB's shadow here, with the same changed-value filter.
         if (VideoCommon::BackSplit::RingEnabled() && split_shadow != nullptr &&
             regs.reg_array[method] != value) [[unlikely]] {
-            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
+            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+                split_shadow[method] = value;
+            } else {
+                VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
+            }
         }
         regs.reg_array[method] = value;
         if (tracked) {
@@ -1387,7 +1391,8 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     // E04.T6 step 4: with the back split, stage A writes no guest memory (GPUBackB does,
     // in ring order), so constant buffer data takes SplitSendCbUpload.
-    if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
+    if (VideoCommon::BackSplit::RingEnabled() &&
+        !VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         return false;
     }
     if (!FastDraw::Enabled()) {
@@ -1570,7 +1575,8 @@ void SplitApplyCbUpload(const u64* payload) {
 /// Stage A: sends a constant buffer upload to GPUBackB (false: not stage A, write it here).
 bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const void* data,
                        size_t bytes, bool note, bool words) {
-    if (!VideoCommon::BackSplit::OnStageA()) [[likely]] {
+    if (!VideoCommon::BackSplit::OnStageA() ||
+        VideoCommon::BackSplit::H2DynamicBypassActive()) [[likely]] {
         return false;
     }
     const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
@@ -1717,9 +1723,33 @@ void SplitApplyStateCheck(const u64* payload) {
         ring.b_bad_state_total.fetch_add(1, std::memory_order_relaxed);
     }
 }
+void CopyDrawStateInPlace(Maxwell3D& dst, const Maxwell3D& src) {
+    const auto& s = src.draw_manager.draw_state;
+    auto& d = dst.draw_manager.draw_state;
+    d.topology = s.topology;
+    d.draw_mode = s.draw_mode;
+    d.draw_indexed = s.draw_indexed;
+    d.draw_element_count = s.draw_element_count;
+    d.base_index = s.base_index;
+    d.vertex_buffer = s.vertex_buffer;
+    d.index_buffer = s.index_buffer;
+    d.base_instance = s.base_instance;
+    d.instance_count = s.instance_count;
+    d.drawn_instances = s.drawn_instances;
+    d.inline_index_draw_indexes = s.inline_index_draw_indexes;
+    dst.draw_manager.indirect_state = src.draw_manager.indirect_state;
+    dst.engine_state = src.engine_state;
+    dst.replace_table = src.replace_table;
+}
 } // Anonymous namespace
 
 void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        if (split_engine != nullptr) {
+            split_engine->state.shader_stages[stage].const_buffers[slot] = buffer;
+        }
+        return;
+    }
     const SplitCbBindPacket packet{
         .shadow = split_engine,
         .address = buffer.address,
@@ -1732,6 +1762,13 @@ void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& b
 }
 
 void Maxwell3D::SplitSendRootLoad(u32 table, u32 index, u32 value) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        if (split_engine != nullptr) {
+            split_engine->root_tables.tables[table][index] = value;
+            split_engine->root_tables.loaded = true;
+        }
+        return;
+    }
     const SplitRootLoadPacket packet{split_engine, table, index, value};
     VideoCommon::BackSplit::EmitTask(&SplitApplyRootLoad, &packet, sizeof(packet));
 }
@@ -1749,6 +1786,15 @@ void Maxwell3D::SplitSendFlags() {
 
 void Maxwell3D::SplitSendFlagsH2() {
     if (split_engine == nullptr || (!dirty.split_b_flags.any() && !g_split_all_dirty)) {
+        return;
+    }
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        if (g_split_all_dirty) [[unlikely]] {
+            split_engine->dirty.flags.set();
+        } else {
+            split_engine->dirty.flags |= dirty.split_b_flags;
+        }
+        dirty.split_b_flags.reset();
         return;
     }
     std::array<u64, 1 + 4> data{};
@@ -1783,6 +1829,10 @@ void Maxwell3D::ApplySplitBFlags(Maxwell3D& shadow, const std::array<u64, 4>& wo
 
 void Maxwell3D::SplitSendDraw() {
     if (split_engine == nullptr) {
+        return;
+    }
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        CopyDrawStateInPlace(*split_engine, *this);
         return;
     }
     SplitSendFastDraw();
@@ -1827,6 +1877,10 @@ void Maxwell3D::SplitSendDraw() {
 
 void Maxwell3D::SplitSendDrawTexture() {
     if (split_engine == nullptr) {
+        return;
+    }
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        split_engine->draw_manager.draw_texture_state = draw_manager.draw_texture_state;
         return;
     }
     SplitSendFastDraw();

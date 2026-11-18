@@ -5792,6 +5792,11 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     {
+        const VideoCommon::BackSplit::H2DrainScope h2_drain{
+            VideoCommon::BackSplit::H2DrainReason::Flush};
+        FlushH2DeferredInvalidations(true);
+    }
+    if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) {
         const auto now = std::chrono::steady_clock::now();
         const u64 frame_ns = h2_last_frame_time.time_since_epoch().count() == 0
                                  ? 16666666ULL
@@ -5801,11 +5806,16 @@ void RasterizerVulkan::TickFrame() {
                                            .count());
         h2_last_frame_time = now;
         const u32 draws = h2_frame_draws.exchange(0, std::memory_order_relaxed);
-        VideoCommon::BackSplit::NoteH2FrameDrawCount(draws, frame_ns);
+        const auto transition = VideoCommon::BackSplit::NoteH2FrameDrawCount(draws, frame_ns);
+        if (transition == VideoCommon::BackSplit::H2BypassTransition::EnteredBypass) {
+            if (maxwell3d != nullptr && maxwell3d_b != nullptr && maxwell3d_b != maxwell3d) {
+                maxwell3d_b->dirty.flags |= maxwell3d->dirty.split_b_flags;
+                maxwell3d->dirty.split_b_flags.reset();
+            }
+        } else if (transition == VideoCommon::BackSplit::H2BypassTransition::ExitedBypass) {
+            OnH2PostDrain();
+        }
     }
-    const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Flush};
-    FlushH2DeferredInvalidations(true);
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(*capture));

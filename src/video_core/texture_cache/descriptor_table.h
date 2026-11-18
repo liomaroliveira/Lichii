@@ -54,7 +54,8 @@ public:
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
         std::pair<T, bool> result;
         bool forwarded = false;
-        if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+        if (BackSplit::H2Async() && BackSplit::OnStageA() &&
+            !BackSplit::H2DynamicBypassActive()) [[unlikely]] {
             const auto fwd =
                 BackSplit::TryForwardRead(gpu_addr, std::addressof(result.first), sizeof(T));
             if (fwd == BackSplit::ForwardResult::Forwarded) {

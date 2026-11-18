@@ -79,8 +79,12 @@ public:
     /// macro's direct write) to GPUBackB's shadow (EDEN_NX2_BACK_SPLIT=1).
     void NoteDirectWrite(u32 method) {
         if (VideoCommon::BackSplit::RingEnabled() && split_shadow != nullptr) [[unlikely]] {
-            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
-                                            regs.reg_array[method]);
+            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+                split_shadow[method] = regs.reg_array[method];
+            } else {
+                VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
+                                                regs.reg_array[method]);
+            }
         }
     }
 
@@ -3394,7 +3398,12 @@ private:
         }
         if (VideoCommon::BackSplit::RingEnabled() && regs.reg_array[method] != argument &&
             split_shadow != nullptr) [[unlikely]] {
-            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, argument);
+            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+                split_shadow[method] = argument;
+            } else {
+                VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
+                                                argument);
+            }
         }
         regs.reg_array[method] = argument;
         const bool h2_async = VideoCommon::BackSplit::H2Async();

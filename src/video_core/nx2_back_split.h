@@ -113,7 +113,7 @@ inline bool OnStageA() noexcept {
 /// E04.T14: Dynamic bypass of H2 split under light draw load (< EDEN_NX2_H2_BYPASS_THRESHOLD draws/s).
 inline bool g_h2_dynamic_bypass_enabled = [] {
     const char* val = std::getenv("EDEN_NX2_H2_DYNAMIC_BYPASS");
-    return val != nullptr && (val[0] == '1');
+    return val == nullptr || (val[0] != '0');
 }();
 inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
 
@@ -130,7 +130,7 @@ void NoteH2ReportDraws(double sec);
 
 /// True on Stage A under H2Async() when not inside a drained C2 barrier scope.
 inline bool UseH2AsyncQueue() noexcept {
-    return g_h2_async && t_stage_a && t_h2_drained_depth == 0;
+    return g_h2_async && t_stage_a && t_h2_drained_depth == 0 && !H2DynamicBypassActive();
 }
 
 /// E04.T6: set on GPUBackB, the thread that owns the rasterizer with the split on.
@@ -1171,7 +1171,7 @@ inline void DrainAsync() {
 
 /// Stage A under EDEN_NX2_H2_SPLIT=2: drains GPUBackB and accounts the barrier reason.
 inline void DrainAsyncH2(H2DrainReason reason) {
-    if (H2Async() && OnStageA()) [[unlikely]] {
+    if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
         if (g_state.WritePosition() != g_state.DrainedPosition()) {
             ++g_h2_drain_reasons[static_cast<size_t>(reason)];
             g_state.DrainAsync();
@@ -1187,48 +1187,64 @@ inline u32 g_h2_bypass_threshold = [] {
             return parsed;
         }
     }
-    return 60000U;
+    return 65000U;
 }();
 inline std::atomic<u32> g_h2_current_draw_rate{140000};
 inline std::atomic<u64> g_h2_bypass_frames{0};
 inline std::atomic<u64> g_h2_split_frames{0};
+inline u32 g_h2_bypass_cooldown_frames{0};
 
-inline void UpdateH2BypassState(u32 rate, const char* source) {
+enum class H2BypassTransition : u8 {
+    None = 0,
+    EnteredBypass,
+    ExitedBypass,
+};
+
+inline H2BypassTransition UpdateH2BypassState(u32 rate, const char* source) {
+    if (g_h2_bypass_cooldown_frames > 0) {
+        --g_h2_bypass_cooldown_frames;
+        return H2BypassTransition::None;
+    }
     const u32 low_thresh = g_h2_bypass_threshold;
-    const u32 high_thresh = (g_h2_bypass_threshold * 115) / 100;
+    const u32 high_thresh = g_h2_bypass_threshold + 20000U;
     const bool currently_bypassed = g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
     if (!currently_bypassed && rate < low_thresh) {
-        DrainAsyncH2(H2DrainReason::Other);
         g_h2_dynamic_bypass_active.store(true, std::memory_order_release);
+        g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass ACTIVATED via {} (draw_rate={}/s < {})",
                  source, rate, low_thresh);
+        return H2BypassTransition::EnteredBypass;
     } else if (currently_bypassed && rate > high_thresh) {
         g_h2_dynamic_bypass_active.store(false, std::memory_order_release);
+        g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass DEACTIVATED via {} (draw_rate={}/s > {})",
                  source, rate, high_thresh);
+        return H2BypassTransition::ExitedBypass;
     }
+    return H2BypassTransition::None;
 }
 
-inline void NoteH2FrameDrawCount(u32 frame_draws, u64 frame_duration_ns) {
+inline H2BypassTransition NoteH2FrameDrawCount(u32 frame_draws, u64 frame_duration_ns) {
     if (!g_h2_async || !g_h2_dynamic_bypass_enabled) {
-        return;
+        return H2BypassTransition::None;
     }
     // Filter out micro-intervals (< 5ms) to prevent division explosions during rapid presentation bursts
     if (frame_duration_ns < 5'000'000ULL) {
-        return;
+        return H2BypassTransition::None;
     }
     const u32 rate = static_cast<u32>((static_cast<u64>(frame_draws) * 1'000'000'000ULL) / frame_duration_ns);
     const u32 prev_rate = g_h2_current_draw_rate.load(std::memory_order_relaxed);
-    const u32 new_rate = (prev_rate * 7 + rate) / 8;
+    const u32 new_rate = (prev_rate * 15 + rate) / 16;
     g_h2_current_draw_rate.store(new_rate, std::memory_order_relaxed);
 
-    UpdateH2BypassState(new_rate, "FrameTick");
+    const H2BypassTransition transition = UpdateH2BypassState(new_rate, "FrameTick");
 
     if (g_h2_dynamic_bypass_active.load(std::memory_order_relaxed)) {
         g_h2_bypass_frames.fetch_add(1, std::memory_order_relaxed);
     } else {
         g_h2_split_frames.fetch_add(1, std::memory_order_relaxed);
     }
+    return transition;
 }
 
 inline void NoteH2ReportDraws(double sec) {
@@ -1237,9 +1253,6 @@ inline void NoteH2ReportDraws(double sec) {
     }
     const u64 win_draws = g_h2_total_draws_window.exchange(0, std::memory_order_relaxed);
     const double win_draws_sec = static_cast<double>(win_draws) / sec;
-    if (win_draws_sec > 0.0) {
-        UpdateH2BypassState(static_cast<u32>(win_draws_sec), "MaybeReport");
-    }
     LOG_INFO(HW_GPU,
              "Nx2BackSplit H2: bypass_active={}, bypass_frames={}, split_frames={}, current_rate={}/s, win_rate={:.0f}/s (thresh={})",
              g_h2_dynamic_bypass_active.load(std::memory_order_relaxed),
@@ -1255,7 +1268,7 @@ struct H2DrainScope {
     bool active{};
 
     explicit H2DrainScope(H2DrainReason reason) {
-        if (H2Async() && OnStageA()) [[unlikely]] {
+        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
             DrainAsyncH2(reason);
             ++t_h2_drained_depth;
             active = true;
@@ -1266,7 +1279,7 @@ struct H2DrainScope {
     /// can be elided (e.g. SkipEmptyFence fast-path), but the scope must still prevent GPUBackB
     /// from enqueuing new tasks while the synchronous operation runs on Stage A.
     explicit H2DrainScope(H2DrainReason reason, bool do_drain) {
-        if (H2Async() && OnStageA()) [[unlikely]] {
+        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
             if (do_drain) {
                 DrainAsyncH2(reason);
             }
