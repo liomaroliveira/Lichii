@@ -2281,15 +2281,16 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             QtCommon::system->GetFrontendAppletHolder().SetCurrentAppletId(Service::AM::AppletId::QLaunch);
         }
         if (type == StartGameType::Normal) {
-        // Load per game settings
-        const auto file_path =
-            std::filesystem::path{Common::U16StringFromBuffer(filename.utf16(), filename.size())};
-        const auto config_file_name = title_id == 0
-                                          ? Common::FS::PathToUTF8String(file_path.filename())
-                                          : fmt::format("{:016X}", title_id);
-        QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
-        QtCommon::system->HIDCore().ReloadInputDevices();
-        QtCommon::system->ApplySettings();
+            // Load per game settings
+            const auto file_path =
+                std::filesystem::path{Common::U16StringFromBuffer(filename.utf16(), filename.size())};
+            const auto config_file_name = title_id == 0
+                                              ? Common::FS::PathToUTF8String(file_path.filename())
+                                              : fmt::format("{:016X}", title_id);
+            QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
+            QtCommon::system->HIDCore().ReloadInputDevices();
+            QtCommon::system->ApplySettings();
+        }
     }
 
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
