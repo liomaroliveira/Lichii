@@ -369,6 +369,7 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
     using namespace FileSys;
 
     const auto& cache = system.GetContentProviderUnion();
+    constexpr u64 QLaunchId = 0x0100000000001000ULL;
 
     auto installed_games = cache.ListEntriesFilterOrigin(std::nullopt, TitleType::Application,
                                                          ContentRecordType::Program);
@@ -382,6 +383,17 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
     } else if (parent_type == GameListItemType::SysNandDir) {
         installed_games = cache.ListEntriesFilterOrigin(
             ContentProviderUnionSlot::SysNAND, TitleType::Application, ContentRecordType::Program);
+        // E53.T10: Listar QLaunch (0100000000001000) na pasta SysNAND
+        if (cache.HasEntry(ContentProviderUnionSlot::SysNAND, QLaunchId, ContentRecordType::Program)) {
+            installed_games.emplace_back(ContentProviderUnionSlot::SysNAND,
+                ContentProviderEntry{QLaunchId, ContentRecordType::Program, TitleType::SystemProgram});
+        }
+    } else {
+        // Modo lista plana sem pastas: inclui o QLaunch se presente no SysNAND
+        if (cache.HasEntry(ContentProviderUnionSlot::SysNAND, QLaunchId, ContentRecordType::Program)) {
+            installed_games.emplace_back(ContentProviderUnionSlot::SysNAND,
+                ContentProviderEntry{QLaunchId, ContentRecordType::Program, TitleType::SystemProgram});
+        }
     }
 
     for (const auto& [slot, game] : installed_games) {
@@ -410,6 +422,10 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         const auto control = cache.GetEntry(game.title_id, ContentRecordType::Control);
         if (control != nullptr) {
             GetMetadataFromControlNCA(patch, *control, icon, name);
+        }
+
+        if ((name.empty() || name == " ") && program_id == QLaunchId) {
+            name = "Switch Home Menu (qlaunch)";
         }
 
         auto entry = MakeGameListEntry(file->GetFullPath(), name, file->GetSize(), icon, *loader,

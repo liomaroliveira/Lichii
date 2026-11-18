@@ -2274,8 +2274,13 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     const auto loader =
         Loader::GetLoader(*QtCommon::system, v_file, params.program_id, params.program_index);
 
-    if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
-        type == StartGameType::Normal) {
+    if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success) {
+        // E53.T10: Se o título for o QLaunch (Home Menu: 0x0100000000001000), configurar LibraryAppletParameters
+        if (title_id == 0x0100000000001000ULL || params.program_id == 0x0100000000001000ULL) {
+            params = LibraryAppletParameters(0x0100000000001000ULL, Service::AM::AppletId::QLaunch);
+            QtCommon::system->GetFrontendAppletHolder().SetCurrentAppletId(Service::AM::AppletId::QLaunch);
+        }
+        if (type == StartGameType::Normal) {
         // Load per game settings
         const auto file_path =
             std::filesystem::path{Common::U16StringFromBuffer(filename.utf16(), filename.size())};
