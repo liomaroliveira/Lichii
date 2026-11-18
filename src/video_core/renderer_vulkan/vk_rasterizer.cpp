@@ -2871,7 +2871,8 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    ++h2_frame_draws;
+    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
+    VideoCommon::BackSplit::NoteDrawEntered();
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -3113,7 +3114,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
-    ++h2_frame_draws;
+    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
+    VideoCommon::BackSplit::NoteDrawEntered();
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -3390,7 +3392,8 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
-    ++h2_frame_draws;
+    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
+    VideoCommon::BackSplit::NoteDrawEntered();
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::RtOrClear);
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -5799,8 +5802,8 @@ void RasterizerVulkan::TickFrame() {
                                            now - h2_last_frame_time)
                                            .count());
         h2_last_frame_time = now;
-        VideoCommon::BackSplit::NoteH2FrameDrawCount(h2_frame_draws, frame_ns);
-        h2_frame_draws = 0;
+        const u32 draws = h2_frame_draws.exchange(0, std::memory_order_relaxed);
+        VideoCommon::BackSplit::NoteH2FrameDrawCount(draws, frame_ns);
     }
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Flush};
