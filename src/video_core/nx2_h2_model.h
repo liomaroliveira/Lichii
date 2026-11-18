@@ -366,3 +366,18 @@ inline void MaybeReport() {
 }
 
 } // namespace VideoCommon::Nx2H2Model
+
+namespace VideoCommon {
+
+/// EDEN_NX2_H2_SPLIT=1 (E04.T11): runs Side A (TextureCache/handles/image descriptors/RTs) and
+/// Side B (BufferCache/descriptor queue/scheduler draw recording) as physically decoupled phases
+/// on one thread via H2DrawPacket. Disabled by default.
+[[nodiscard]] inline bool Nx2H2SplitEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_H2_SPLIT");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+} // namespace VideoCommon

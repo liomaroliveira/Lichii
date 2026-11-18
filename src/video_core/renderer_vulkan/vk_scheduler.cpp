@@ -711,6 +711,66 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     framebuffer->MarkResolveShadowsUpToDate();
 }
 
+void Scheduler::BeginRenderPassSnapshotImpl(const FramebufferSnapshot& fb, VkRenderPass renderpass,
+                                            const VkClearValue* clear_values,
+                                            u32 clear_value_count) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
+    ++trace_counts.render_passes;
+    const VkFramebuffer framebuffer_handle = fb.handle;
+    const VkExtent2D render_area = fb.render_area;
+    ++render_pass_serial;
+    state.renderpass = renderpass;
+    state.framebuffer = framebuffer_handle;
+    state.render_area = render_area;
+
+    if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
+        const std::string render_pass_info =
+            fmt::format("renderArea={}x{}, numImages={}", render_area.width, render_area.height,
+                        fb.num_images);
+        GPU::Logging::GPULogger::GetInstance().LogRenderPassBegin(render_pass_info);
+    }
+
+    std::array<VkClearValue, 9> values{};
+    for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
+        values[i] = clear_values[i];
+    }
+    const bool after_compute = std::exchange(compute_writes_pending, false);
+    RecordAs([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+              after_compute](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+        const VkRenderPassBeginInfo renderpass_bi{
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .pNext = nullptr,
+            .renderPass = renderpass,
+            .framebuffer = framebuffer_handle,
+            .renderArea =
+                {
+                    .offset = {.x = 0, .y = 0},
+                    .extent = render_area,
+                },
+            .clearValueCount = clear_value_count,
+            .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
+        };
+        if (after_compute) {
+            // Draws read compute output as indirect arguments, vertices and resources; nothing
+            // else orders those reads after the dispatch.
+            static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
+        }
+        cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+    }, last_pass_end, RecordSite::PassBegin, 0);
+    num_renderpass_images = fb.num_images;
+    renderpass_images = fb.images;
+    renderpass_image_ranges = fb.image_ranges;
+}
+
 void Scheduler::RealizeDeferredClear() {
     if (deferred_clear.framebuffer == nullptr) {
         return;
@@ -803,6 +863,28 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // Ends any active pass and realizes a deferred clear
     EndRenderPass(location);
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+}
+
+void Scheduler::RequestRenderpassSnapshot(const FramebufferSnapshot& fb,
+                                          std::source_location location) {
+    if (deferred_clear.framebuffer != nullptr) {
+        if (deferred_clear.framebuffer->Handle() == fb.handle) {
+            RealizeDeferredClear();
+            return;
+        }
+        RealizeDeferredClear();
+        EndRenderPass(location);
+    }
+    if (state.renderpass && fb.handle == state.framebuffer &&
+        fb.render_area.width == state.render_area.width &&
+        fb.render_area.height == state.render_area.height) {
+        return;
+    }
+    if (state.renderpass) {
+        CountRenderPassEnd(location);
+    }
+    EndRenderPass(location);
+    BeginRenderPassSnapshotImpl(fb, fb.renderpass, nullptr, 0);
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {

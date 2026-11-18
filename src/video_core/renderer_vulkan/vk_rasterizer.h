@@ -231,12 +231,15 @@ private:
 
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
-    void UpdateDynamicStates(const GraphicsPipeline* pipeline);
+    void UpdateDynamicStates(const GraphicsPipeline* pipeline,
+                             std::optional<bool> is_rescaling_override = std::nullopt);
 
     void HandleTransformFeedback();
 
-    void UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs,
+                              std::optional<bool> is_rescaling_override = std::nullopt);
+    void UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs,
+                             std::optional<bool> is_rescaling_override = std::nullopt);
     void UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateBlendConstants(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthBounds(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -257,8 +260,10 @@ private:
     void UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                     const GraphicsPipeline* pipeline);
+    void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                const GraphicsPipeline* pipeline);
     void UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -291,6 +296,8 @@ private:
     /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
     /// gets new sample positions each frame (the game renders without jitter). The offset goes to
     /// FSR with the frame.
+    std::array<f32, 2> ComputeOcarinaJitter();
+    void ApplyOcarinaJitter(std::array<f32, 2> want);
     void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
     bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);

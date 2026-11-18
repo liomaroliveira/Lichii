@@ -43,6 +43,7 @@ namespace Vulkan {
 class CommandPool;
 class Device;
 class Framebuffer;
+struct FramebufferSnapshot;
 class GpuCost;
 class GraphicsPipeline;
 class ReorderedUploadBatch;
@@ -158,6 +159,10 @@ public:
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
+
+    /// Requests to begin a renderpass from a value snapshot (H2 Side B).
+    void RequestRenderpassSnapshot(const FramebufferSnapshot& fb,
+                                   std::source_location location = std::source_location::current());
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
@@ -542,6 +547,10 @@ private:
     /// Begins a render pass for the given framebuffer, optionally with clear values.
     void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                              const VkClearValue* clear_values, u32 clear_value_count);
+
+    /// Begins a render pass from a value snapshot, optionally with clear values.
+    void BeginRenderPassSnapshotImpl(const FramebufferSnapshot& fb, VkRenderPass renderpass,
+                                     const VkClearValue* clear_values, u32 clear_value_count);
 
     /// If a deferred clear is pending.
     void RealizeDeferredClear();

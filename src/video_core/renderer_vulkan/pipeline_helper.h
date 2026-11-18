@@ -407,8 +407,34 @@ public:
            VideoCore::Surface::IsPixelFormatETC2(format);
 }
 
+/// Value sink for PushImageDescriptors on H2 Side A (avoids touching GuestDescriptorQueue).
+struct ImageDescriptorSink {
+    boost::container::small_vector<DescriptorUpdateEntry, 32> entries;
+
+    void AddSampledImage(VkImageView image_view, VkSampler sampler) {
+        entries.emplace_back(VkDescriptorImageInfo{
+            .sampler = sampler,
+            .imageView = image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        });
+    }
+
+    void AddImage(VkImageView image_view) {
+        entries.emplace_back(VkDescriptorImageInfo{
+            .sampler = VK_NULL_HANDLE,
+            .imageView = image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        });
+    }
+
+    [[nodiscard]] size_t UpdateCount() const noexcept {
+        return entries.size();
+    }
+};
+
+template <typename DescriptorSink>
 inline void PushImageDescriptors(TextureCache& texture_cache,
-                                 GuestDescriptorQueue& guest_descriptor_queue,
+                                 DescriptorSink& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views) {

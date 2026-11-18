@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <type_traits>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -483,6 +484,29 @@ private:
     mutable std::array<VkRenderPass, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_render_passes{};
     mutable u32 num_memoized_variants{};
 };
+
+/// Value snapshot of a Framebuffer for H2 Side B render pass requests without dereferencing
+/// TextureCache-owned objects.
+struct FramebufferSnapshot {
+    VkFramebuffer handle{VK_NULL_HANDLE};
+    VkRenderPass renderpass{VK_NULL_HANDLE};
+    VkExtent2D render_area{};
+    u32 num_images{};
+    std::array<VkImage, 9> images{};
+    std::array<VkImageSubresourceRange, 9> image_ranges{};
+
+    [[nodiscard]] static FramebufferSnapshot From(const Framebuffer& fb) noexcept {
+        return FramebufferSnapshot{
+            .handle = fb.Handle(),
+            .renderpass = fb.RenderPass(),
+            .render_area = fb.RenderArea(),
+            .num_images = fb.NumImages(),
+            .images = fb.Images(),
+            .image_ranges = fb.ImageRanges(),
+        };
+    }
+};
+static_assert(std::is_trivially_copyable_v<FramebufferSnapshot>);
 
 class Image : public VideoCommon::ImageBase {
 public:

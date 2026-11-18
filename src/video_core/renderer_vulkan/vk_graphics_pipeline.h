@@ -18,10 +18,13 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -136,6 +139,28 @@ struct KeptGraphicsStages {
     [[nodiscard]] u64 Bytes() const noexcept;
 };
 
+/// Per-draw packet produced by Side A (TextureCache/handles/image descriptors/render targets)
+/// and consumed by Side B (BufferCache/descriptor queue/scheduler) under EDEN_NX2_H2_SPLIT=1.
+struct H2DrawPacket {
+    static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+
+    bool fallback_sync{};
+    bool failed{};
+    bool is_indexed{};
+    bool is_delta{};
+    bool unbind_tex_buffers{};
+    bool feedback_break{};
+    bool is_rescaling{};
+    bool replay_images{};
+    bool has_taken_delta{};
+    VideoCommon::Nx2FastDraw::Delta taken_delta{};
+    std::array<f32, 2> oot_jitter{};
+    FramebufferSnapshot fb_snapshot{};
+    boost::container::small_vector<DescriptorUpdateEntry, 32> image_entries;
+    std::array<std::pair<u32, u32>, NUM_STAGES> image_ranges{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling_words{};
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -217,6 +242,14 @@ public:
     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
     [[nodiscard]] bool IsEmulatedMesh() const noexcept {
         return mesh_emulation.has_value();
+    }
+
+    [[nodiscard]] bool HasMeshEmulation() const noexcept {
+        return mesh_emulation.has_value();
+    }
+
+    [[nodiscard]] bool UsesTextureOrImageBuffers() const noexcept {
+        return uses_texture_or_image_buffers;
     }
 
     /// Output bytes the emulation needs for one mesh workgroup.
@@ -482,6 +515,16 @@ public:
     /// changed), or nothing when the draw must resolve in full.
     std::optional<u32> RetextureComputed();
 
+    /// H2 split (EDEN_NX2_H2_SPLIT=1): Side A prepares TextureCache descriptors, image descriptor
+    /// entries, render targets and feedback state into `pkt`, touching neither BufferCache nor
+    /// GuestDescriptorQueue nor recording Scheduler commands.
+    bool PrepareSideA(bool is_indexed, bool is_delta, bool taken_revisit, H2DrawPacket& pkt);
+
+    /// H2 split (EDEN_NX2_H2_SPLIT=1): Side B binds BufferCache state, pushes buffered image
+    /// descriptors to GuestDescriptorQueue and records the draw via Scheduler without touching
+    /// TextureCache or `configured_stages`.
+    bool ExecuteSideB(const H2DrawPacket& pkt);
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -505,6 +548,10 @@ private:
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
+
+    bool ConfigureDrawImpl(const RescalingPushConstant& rescaling,
+                           const RenderAreaPushConstant& render_area,
+                           const FramebufferSnapshot* fb_snap, bool is_rescaling_override);
 
     void MakePipeline(VkRenderPass render_pass);
 
@@ -537,6 +584,9 @@ private:
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     /// Stages with a shader, and whether a handle is computed at draw time (SharesDeltaStateWith).
     std::array<bool, NUM_STAGES> stage_enabled{};
+    std::array<bool, NUM_STAGES> immutable_enabled_stages{};
+    bool uses_texture_or_image_buffers{};
+    bool has_image_descriptors{};
     bool has_computed_handles{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
@@ -614,6 +664,12 @@ private:
     std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
     u64 kept_scale_epoch{};
     bool kept_images_valid{};
+
+    /// Side B private copy of the kept image descriptors for H2 split replay.
+    std::vector<DescriptorUpdateEntry> b_kept_image_entries;
+    std::array<std::pair<u32, u32>, NUM_STAGES> b_kept_image_ranges{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> b_kept_rescaling{};
+    bool b_kept_images_valid{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

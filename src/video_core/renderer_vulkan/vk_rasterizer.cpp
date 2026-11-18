@@ -1706,224 +1706,441 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const u64 draw_map_serial = gpu_memory->MapSerial();
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
-    {
-        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
-        const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-            maxwell3d->regs, pipeline->HasDynamicVertexInput());
-        if (repack_dirty) {
-            auto& flags = maxwell3d->dirty.flags;
-            flags[VideoCommon::Dirty::VertexBuffers] = true;
-            flags[Dirty::VertexInput] = true;
-            for (u32 binding = 0; binding < 32; ++binding) {
-                if (repack_dirty & (1U << binding)) {
-                    flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
-                }
-            }
-        }
-    }
-    setup_scope.reset();
-    // Handles computed at draw time come from memory the delta doesn't track: evaluated again for
-    // each delta draw, the views of the ones that changed are resolved as written handles are.
-    bool computed_checked = false;
-    const bool retextured = [&] {
-        if (delta_pipeline == nullptr) {
-            return true;
-        }
-        Profile::Scope scope{Profile::Zone::ReadHandles};
-        if (!taken_retexture) {
-            if (!delta_pipeline->HasComputedHandles() || !delta_pipeline->CanRetexture()) {
+
+    DrawPath path = DrawPath::Full;
+    if (VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() &&
+        !pipeline->UsesTextureOrImageBuffers() && !frame_dump.Capturing()) {
+        setup_scope.reset();
+        // --- Side A: TextureCache, handles, image descriptors, render targets ---
+        bool computed_checked = false;
+        const bool retextured = [&] {
+            if (delta_pipeline == nullptr) {
                 return true;
             }
-            computed_checked = true;
-            const std::optional<u32> resolved = delta_pipeline->RetextureComputed();
+            Profile::Scope scope{Profile::Zone::ReadHandles};
+            if (!taken_retexture) {
+                if (!delta_pipeline->HasComputedHandles() || !delta_pipeline->CanRetexture()) {
+                    return true;
+                }
+                computed_checked = true;
+                const std::optional<u32> resolved = delta_pipeline->RetextureComputed();
+                if (!resolved) {
+                    ++fast_draw_stats.retexture_failed;
+                    ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandleData)];
+                    last_full_reason = FullDraw::HandleData;
+                    return false;
+                }
+                if (*resolved != 0) {
+                    ++fast_draw_stats.retexture_computed;
+                    ++fast_draw_stats.retexture_resolved;
+                }
+                return true;
+            }
+            if (taken_revisit) {
+                // The draws in between may have left other texture pools synchronized.
+                texture_cache.SynchronizeDescriptors(false);
+            }
+            const std::optional<u32> resolved = delta_pipeline->RetextureDelta();
             if (!resolved) {
                 ++fast_draw_stats.retexture_failed;
                 ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandleData)];
                 last_full_reason = FullDraw::HandleData;
                 return false;
             }
-            if (*resolved != 0) {
-                ++fast_draw_stats.retexture_computed;
-                ++fast_draw_stats.retexture_resolved;
-            }
+            // RetextureDelta evaluated the computed handles now, and kept their values.
+            computed_checked = true;
+            ++(*resolved == 0 ? fast_draw_stats.retexture_unchanged
+                              : fast_draw_stats.retexture_resolved);
             return true;
-        }
-        if (taken_revisit) {
-            // The draws in between may have left other texture pools synchronized.
-            texture_cache.SynchronizeDescriptors(false);
-        }
-        const std::optional<u32> resolved = delta_pipeline->RetextureDelta();
-        if (!resolved) {
-            ++fast_draw_stats.retexture_failed;
-            ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandleData)];
-            last_full_reason = FullDraw::HandleData;
-            return false;
-        }
-        // RetextureDelta evaluated the computed handles now, and kept their values.
-        computed_checked = true;
-        ++(*resolved == 0 ? fast_draw_stats.retexture_unchanged
-                          : fast_draw_stats.retexture_resolved);
-        return true;
-    }();
-    const bool delta_holds =
-        delta_pipeline != nullptr && retextured &&
-        DeltaStillHolds(delta_pipeline, draw_serial, draw_memory_serial, draw_map_serial,
-                        computed_checked);
-    if (taken_revisit && delta_holds) {
-        delta_pipeline->UnbindStageTextureBuffers();
-    }
-    const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
-    // EDEN_NX2_FAST_DRAW_VERIFY compares only draws that would have taken the delta path.
-    const bool verify_kept = verify_views && delta_holds;
-    verify_vertex_input = verify_kept;
-    // Every draw keeps the uniform buffers no write reached since they were streamed.
-    {
-        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
-        buffer_cache.BeginGraphicsUniforms(fast_draw_on && !uniform_writes_lost ? &taken_delta
-                                                                                : nullptr);
-    }
-    uniform_writes_lost = taken_delta_unconsumed = false;
-    if (path == DrawPath::Delta) {
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
-            report_failure("configure failed");
-            TraceRenderState(is_indexed, "configure-failed", nullptr);
-            return;
-        }
-        ++fast_draw_stats.delta;
-    } else {
-        // What the delta draw would have kept: the texture buffer bindings. Only draws that
-        // passed DeltaStillHolds are compared; the others would have been resolved in full.
+        }();
+        const bool delta_holds =
+            delta_pipeline != nullptr && retextured &&
+            DeltaStillHolds(delta_pipeline, draw_serial, draw_memory_serial, draw_map_serial,
+                            computed_checked);
+        path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
         const bool verify_kept = verify_views && delta_holds;
-        const u64 kept_bindings =
-            verify_kept ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
-        if (fast_draw_on) {
+        if (path == DrawPath::Full && fast_draw_on) {
             pipeline->CaptureNextDelta(verify_kept);
         }
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
-            report_failure("configure failed");
-            TraceRenderState(is_indexed, "configure-failed", nullptr);
-            return;
-        }
-        if (verify_kept && pipeline->DeltaMismatch()) {
-            ++fast_draw_stats.view_mismatches;
-        }
-        if (verify_kept &&
-            kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
-            ++fast_draw_stats.binding_mismatches;
-        }
-    }
-    VideoCommon::Nx2H2Model::NoteDraw();
-    if (reuse_start != 0) {
-        const u64 probe_start = VideoCommon::Nx2Profile::Now();
-        reuse = NoteDrawReuse(*pipeline, is_indexed);
-        reuse_path = path;
-        reuse_probe_ns = VideoCommon::Nx2Profile::Now() - probe_start;
-    }
-    if (DrawRepeatEnabled()) {
-        NoteDrawRepeat(*pipeline, is_indexed, path);
-    }
 
-    TrackOcarinaCamera();
-    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
-    TracePendingCpuWrites(false, pipeline->ShaderHashes());
-    TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
-    if (frame_dump.Capturing()) {
-        FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(pipeline->ShaderHashes());
-        if (frame_dump.WantsShaders(pipeline)) {
-            frame_dump.NoteGraphicsShaders(
-                *pipeline, pipeline_cache.CaptureGraphicsPrograms(pipeline->ShaderHashes()));
+        H2DrawPacket pkt{};
+        pkt.has_taken_delta = fast_draw_on && !uniform_writes_lost;
+        if (pkt.has_taken_delta) {
+            pkt.taken_delta = taken_delta;
         }
-        bool recorded = false;
-        if (frame_dump.CapturingSampled()) {
-            boost::container::small_vector<FrameDump::Sampled, 16> sampled;
-            for (const auto& image : pipeline->SampledImages()) {
-                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
-                                   &texture_cache.GetSampler(image.sampler)});
+        {
+            Profile::Scope scope{Profile::Zone::Configure};
+            if (!pipeline->PrepareSideA(is_indexed, path == DrawPath::Delta,
+                                        taken_revisit && delta_holds, pkt)) {
+                report_failure("configure failed");
+                TraceRenderState(is_indexed, "configure-failed", nullptr);
+                return;
             }
-            recorded = frame_dump.NoteSampled(sampled);
         }
-        if (frame_dump.CapturingBuffers()) {
-            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+        TrackOcarinaCamera();
+        pkt.oot_jitter = ComputeOcarinaJitter();
+        const auto hashes = pipeline->ShaderHashes();
+        constexpr u64 final_vertex = 0x16aff33d999f993fULL;
+        constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
+        if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
+            std::ranges::find(hashes, final_vertex) != hashes.end()) {
+            const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (target_id) {
+                const auto& target = texture_cache.GetImageView(target_id);
+                if (target.size.width == 2560 && target.size.height == 1440 &&
+                    target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
+                    oot_4k_guest_present = target.ImageHandle();
+                }
+            }
         }
-        if (recorded) {
-            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+        VkImageView save_effects_view{VK_NULL_HANDLE};
+        VkExtent2D save_effects_extent{};
+        constexpr u64 fog_fragment = 0x3ddfb1d7a854c849ULL;
+        if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaTemporalEnabled() &&
+            oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+            oot_camera_sample_frame == render_trace_frame) {
+            const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (scene_id) {
+                const auto& scene = texture_cache.GetImageView(scene_id);
+                if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                    scene.size.width == oot_motion.extent.width &&
+                    scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
+                    scene.range == VideoCommon::SubresourceRange{}) {
+                    oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
+                    oot_effects_address = scene.gpu_addr;
+                    oot_effects_frame = render_trace_frame;
+                    save_effects_view = oot_effects_scene;
+                    save_effects_extent = oot_motion.extent;
+                }
+            }
         }
-    }
-    if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
-        LOG_DEBUG(Render_Vulkan,
-                  "Render trace pipeline: frame={} draw={} hashes={:016x} dynamic_vertex_input={}",
-                  render_trace_frame, render_trace_draws, fmt::join(pipeline->ShaderHashes(), ","),
-                  pipeline->HasDynamicVertexInput());
-    }
+        if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
+            TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+        }
 
-    if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
-        static const bool readback = [] {
-            const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
-            return value && std::string_view{value} == "1";
+        // --- Side B: BufferCache, descriptor queue, dynamic state, draw recording ---
+        {
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+                maxwell3d->regs, pipeline->HasDynamicVertexInput());
+            if (repack_dirty) {
+                auto& flags = maxwell3d->dirty.flags;
+                flags[VideoCommon::Dirty::VertexBuffers] = true;
+                flags[Dirty::VertexInput] = true;
+                for (u32 binding = 0; binding < 32; ++binding) {
+                    if (repack_dirty & (1U << binding)) {
+                        flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+                    }
+                }
+            }
+            buffer_cache.BeginGraphicsUniforms(pkt.has_taken_delta ? &pkt.taken_delta : nullptr);
+        }
+        uniform_writes_lost = taken_delta_unconsumed = false;
+        verify_vertex_input = verify_kept;
+        const u64 kept_bindings =
+            (path == DrawPath::Full && verify_kept)
+                ? buffer_cache.KeptGraphicsBindingsHash(false, false, true)
+                : 0;
+        {
+            Profile::Scope scope{Profile::Zone::Configure};
+            if (!pipeline->ExecuteSideB(pkt)) {
+                report_failure("configure failed");
+                TraceRenderState(is_indexed, "configure-failed", nullptr);
+                return;
+            }
+        }
+        if (path == DrawPath::Delta) {
+            ++fast_draw_stats.delta;
+        } else {
+            if (verify_kept && pipeline->DeltaMismatch()) {
+                ++fast_draw_stats.view_mismatches;
+            }
+            if (verify_kept &&
+                kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
+                ++fast_draw_stats.binding_mismatches;
+            }
+        }
+        VideoCommon::Nx2H2Model::NoteDraw();
+        if (reuse_start != 0) {
+            const u64 probe_start = VideoCommon::Nx2Profile::Now();
+            reuse = NoteDrawReuse(*pipeline, is_indexed);
+            reuse_path = path;
+            reuse_probe_ns = VideoCommon::Nx2Profile::Now() - probe_start;
+        }
+        if (DrawRepeatEnabled()) {
+            NoteDrawRepeat(*pipeline, is_indexed, path);
+        }
+        TrackOcarinaActor(hashes[1], is_indexed, is_indirect);
+        TracePendingCpuWrites(false, hashes);
+        if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) &&
+            render_trace_draws <= 2048) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace pipeline: frame={} draw={} hashes={:016x} "
+                      "dynamic_vertex_input={}",
+                      render_trace_frame, render_trace_draws, fmt::join(hashes, ","),
+                      pipeline->HasDynamicVertexInput());
+        }
+        if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
+            static const bool readback = [] {
+                const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
+                return value && std::string_view{value} == "1";
+            }();
+            if (readback) {
+                CaptureIndirectTrace();
+            }
+        }
+        {
+            Profile::Scope scope{Profile::Zone::DynamicState};
+            const VideoCommon::Nx2H2Model::SideScope h2_dyn{VideoCommon::Nx2H2Model::Side::Dyn};
+            ApplyOcarinaJitter(pkt.oot_jitter);
+            UpdateDynamicStates(pipeline, pkt.is_rescaling);
+            verify_vertex_input = false;
+        }
+        {
+            const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            query_cache.NotifySegment(true);
+            HandleTransformFeedback();
+            query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                      maxwell3d->regs.zpass_pixel_count_enable);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::DrawRecord};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            scheduler.TraceGraphicsPipeline(hashes);
+            trace_draw_hashes = {hashes[1], hashes[5]};
+            draw_func();
+        }
+        submitted = true;
+        buffer_cache.NoteWorkRecorded(false);
+        if (save_effects_view != VK_NULL_HANDLE) {
+            oot_live_dlss->SaveEffectsBase(save_effects_view, save_effects_extent,
+                                           render_trace_frame);
+        }
+    } else {
+        {
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+                maxwell3d->regs, pipeline->HasDynamicVertexInput());
+            if (repack_dirty) {
+                auto& flags = maxwell3d->dirty.flags;
+                flags[VideoCommon::Dirty::VertexBuffers] = true;
+                flags[Dirty::VertexInput] = true;
+                for (u32 binding = 0; binding < 32; ++binding) {
+                    if (repack_dirty & (1U << binding)) {
+                        flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+                    }
+                }
+            }
+        }
+        setup_scope.reset();
+        // Handles computed at draw time come from memory the delta doesn't track: evaluated again
+        // for each delta draw, the views of the ones that changed are resolved as written handles
+        // are.
+        bool computed_checked = false;
+        const bool retextured = [&] {
+            if (delta_pipeline == nullptr) {
+                return true;
+            }
+            Profile::Scope scope{Profile::Zone::ReadHandles};
+            if (!taken_retexture) {
+                if (!delta_pipeline->HasComputedHandles() || !delta_pipeline->CanRetexture()) {
+                    return true;
+                }
+                computed_checked = true;
+                const std::optional<u32> resolved = delta_pipeline->RetextureComputed();
+                if (!resolved) {
+                    ++fast_draw_stats.retexture_failed;
+                    ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandleData)];
+                    last_full_reason = FullDraw::HandleData;
+                    return false;
+                }
+                if (*resolved != 0) {
+                    ++fast_draw_stats.retexture_computed;
+                    ++fast_draw_stats.retexture_resolved;
+                }
+                return true;
+            }
+            if (taken_revisit) {
+                // The draws in between may have left other texture pools synchronized.
+                texture_cache.SynchronizeDescriptors(false);
+            }
+            const std::optional<u32> resolved = delta_pipeline->RetextureDelta();
+            if (!resolved) {
+                ++fast_draw_stats.retexture_failed;
+                ++fast_draw_stats.full[static_cast<size_t>(FullDraw::HandleData)];
+                last_full_reason = FullDraw::HandleData;
+                return false;
+            }
+            // RetextureDelta evaluated the computed handles now, and kept their values.
+            computed_checked = true;
+            ++(*resolved == 0 ? fast_draw_stats.retexture_unchanged
+                              : fast_draw_stats.retexture_resolved);
+            return true;
         }();
-        if (readback) {
-            CaptureIndirectTrace();
+        const bool delta_holds =
+            delta_pipeline != nullptr && retextured &&
+            DeltaStillHolds(delta_pipeline, draw_serial, draw_memory_serial, draw_map_serial,
+                            computed_checked);
+        if (taken_revisit && delta_holds) {
+            delta_pipeline->UnbindStageTextureBuffers();
         }
-    }
-
-    {
-        Profile::Scope scope{Profile::Zone::DynamicState};
-        const VideoCommon::Nx2H2Model::SideScope h2_dyn{VideoCommon::Nx2H2Model::Side::Dyn};
-        UpdateOcarinaJitter();
-        UpdateDynamicStates(pipeline);
-        verify_vertex_input = false;
-    }
-
-    {
-        const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
-        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
-        query_cache.NotifySegment(true);
-        HandleTransformFeedback();
-        query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
-                                  maxwell3d->regs.zpass_pixel_count_enable);
-    }
-    {
-        Profile::Scope scope{Profile::Zone::DrawRecord};
-        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
-        scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
-        trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
-        draw_func();
-    }
-    submitted = true;
-    buffer_cache.NoteWorkRecorded(false);
-    constexpr u64 final_vertex = 0x16aff33d999f993fULL;
-    constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
-    const auto hashes = pipeline->ShaderHashes();
-    if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
-        std::ranges::find(hashes, final_vertex) != hashes.end()) {
-        const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
-        if (target_id) {
-            const auto& target = texture_cache.GetImageView(target_id);
-            if (target.size.width == 2560 && target.size.height == 1440 &&
-                target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
-                oot_4k_guest_present = target.ImageHandle();
+        path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+        // EDEN_NX2_FAST_DRAW_VERIFY compares only draws that would have taken the delta path.
+        const bool verify_kept = verify_views && delta_holds;
+        verify_vertex_input = verify_kept;
+        // Every draw keeps the uniform buffers no write reached since they were streamed.
+        {
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            buffer_cache.BeginGraphicsUniforms(fast_draw_on && !uniform_writes_lost ? &taken_delta
+                                                                                    : nullptr);
+        }
+        uniform_writes_lost = taken_delta_unconsumed = false;
+        if (path == DrawPath::Delta) {
+            if (Profile::Scope scope{Profile::Zone::Configure};
+                !pipeline->ConfigureDelta(is_indexed)) {
+                report_failure("configure failed");
+                TraceRenderState(is_indexed, "configure-failed", nullptr);
+                return;
+            }
+            ++fast_draw_stats.delta;
+        } else {
+            // What the delta draw would have kept: the texture buffer bindings. Only draws that
+            // passed DeltaStillHolds are compared; the others would have been resolved in full.
+            const u64 kept_bindings =
+                verify_kept ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
+            if (fast_draw_on) {
+                pipeline->CaptureNextDelta(verify_kept);
+            }
+            if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+                report_failure("configure failed");
+                TraceRenderState(is_indexed, "configure-failed", nullptr);
+                return;
+            }
+            if (verify_kept && pipeline->DeltaMismatch()) {
+                ++fast_draw_stats.view_mismatches;
+            }
+            if (verify_kept &&
+                kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
+                ++fast_draw_stats.binding_mismatches;
             }
         }
-    }
-    // The game draws Navi's glow, fireflies and dust right after the fog. They write no depth and
-    // move on their own, so FSR must not take them from its history. DLSS doesn't use the mask.
-    constexpr u64 fog_fragment = 0x3ddfb1d7a854c849ULL;
-    if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaTemporalEnabled() &&
-        oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
-        oot_camera_sample_frame == render_trace_frame && !frame_dump.Capturing()) {
-        const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
-        if (scene_id) {
-            const auto& scene = texture_cache.GetImageView(scene_id);
-            if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                scene.size.width == oot_motion.extent.width &&
-                scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
-                scene.range == VideoCommon::SubresourceRange{}) {
-                oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
-                oot_effects_address = scene.gpu_addr;
-                oot_effects_frame = render_trace_frame;
-                oot_live_dlss->SaveEffectsBase(oot_effects_scene, oot_motion.extent,
-                                               render_trace_frame);
+        VideoCommon::Nx2H2Model::NoteDraw();
+        if (reuse_start != 0) {
+            const u64 probe_start = VideoCommon::Nx2Profile::Now();
+            reuse = NoteDrawReuse(*pipeline, is_indexed);
+            reuse_path = path;
+            reuse_probe_ns = VideoCommon::Nx2Profile::Now() - probe_start;
+        }
+        if (DrawRepeatEnabled()) {
+            NoteDrawRepeat(*pipeline, is_indexed, path);
+        }
+
+        TrackOcarinaCamera();
+        TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
+        TracePendingCpuWrites(false, pipeline->ShaderHashes());
+        TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+        if (frame_dump.Capturing()) {
+            FrameDumpPass(texture_cache.GetFramebuffer());
+            frame_dump.NoteDraw(pipeline->ShaderHashes());
+            if (frame_dump.WantsShaders(pipeline)) {
+                frame_dump.NoteGraphicsShaders(
+                    *pipeline, pipeline_cache.CaptureGraphicsPrograms(pipeline->ShaderHashes()));
+            }
+            bool recorded = false;
+            if (frame_dump.CapturingSampled()) {
+                boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+                for (const auto& image : pipeline->SampledImages()) {
+                    sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
+                                       &texture_cache.GetSampler(image.sampler)});
+                }
+                recorded = frame_dump.NoteSampled(sampled);
+            }
+            if (frame_dump.CapturingBuffers()) {
+                recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+            }
+            if (recorded) {
+                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            }
+        }
+        if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) &&
+            render_trace_draws <= 2048) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace pipeline: frame={} draw={} hashes={:016x} "
+                      "dynamic_vertex_input={}",
+                      render_trace_frame, render_trace_draws, fmt::join(pipeline->ShaderHashes(), ","),
+                      pipeline->HasDynamicVertexInput());
+        }
+
+        if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
+            static const bool readback = [] {
+                const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
+                return value && std::string_view{value} == "1";
+            }();
+            if (readback) {
+                CaptureIndirectTrace();
+            }
+        }
+
+        {
+            Profile::Scope scope{Profile::Zone::DynamicState};
+            const VideoCommon::Nx2H2Model::SideScope h2_dyn{VideoCommon::Nx2H2Model::Side::Dyn};
+            UpdateOcarinaJitter();
+            UpdateDynamicStates(pipeline);
+            verify_vertex_input = false;
+        }
+
+        {
+            const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            query_cache.NotifySegment(true);
+            HandleTransformFeedback();
+            query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                      maxwell3d->regs.zpass_pixel_count_enable);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::DrawRecord};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+            scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
+            trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+            draw_func();
+        }
+        submitted = true;
+        buffer_cache.NoteWorkRecorded(false);
+        constexpr u64 final_vertex = 0x16aff33d999f993fULL;
+        constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
+        const auto hashes = pipeline->ShaderHashes();
+        if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
+            std::ranges::find(hashes, final_vertex) != hashes.end()) {
+            const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (target_id) {
+                const auto& target = texture_cache.GetImageView(target_id);
+                if (target.size.width == 2560 && target.size.height == 1440 &&
+                    target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
+                    oot_4k_guest_present = target.ImageHandle();
+                }
+            }
+        }
+        // The game draws Navi's glow, fireflies and dust right after the fog. They write no depth
+        // and move on their own, so FSR must not take them from its history. DLSS doesn't use the
+        // mask.
+        constexpr u64 fog_fragment = 0x3ddfb1d7a854c849ULL;
+        if (hashes[5] == fog_fragment && oot_live_dlss && OcarinaTemporalEnabled() &&
+            oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+            oot_camera_sample_frame == render_trace_frame && !frame_dump.Capturing()) {
+            const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (scene_id) {
+                const auto& scene = texture_cache.GetImageView(scene_id);
+                if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                    scene.size.width == oot_motion.extent.width &&
+                    scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
+                    scene.range == VideoCommon::SubresourceRange{}) {
+                    oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
+                    oot_effects_address = scene.gpu_addr;
+                    oot_effects_frame = render_trace_frame;
+                    oot_live_dlss->SaveEffectsBase(oot_effects_scene, oot_motion.extent,
+                                                   render_trace_frame);
+                }
             }
         }
     }
@@ -3988,7 +4205,7 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     oot_motion.previous = camera.previous;
 }
 
-void RasterizerVulkan::UpdateOcarinaJitter() {
+std::array<f32, 2> RasterizerVulkan::ComputeOcarinaJitter() {
     std::array<f32, 2> want{};
     // Only while FSR replaced the previous frame's upscale: a frame the game upscales itself
     // would show the offset as a shake. Only draws that depth-test against the scene depth at
@@ -4013,10 +4230,18 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
             }
         }
     }
+    return want;
+}
+
+void RasterizerVulkan::ApplyOcarinaJitter(std::array<f32, 2> want) {
     if (want != oot_jitter_applied) {
         oot_jitter_applied = want;
         maxwell3d->dirty.flags[Dirty::Viewports] = true;
     }
+}
+
+void RasterizerVulkan::UpdateOcarinaJitter() {
+    ApplyOcarinaJitter(ComputeOcarinaJitter());
 }
 
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
@@ -4837,7 +5062,8 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
+void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline,
+                                           std::optional<bool> is_rescaling_override) {
     auto& regs = maxwell3d->regs;
     auto& flags = maxwell3d->dirty.flags;
     // A mesh emulation pipeline has static input assembly and vertex input. Binding it replaces
@@ -4853,8 +5079,8 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
         flags[Dirty::PrimitiveRestartEnable] = true;
     }
 
-    UpdateViewportsState(regs);
-    UpdateScissorsState(regs);
+    UpdateViewportsState(regs, is_rescaling_override);
+    UpdateScissorsState(regs, is_rescaling_override);
     UpdateDepthBias(regs);
     UpdateBlendConstants(regs);
     UpdateDepthBounds(regs);
@@ -4912,8 +5138,8 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
         UpdateLineRasterizationMode(regs);
         UpdateLineStippleEnable(regs);
         UpdateConservativeRasterizationMode(regs);
-        UpdateAlphaToCoverageEnable(regs);
-        UpdateAlphaToOneEnable(regs);
+        UpdateAlphaToCoverageEnable(regs, pipeline);
+        UpdateAlphaToOneEnable(regs, pipeline);
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
@@ -4961,7 +5187,8 @@ void RasterizerVulkan::HandleTransformFeedback() {
     }
 }
 
-void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs,
+                                            std::optional<bool> is_rescaling_override) {
     if (!state_tracker.TouchViewports()) {
         return;
     }
@@ -4994,7 +5221,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         });
         return;
     }
-    const bool is_rescaling{texture_cache.IsRescaling()};
+    const bool is_rescaling =
+        is_rescaling_override ? *is_rescaling_override : texture_cache.IsRescaling();
     const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
     std::array viewport_list{
         GetViewportState(device, regs, 0, scale),  GetViewportState(device, regs, 1, scale),
@@ -5019,7 +5247,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     });
 }
 
-void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs,
+                                           std::optional<bool> is_rescaling_override) {
     if (!state_tracker.TouchScissors()) {
         return;
     }
@@ -5047,7 +5276,9 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
     }
     u32 up_scale = 1;
     u32 down_shift = 0;
-    if (texture_cache.IsRescaling()) {
+    const bool is_rescaling =
+        is_rescaling_override ? *is_rescaling_override : texture_cache.IsRescaling();
+    if (is_rescaling) {
         up_scale = Settings::values.resolution_info.up_scale;
         down_shift = Settings::values.resolution_info.down_shift;
     }
@@ -5460,22 +5691,25 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
         [is_enabled](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthClampEnableEXT(is_enabled); });
 }
 
-void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                                   const GraphicsPipeline* pipeline) {
     if (!state_tracker.TouchAlphaToCoverageEnable()) {
         return;
     }
     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToCoverage() &&
+    const GraphicsPipeline* const gp =
+        pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
+    const bool enable = gp != nullptr && gp->SupportsAlphaToCoverage() &&
                         regs.anti_alias_alpha_control.alpha_to_coverage != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetAlphaToCoverageEnableEXT(enable ? VK_TRUE : VK_FALSE);
     });
 }
 
-void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                              const GraphicsPipeline* pipeline) {
     if (!state_tracker.TouchAlphaToOneEnable()) {
         return;
     }
@@ -5487,8 +5721,9 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
         });
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToOne() &&
+    const GraphicsPipeline* const gp =
+        pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
+    const bool enable = gp != nullptr && gp->SupportsAlphaToOne() &&
                         regs.anti_alias_alpha_control.alpha_to_one != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetAlphaToOneEnableEXT(enable ? VK_TRUE : VK_FALSE);

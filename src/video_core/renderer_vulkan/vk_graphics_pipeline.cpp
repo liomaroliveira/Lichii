@@ -410,6 +410,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
         stage_infos[stage] = *info;
         stage_enabled[stage] = true;
+        immutable_enabled_stages[stage] = true;
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_image_elements += Shader::NumDescriptors(info->texture_buffer_descriptors);
@@ -419,6 +420,11 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
+    uses_texture_or_image_buffers = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty();
+    });
+    has_image_descriptors = std::ranges::any_of(
+        stage_infos, [](const Shader::Info& info) { return !info.image_descriptors.empty(); });
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     // The guest leaves render target components the fragment shader doesn't output untouched,
     // while Vulkan writes undefined values to them (AMD writes garbage), so they are masked out.
@@ -1415,6 +1421,8 @@ void GraphicsPipeline::TakeDeltaStateFrom(GraphicsPipeline& other) noexcept {
     kept_scale_epoch = other.kept_scale_epoch;
     delta_views_valid = std::exchange(other.delta_views_valid, false);
     kept_images_valid = std::exchange(other.kept_images_valid, false);
+    b_kept_images_valid = false;
+    other.b_kept_images_valid = false;
     NextDeltaGeneration();
     other.NextDeltaGeneration();
 }
@@ -1826,11 +1834,603 @@ void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
                               entries + end_entry);
 }
 
+bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_revisit,
+                                    H2DrawPacket& pkt) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    const VideoCommon::Nx2H2Model::SideScope h2_a{VideoCommon::Nx2H2Model::Side::A};
+
+    pkt.fallback_sync = false;
+    pkt.failed = false;
+    pkt.is_indexed = is_indexed;
+    pkt.is_delta = is_delta;
+    pkt.unbind_tex_buffers = false;
+    pkt.feedback_break = false;
+    pkt.is_rescaling = false;
+    pkt.replay_images = false;
+    pkt.image_entries.clear();
+    pkt.image_ranges = {};
+    pkt.rescaling_words = {};
+
+    if (uses_texture_or_image_buffers || mesh_emulation) {
+        pkt.fallback_sync = true;
+        return true;
+    }
+
+    if (is_delta) {
+        pkt.unbind_tex_buffers = taken_revisit;
+
+        const bool kept_usable = kept_images_valid &&
+                                 kept_scale_epoch == texture_cache.ScaleEpoch() &&
+                                 b_kept_images_valid;
+        const bool replay_images = kept_usable && !delta_descriptors_verify;
+        if (replay_images) {
+            pkt.replay_images = true;
+            ++delta_descriptor_stats.replayed;
+        } else {
+            struct Kept {
+                std::vector<DescriptorUpdateEntry> entries;
+                std::array<std::pair<u32, u32>, NUM_STAGES> ranges;
+                std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>
+                    rescaling;
+            };
+            std::optional<Kept> verify_kept;
+            if (delta_descriptors_verify && kept_images_valid &&
+                kept_scale_epoch == texture_cache.ScaleEpoch()) {
+                verify_kept.emplace(std::move(kept_image_entries), kept_image_ranges,
+                                    kept_rescaling);
+            }
+            kept_image_entries.clear();
+            kept_image_ranges = {};
+
+            RescalingPushConstant rescaling;
+            ImageDescriptorSink sink;
+            const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
+            const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
+            bool pushed_img_desc = false;
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!immutable_enabled_stages[stage]) {
+                    continue;
+                }
+                Profile::Scope scope{Profile::Zone::PushDescriptors};
+                const size_t first_entry = sink.UpdateCount();
+                PushImageDescriptors(texture_cache, sink, stage_infos[stage], rescaling,
+                                     samplers_it, views_it);
+                const size_t end_entry = sink.UpdateCount();
+                const u32 count = static_cast<u32>(end_entry - first_entry);
+                pkt.image_ranges[stage] = {static_cast<u32>(first_entry), count};
+                if (count != 0) {
+                    pushed_img_desc = true;
+                }
+                kept_image_ranges[stage] = {static_cast<u32>(kept_image_entries.size()), count};
+                kept_image_entries.insert(kept_image_entries.end(),
+                                          sink.entries.data() + first_entry,
+                                          sink.entries.data() + end_entry);
+            }
+            pkt.image_entries = std::move(sink.entries);
+            pkt.rescaling_words = rescaling.Data();
+            if (pushed_img_desc) {
+                VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::PushImgDesc);
+            }
+            kept_rescaling = rescaling.Data();
+            kept_scale_epoch = texture_cache.ScaleEpoch();
+            kept_images_valid = true;
+            ++delta_descriptor_stats.pushed;
+            if (verify_kept) {
+                ++delta_descriptor_stats.verified;
+                const auto same_image = [](const DescriptorUpdateEntry& lhs,
+                                           const DescriptorUpdateEntry& rhs) {
+                    return lhs.image.sampler == rhs.image.sampler &&
+                           lhs.image.imageView == rhs.image.imageView &&
+                           lhs.image.imageLayout == rhs.image.imageLayout;
+                };
+                if ((verify_kept->ranges != kept_image_ranges ||
+                     verify_kept->rescaling != kept_rescaling ||
+                     !std::ranges::equal(verify_kept->entries, kept_image_entries, same_image)) &&
+                    delta_descriptor_stats.mismatches++ < 16) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Delta descriptors verify: pipeline {:016x} resolved other image "
+                              "descriptors or rescaling words than the previous draw",
+                              key.Hash());
+                }
+            }
+        }
+        ReportDeltaDescriptors();
+        {
+            Profile::Scope scope{Profile::Zone::RenderTargets};
+            texture_cache.UpdateRenderTargets(false);
+            const Framebuffer* const fb = texture_cache.GetFramebuffer();
+            VideoCommon::Nx2H2Model::NoteFramebuffer(fb);
+            const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
+            texture_cache.CheckFeedbackLoop(view_span);
+            if (scheduler.HasFragmentBarrier() &&
+                (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+                pkt.feedback_break = true;
+            }
+            fb->MarkResolveShadowsUpToDate();
+            pkt.fb_snapshot = FramebufferSnapshot::From(*fb);
+            pkt.is_rescaling = texture_cache.IsRescaling();
+        }
+        if (IsBuilt() && (!pipeline || build->Failed())) {
+            pkt.failed = true;
+            return false;
+        }
+        return true;
+    }
+
+    // Full path on Side A (no BufferCache, no GuestDescriptorQueue, no Scheduler recording).
+    small_vector<VideoCommon::ImageViewInOut, 160> views;
+    small_vector<VideoCommon::SamplerId, 96> samplers;
+    small_vector<ComputedHandle, 16> computed_handles;
+    small_vector<u32, 64> computed_values;
+    views.reserve(num_image_elements);
+    samplers.reserve(num_textures);
+
+    {
+        Profile::Scope scope{Profile::Zone::SyncDescriptors};
+        texture_cache.SynchronizeDescriptors(false);
+    }
+
+    const auto& regs{maxwell3d->regs};
+    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+
+    const bool use_memo{texture_memo_eligible && !RecordingSampledTextures()};
+    const bool verify_memo{use_memo && TextureMemoVerify()};
+    small_vector<GPUVAddr, 32> handle_addresses;
+    small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
+    small_vector<VideoCommon::ImageViewInOut, 32> memo_views;
+    small_vector<VideoCommon::SamplerId, 32> memo_samplers;
+    std::vector<VideoCommon::ImageId> memo_prepared;
+    std::vector<VideoCommon::ImageId> full_prepared;
+    bool memo_hit{};
+    if (use_memo) {
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!immutable_enabled_stages[stage]) {
+                continue;
+            }
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                ASSERT(cbufs[desc.cbuf_index].enabled);
+                for (u32 index = 0; index < desc.count; ++index) {
+                    handle_addresses.push_back(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                               (index << desc.size_shift));
+                }
+            }
+        }
+        views.resize(num_image_elements);
+        samplers.resize(num_textures);
+        if (verify_memo) {
+            texture_cache.LogPrepares(&memo_prepared, true);
+        }
+        memo_hit = texture_cache.ResolveMemoizedTextures(
+            texture_memo, std::span(handle_addresses.data(), handle_addresses.size()),
+            std::span(views.data(), views.size()), std::span(samplers.data(), samplers.size()));
+        if (verify_memo) {
+            texture_cache.LogPrepares(nullptr, false);
+        }
+        if (memo_hit && verify_memo) {
+            memo_views.assign(views.begin(), views.end());
+            memo_samplers.assign(samplers.begin(), samplers.end());
+        }
+        if (!memo_hit || verify_memo) {
+            views.clear();
+            samplers.clear();
+        }
+    }
+    const bool resolve_in_full{!memo_hit || verify_memo};
+
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!immutable_enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            const auto cbuf_address{[&cbufs](u32 cbuf) -> GPUVAddr {
+                return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                  : GPUVAddr{};
+            }};
+            const auto note_computed{[&](const auto& desc, u32 element, u32 value) {
+                using Desc = std::remove_cvref_t<decltype(desc)>;
+                const auto [kind, first] = [&]() -> std::pair<ComputedHandleKind, const Desc*> {
+                    if constexpr (std::is_same_v<Desc, Shader::TextureDescriptor>) {
+                        return {Texture, info.texture_descriptors.data()};
+                    } else {
+                        return {Image, info.image_descriptors.data()};
+                    }
+                }();
+                if (element == 0) {
+                    computed_handles.push_back({static_cast<u8>(stage), kind,
+                                                static_cast<u16>(&desc - first), 0,
+                                                static_cast<u32>(computed_values.size())});
+                }
+                ++computed_handles.back().count;
+                computed_values.push_back(value);
+            }};
+            const auto read_handle{[&](const auto& desc, u32 index) {
+                if (desc.handle_program != ~0U) {
+                    const u32 value{VideoCommon::EvaluateTextureHandle(
+                        info, desc.handle_program, *gpu_memory, cbuf_address,
+                        device.GetStorageBufferAlignment(), index)};
+                    note_computed(desc, index, value);
+                    return TexturePair(value, via_header_index);
+                }
+                ASSERT(cbufs[desc.cbuf_index].enabled);
+                const u32 index_offset{index << desc.size_shift};
+                const u32 offset{desc.cbuf_offset + index_offset};
+                const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
+                if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
+                    if (desc.has_secondary) {
+                        ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
+                        const u32 second_offset{desc.secondary_cbuf_offset};
+                        const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
+                                                     second_offset};
+                        const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
+                        const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                                          << desc.secondary_shift_left};
+                        const u32 raw{lhs_raw | rhs_raw};
+                        return TexturePair(raw, via_header_index);
+                    }
+                }
+                return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            }};
+            if (resolve_in_full) {
+                u32 texture{};
+                for (const auto& desc : info.texture_descriptors) {
+                    if (desc.count > 1 && desc.handle_program != ~0U) {
+                        const size_t first{views.size()};
+                        u32 last_sampler_index{~0U};
+                        VideoCommon::SamplerId sampler{};
+                        VideoCommon::EvaluateTextureHandles(
+                            info, desc.handle_program, *gpu_memory, cbuf_address,
+                            device.GetStorageBufferAlignment(), desc.count,
+                            [&](u32 element, u32 raw) {
+                                note_computed(desc, element, raw);
+                                const auto handle{TexturePair(raw, via_header_index)};
+                                views.push_back({handle.first});
+                                if (handle.second != last_sampler_index) {
+                                    sampler = texture_cache.GetSamplerId(handle.second, false);
+                                    last_sampler_index = handle.second;
+                                }
+                                samplers.push_back(sampler);
+                            });
+                        if (VideoCommon::HandleTableNotes::Wanted()) {
+                            std::vector<u32> tics(desc.count);
+                            for (u32 index = 0; index < desc.count; ++index) {
+                                tics[index] = views[first + index].index;
+                            }
+                            VideoCommon::HandleTableNotes::Note(key.unique_hashes[stage + 1],
+                                                                texture, tics);
+                        }
+                        ++texture;
+                        continue;
+                    }
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                              ? VideoCommon::NULL_TEXTURE_HANDLE
+                                              : read_handle(desc, index)};
+                        views.push_back({handle.first});
+
+                        VideoCommon::SamplerId sampler{
+                            texture_cache.GetSamplerId(handle.second, false)};
+                        samplers.push_back(sampler);
+                        if (use_memo) {
+                            handle_reads.push_back(
+                                {handle_addresses[handle_reads.size()],
+                                 via_header_index ? handle.first
+                                                  : handle.first | (handle.second << 20)});
+                        }
+                    }
+                    ++texture;
+                }
+            }
+            if (has_image_descriptors) {
+                for (const auto& desc : info.image_descriptors) {
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        const auto handle{read_handle(desc, index)};
+                        views.push_back({
+                            .index = handle.first,
+                            .blacklist = desc.is_written,
+                            .id = {},
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
+    ASSERT(views.size() == num_image_elements);
+    ASSERT(samplers.size() == num_textures);
+
+    if (resolve_in_full) {
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        if (memo_hit && verify_memo) {
+            texture_cache.LogPrepares(&full_prepared, false);
+        }
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                     has_image_descriptors);
+        if (memo_hit && verify_memo) {
+            texture_cache.LogPrepares(nullptr, false);
+        }
+    }
+    if (use_memo) {
+        if (!memo_hit) {
+            Count(g_memo_misses);
+            if (++texture_memo.misses <= 8 || (texture_memo.misses & 15) == 0) {
+                texture_cache.MemoizeTextures(texture_memo,
+                                              std::span(handle_reads.data(), handle_reads.size()),
+                                              std::span(views.data(), views.size()),
+                                              std::span(samplers.data(), samplers.size()));
+            }
+        } else {
+            texture_memo.misses = 0;
+            Count(g_memo_hits);
+        }
+        if (memo_hit && verify_memo) {
+            for (auto* const prepared : {&memo_prepared, &full_prepared}) {
+                std::ranges::sort(*prepared);
+                prepared->erase(std::unique(prepared->begin(), prepared->end()), prepared->end());
+            }
+            const bool same =
+                std::ranges::equal(views, memo_views,
+                                   [](const auto& lhs, const auto& rhs) {
+                                       return lhs.index == rhs.index && lhs.id == rhs.id;
+                                   }) &&
+                std::ranges::equal(samplers, memo_samplers) && memo_prepared == full_prepared;
+            if (!same) {
+                Count(g_memo_mismatches);
+                LOG_ERROR(Render_Vulkan,
+                          "Texture memo: pipeline {:016x} resolved other views, samplers or "
+                          "prepared images than its memo",
+                          key.Hash());
+            }
+        }
+        ReportTextureMemo();
+    }
+    if (RecordingSampledTextures() || DrawReuseProbeEnabled() || DrawRepeatEnabled()) {
+        sampled_images.clear();
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!immutable_enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
+                                          views[view_index].id, samplers[sampler_index]});
+            }
+            if (has_image_descriptors) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+    }
+    const bool captured_delta =
+        std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None;
+    if (captured_delta) {
+        const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
+                                  const VideoCommon::ImageViewInOut& rhs) {
+            return lhs.index == rhs.index && lhs.id == rhs.id;
+        };
+        if (std::exchange(verify_delta, false)) {
+            delta_mismatch = !delta_views_valid ||
+                             !std::ranges::equal(views, delta_views, same_view) ||
+                             !std::ranges::equal(samplers, delta_samplers);
+        }
+        delta_views.assign(views.begin(), views.end());
+        delta_samplers.assign(samplers.begin(), samplers.end());
+        delta_computed_handles.assign(computed_handles.begin(), computed_handles.end());
+        delta_computed_values.assign(computed_values.begin(), computed_values.end());
+        configured_stages = immutable_enabled_stages;
+        delta_raw_handles.clear();
+        if (retexture_eligible && !ReadRawHandles(delta_raw_handles)) {
+            delta_raw_handles.clear();
+        }
+        delta_views_valid = true;
+        kept_images_valid = false;
+        NextDeltaGeneration();
+        kept_image_entries.clear();
+        kept_image_ranges = {};
+    }
+
+    pkt.unbind_tex_buffers = true;
+    pkt.replay_images = false;
+    RescalingPushConstant rescaling;
+    ImageDescriptorSink sink;
+    const VideoCommon::SamplerId* samplers_it{samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{views.data()};
+    bool pushed_img_desc = false;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!immutable_enabled_stages[stage]) {
+            continue;
+        }
+        Profile::Scope scope{Profile::Zone::PushDescriptors};
+        const size_t first_entry = sink.UpdateCount();
+        PushImageDescriptors(texture_cache, sink, stage_infos[stage], rescaling, samplers_it,
+                             views_it);
+        const size_t end_entry = sink.UpdateCount();
+        const u32 count = static_cast<u32>(end_entry - first_entry);
+        pkt.image_ranges[stage] = {static_cast<u32>(first_entry), count};
+        if (count != 0) {
+            pushed_img_desc = true;
+        }
+        if (captured_delta) {
+            kept_image_ranges[stage] = {static_cast<u32>(kept_image_entries.size()), count};
+            kept_image_entries.insert(kept_image_entries.end(), sink.entries.data() + first_entry,
+                                      sink.entries.data() + end_entry);
+        }
+    }
+    pkt.image_entries = std::move(sink.entries);
+    pkt.rescaling_words = rescaling.Data();
+    if (pushed_img_desc) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::PushImgDesc);
+    }
+    if (captured_delta) {
+        kept_rescaling = rescaling.Data();
+        kept_scale_epoch = texture_cache.ScaleEpoch();
+        kept_images_valid = true;
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+        const Framebuffer* const fb = texture_cache.GetFramebuffer();
+        VideoCommon::Nx2H2Model::NoteFramebuffer(fb);
+        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.HasFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            pkt.feedback_break = true;
+        }
+        fb->MarkResolveShadowsUpToDate();
+        pkt.fb_snapshot = FramebufferSnapshot::From(*fb);
+        pkt.is_rescaling = texture_cache.IsRescaling();
+    }
+
+    if (IsBuilt() && (!pipeline || build->Failed())) {
+        if (captured_delta) {
+            kept_images_valid = false;
+        }
+        pkt.failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool GraphicsPipeline::ExecuteSideB(const H2DrawPacket& pkt) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+
+    if (pkt.unbind_tex_buffers) {
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (immutable_enabled_stages[stage]) {
+                buffer_cache.UnbindGraphicsTextureBuffers(stage);
+            }
+        }
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        const auto bind_ssbos = [&]() LAMBDA_FORCEINLINE {
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!immutable_enabled_stages[stage]) {
+                    continue;
+                }
+                const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
+                buffer_cache.UnbindGraphicsStorageBuffers(stage);
+                size_t ssbo_index{};
+                for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                    ASSERT(desc.count == 1);
+                    buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                           desc.cbuf_offset, desc.is_written,
+                                                           desc.indirect_offset);
+                    ++ssbo_index;
+                }
+            }
+        };
+        if (VideoCommon::SsboKeepEnabled()) {
+            const bool can_keep = buffer_cache.TryKeepGraphicsStorageBuffers(this);
+            const bool verify_ssbo = can_keep && VideoCommon::SsboKeepVerifyEnabled();
+            if (!can_keep || verify_ssbo) {
+                if (verify_ssbo) {
+                    buffer_cache.SnapshotGraphicsStorageBuffers();
+                } else {
+                    buffer_cache.NoteStorageKeepFull();
+                }
+                buffer_cache.BeginCaptureGraphicsStorage(this, storage_keep_eligible);
+                bind_ssbos();
+                buffer_cache.EndCaptureGraphicsStorage();
+                if (verify_ssbo) {
+                    buffer_cache.VerifyGraphicsStorageBuffers(key.Hash(), immutable_enabled_stages);
+                }
+            }
+            buffer_cache.ReportStorageKeepStats();
+        } else {
+            bind_ssbos();
+        }
+    }
+
+    const auto& regs{maxwell3d->regs};
+    if (regs.transform_feedback_enabled != 0) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.UpdateGraphicsBuffers(pkt.is_indexed);
+        const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
+        buffer_cache.BindHostGeometryBuffers(pkt.is_indexed);
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+
+    if (!pkt.replay_images) {
+        b_kept_image_entries.assign(pkt.image_entries.begin(), pkt.image_entries.end());
+        b_kept_image_ranges = pkt.image_ranges;
+        b_kept_rescaling = pkt.rescaling_words;
+        b_kept_images_valid = true;
+    }
+
+    RenderAreaPushConstant render_area;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!immutable_enabled_stages[stage]) {
+            continue;
+        }
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            buffer_cache.BindHostStageBuffers(stage);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const auto [first, count] = b_kept_image_ranges[stage];
+            if (count != 0) {
+                guest_descriptor_queue.AddEntries({b_kept_image_entries.data() + first, count});
+            }
+        }
+        if (stage_infos[stage].uses_render_area) {
+            render_area.uses_render_area = true;
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }
+
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+
+    if (pkt.feedback_break) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+
+    RescalingPushConstant rescaling;
+    rescaling.Assign(b_kept_rescaling);
+
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    return ConfigureDrawImpl(rescaling, render_area, &pkt.fb_snapshot, pkt.is_rescaling);
+}
+
 /// Writes the descriptors the stages queued and the push constants, then records the draw's state
 /// and bindings. Returns false, and the draw is skipped, when the queued descriptor count does not
 /// match the pipeline or no descriptor memory can be reserved.
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
+    return ConfigureDrawImpl(rescaling, render_area, nullptr, false);
+}
+
+bool GraphicsPipeline::ConfigureDrawImpl(const RescalingPushConstant& rescaling,
+                                         const RenderAreaPushConstant& render_area,
+                                         const FramebufferSnapshot* fb_snap,
+                                         bool is_rescaling_override) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
         LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
                      num_descriptor_entries, guest_descriptor_queue.UpdateCount());
@@ -1998,7 +2598,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (fb_snap != nullptr) {
+        scheduler.RequestRenderpassSnapshot(*fb_snap);
+    } else {
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    }
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
@@ -2014,7 +2618,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                    std::memory_order::relaxed);
         });
     }
-    const bool is_rescaling{texture_cache.IsRescaling()};
+    const bool is_rescaling{fb_snap != nullptr ? is_rescaling_override
+                                               : texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
