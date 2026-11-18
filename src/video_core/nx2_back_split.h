@@ -1160,6 +1160,60 @@ inline void DrainAsyncH2(H2DrainReason reason) {
     }
 }
 
+/// E04.T14: Dynamic bypass of H2 split under light draw load (< EDEN_NX2_H2_BYPASS_THRESHOLD draws/s).
+inline bool g_h2_dynamic_bypass_enabled = [] {
+    const char* val = std::getenv("EDEN_NX2_H2_DYNAMIC_BYPASS");
+    return val == nullptr || (val[0] != '0');
+}();
+inline u32 g_h2_bypass_threshold = [] {
+    const char* val = std::getenv("EDEN_NX2_H2_BYPASS_THRESHOLD");
+    if (val != nullptr) {
+        const u32 parsed = static_cast<u32>(std::strtoul(val, nullptr, 10));
+        if (parsed > 0) {
+            return parsed;
+        }
+    }
+    return 60000U;
+}();
+inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
+inline std::atomic<u32> g_h2_current_draw_rate{140000};
+inline std::atomic<u64> g_h2_bypass_frames{0};
+inline std::atomic<u64> g_h2_split_frames{0};
+
+inline bool H2DynamicBypassActive() noexcept {
+    return g_h2_dynamic_bypass_enabled && g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
+}
+
+inline void NoteH2FrameDrawCount(u32 frame_draws, u64 frame_duration_ns) {
+    if (!g_h2_async || !g_h2_dynamic_bypass_enabled) {
+        return;
+    }
+    u32 rate = 0;
+    if (frame_duration_ns > 0) {
+        rate = static_cast<u32>((static_cast<u64>(frame_draws) * 1000000000ULL) / frame_duration_ns);
+    } else {
+        rate = frame_draws * 60;
+    }
+    const u32 prev_rate = g_h2_current_draw_rate.load(std::memory_order_relaxed);
+    const u32 new_rate = (prev_rate * 3 + rate) / 4;
+    g_h2_current_draw_rate.store(new_rate, std::memory_order_relaxed);
+
+    const bool currently_bypassed = g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
+    const u32 low_thresh = g_h2_bypass_threshold;
+    const u32 high_thresh = (g_h2_bypass_threshold * 115) / 100;
+    if (!currently_bypassed && new_rate < low_thresh) {
+        DrainAsyncH2(H2DrainReason::Other);
+        g_h2_dynamic_bypass_active.store(true, std::memory_order_relaxed);
+    } else if (currently_bypassed && new_rate > high_thresh) {
+        g_h2_dynamic_bypass_active.store(false, std::memory_order_relaxed);
+    }
+    if (g_h2_dynamic_bypass_active.load(std::memory_order_relaxed)) {
+        g_h2_bypass_frames.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_h2_split_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 /// RAII C2 barrier under H2Async(): drains GPUBackB on entry, suppresses async queueing while
 /// active, and re-synchronizes H2SchedulerMirror on exit of the outermost scope.
 struct H2DrainScope {

@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -863,6 +864,8 @@ private:
     /// rare deferred TextureCache/PipelineCache invalidations noticed on GPUBackB.
     Tegra::Engines::Maxwell3D* maxwell3d_b{};
     H2SchedulerMirror h2_mirror{};
+    u32 h2_frame_draws = 0;
+    std::chrono::steady_clock::time_point h2_last_frame_time{};
     std::atomic<bool> h2_has_deferred_invals{false};
     std::mutex h2_inval_mutex;
     std::vector<std::pair<DAddr, std::size_t>> h2_deferred_tex_invals;

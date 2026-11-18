@@ -894,6 +894,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     // input) depend on the vertex streams' stride and enable word then.
     VideoCommon::Nx2FastDraw::g_vertex_streams_dynamic =
         dynamic_features.has_extended_dynamic_state && dynamic_features.has_dynamic_vertex_input;
+    VideoCommon::Nx2FastDraw::g_dynamic_vertex_streams.store(
+        dynamic_features.has_dynamic_vertex_input && dynamic_features.has_extended_dynamic_state,
+        std::memory_order_relaxed);
 
     dynamic_features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
     dynamic_features.has_provoking_vertex_first_mode =

@@ -3340,6 +3340,8 @@ public:
     static bool IsFastDrawReportOperand(u32 method);
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
+    /// Query counter resets and render enable mode methods.
+    static bool IsFastDrawQueryMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
     /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
     /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having

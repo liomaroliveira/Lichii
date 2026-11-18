@@ -2085,6 +2085,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool use_h2_split =
         VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() && !frame_dump.Capturing();
     const bool use_h2_async = use_h2_split && VideoCommon::BackSplit::UseH2AsyncQueue() &&
+                              !VideoCommon::BackSplit::H2DynamicBypassActive() &&
                               !is_indirect && !fast_draw_verify && reuse_start == 0 &&
                               !DrawRepeatEnabled();
 
@@ -2267,7 +2268,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     const VideoCommon::BackSplit::H2DrainScope h2_fallback_drain{
         is_indirect ? VideoCommon::BackSplit::H2DrainReason::DrawIndirect
-                    : VideoCommon::BackSplit::H2DrainReason::DrawFallback};
+                    : VideoCommon::BackSplit::H2DrainReason::DrawFallback,
+        !VideoCommon::BackSplit::H2DynamicBypassActive()};
     if (h2_fallback_drain.active) [[unlikely]] {
         gpu_memory->FlushCaching();
         FlushH2DeferredInvalidations(true);
@@ -3019,6 +3021,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         gpu.TickWork();
         return;
     }
+    ++h2_frame_draws;
     PrepareDraw(
         is_indexed,
         [this, is_indexed, instance_count] {
@@ -5785,6 +5788,18 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const u64 frame_ns = h2_last_frame_time.time_since_epoch().count() == 0
+                                 ? 16666666ULL
+                                 : static_cast<u64>(
+                                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           now - h2_last_frame_time)
+                                           .count());
+        h2_last_frame_time = now;
+        VideoCommon::BackSplit::NoteH2FrameDrawCount(h2_frame_draws, frame_ns);
+        h2_frame_draws = 0;
+    }
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Flush};
     FlushH2DeferredInvalidations(true);

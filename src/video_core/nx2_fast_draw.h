@@ -76,6 +76,7 @@ inline std::atomic<bool> g_dynamic_vertex_input{};
 /// dynamic vertex input): then no pipeline depends on them and they are draw parameters. Set
 /// by the pipeline cache.
 inline bool g_vertex_streams_dynamic{};
+inline std::atomic<bool> g_dynamic_vertex_streams{};
 
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.

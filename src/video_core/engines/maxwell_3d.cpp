@@ -372,8 +372,14 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
                IsFastDrawVertexBuffer(method) || IsFastDrawNeutralMethod(method) ||
-               IsFastDrawReportOperand(method) || IsFastDrawVertexFormat(method);
+               IsFastDrawReportOperand(method) || IsFastDrawVertexFormat(method) ||
+               IsFastDrawQueryMethod(method);
     }
+}
+
+bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
+    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           method == MAXWELL3D_REG_INDEX(render_enable.mode);
 }
 
 bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
@@ -436,10 +442,11 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
     if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
         const u32 word = (method - streams) % stream_words;
-        // address_high, address_low; the stride and enable word when they are dynamic state
-        // (the buffer cache and UpdateVertexInput take them from the registers on every draw).
+        // address_high, address_low; the stride, enable and frequency words when vertex streams
+        // are dynamic state (the buffer cache and UpdateVertexInput take them from the registers
+        // on every draw).
         return word == 1 || word == 2 ||
-               (word == 0 && VideoCommon::Nx2FastDraw::g_vertex_streams_dynamic);
+               VideoCommon::Nx2FastDraw::g_dynamic_vertex_streams.load(std::memory_order_relaxed);
     }
     constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
     constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
@@ -467,7 +474,7 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
-        !IsFastDrawNeutralMethod(method)) {
+        !IsFastDrawNeutralMethod(method) && !IsFastDrawQueryMethod(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
