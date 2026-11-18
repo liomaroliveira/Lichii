@@ -171,10 +171,15 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
             }
             return {Kind::MetByQueued, *settled_word->release};
         }
-        if (!settled_word) {
-            return {Kind::Unknown, split.LastWriterPosition(), Why::PlacedPending, false};
+        if (!dma_pusher.rasterizer->MustFlushRegion(device, sizeof(u32),
+                                                    VideoCommon::CacheType::BufferCache)) {
+            if (acquire.Matches(memory())) {
+                if (split.Ran(acquire.writers_before)) {
+                    return {Kind::Met};
+                }
+            }
         }
-        return {Kind::NotMet};
+        return {Kind::Flush};
     }
     // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
     // KeplerCompute::ProcessNativeMethod): memory that meets a greater-or-equal acquire now still

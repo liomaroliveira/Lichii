@@ -4367,7 +4367,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::VtgPrimitivesOut ||
         type == VideoCommon::QueryType::StreamingPrimitivesSucceeded ||
         type == VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded;
-    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_tfb_query) [[unlikely]] {
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_fence && !is_tfb_query) [[unlikely]] {
         // Reports and semaphore releases reach guest memory the CPU may wait on.
         VideoCommon::Nx2FastDraw::NoteSync();
         if (VideoCommon::Nx2DrainCheck::g_enabled && type == VideoCommon::QueryType::Payload)
