@@ -456,6 +456,46 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
                                 it->second.fenced, it->second.position};
 }
 
+std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::MemoryManager& memory,
+                                                             GPUVAddr address, u64 device_address,
+                                                             AcquireUnsettled& why) const {
+    // Unaligned, it reads part of two words, neither of which a note names (NoteSemaphoreWrite).
+    if (device_address % sizeof(u32) != 0) {
+        why = AcquireUnsettled::Unknown;
+        return std::nullopt;
+    }
+    auto& shadow = Tegra::Nx2MirrorShadow::Get();
+    // Mirrored releases into a diverted word change what acquires read there without a note.
+    if (memory.OverlapsSyncpointShim(address, sizeof(u32)) || shadow.Diverts(device_address)) {
+        why = AcquireUnsettled::Elsewhere;
+        return std::nullopt;
+    }
+    if (!UnnotedReleasesLanded()) {
+        why = AcquireUnsettled::Unnoted;
+        return std::nullopt;
+    }
+    // Shader stores are placed nowhere, and the back marks the pages they write GPU-written only
+    // as it runs them (NoteCacheWrite): each one sent may write the word.
+    const u64 others =
+        (std::max)(OtherWritesTarget(memory, address), (std::min)(last_any_write, write_position));
+    const auto queued = QueuedSemaphoreWriteAt(device_address);
+    if (queued && (!queued->known || queued->at_least)) {
+        why = AcquireUnsettled::Unknown;
+        return std::nullopt;
+    }
+    // Read after Ran: the back marks the pages its stores wrote before it stores its position.
+    if ((queued ? queued->position < others : !Ran(others)) ||
+        Tegra::Nx2MayBeGpuWritten(device_address, sizeof(u32))) {
+        why = AcquireUnsettled::Writes;
+        return std::nullopt;
+    }
+    if (queued) {
+        return SettledWord{queued->payload, queued->position};
+    }
+    const u32 guest = memory.Read<u32>(address);
+    return SettledWord{shadow.Read(device_address, guest).value_or(guest), std::nullopt};
+}
+
 bool GpuSplit::WritersPending() const {
     return consumed.load(std::memory_order_acquire) <
            std::min(last_writer_position, write_position);
@@ -617,6 +657,14 @@ u64 GpuSplit::MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr ad
             target = std::max(target, DeviceWritesTarget(device, bytes));
         });
     }
+    return std::min(target, write_position);
+}
+
+u64 GpuSplit::OtherWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address) const {
+    u64 target = last_unplaced_write;
+    ForEachDeviceRange(memory, address, sizeof(u32), [this, &target](DAddr device, u64 bytes) {
+        target = std::max(target, DeviceWritesTarget(device, bytes));
+    });
     return std::min(target, write_position);
 }
 

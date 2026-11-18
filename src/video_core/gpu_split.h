@@ -75,6 +75,16 @@ enum class DrainSite : u32 {
     Count,
 };
 
+/// Why the front can't tell what an equal or mask acquire's word holds once the back ran what was
+/// sent (GpuSplit::SettledWordAt), counted with the acquires.
+enum class AcquireUnsettled : u32 {
+    Elsewhere, ///< Acquires read it from the syncpoint shim or the mirror shadow
+    Unknown,   ///< The last release noted there has an unknown value or a lower bound
+    Writes,    ///< The back has yet to run another write sent there, or one after the note
+    Unnoted,   ///< A release the front did not note may land yet
+    Count,
+};
+
 /// How semaphore acquires and the polls of suspended ones were decided, counted with
 /// EDEN_NX2_GPU_PROFILE, EDEN_NX2_ACQUIRE_VERIFY, EDEN_NX2_ACQUIRE_STATS or
 /// EDEN_NX2_GUEST_THREAD_STATS and logged every 10 s (GpuSplit::ReportAcquire).
@@ -84,6 +94,8 @@ struct AcquireStats {
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
     std::atomic<u64> drain_operation{}; ///< Of drained: an equal or mask acquire
+    /// Of drain_operation: those whose word queued work may still change, by why
+    std::array<std::atomic<u64>, static_cast<size_t>(AcquireUnsettled::Count)> unsettled{};
     std::atomic<u64> drain_settings{};  ///< ...the split or the accuracy settings ask for it
     std::atomic<u64> drain_word{};      ///< ...the word is unmapped or on a GPU-written page
     std::atomic<u64> drain_queued{};    ///< ...a queued release to it is unknown or doesn't meet it
@@ -507,6 +519,27 @@ public:
     /// yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
+    struct SettledWord {
+        u32 value;
+        std::optional<u64> release; ///< The position the back runs the noted release by
+    };
+    /// What an acquire of the word at `address` (`device_address`) finds once the back ran
+    /// everything sent so far, where the front knows that exactly, as FrontQmdView::WordAt values
+    /// a reduction's base: the last release noted there, with a known payload and only noted
+    /// releases to other words sent after it; or memory, once the back ran every write sent there,
+    /// shader stores included, and each landed. None, with `why`, where queued work may still
+    /// change it or acquires read it elsewhere. Every release the front did not note must have
+    /// landed for either.
+    [[nodiscard]] std::optional<SettledWord> SettledWordAt(const Tegra::MemoryManager& memory,
+                                                           GPUVAddr address, u64 device_address,
+                                                           AcquireUnsettled& why) const;
+    void NoteUnnotedReleases() {
+        unnoted_releases_landed = EntryTag(last_entry_start) + 1;
+    }
+    [[nodiscard]] bool UnnotedReleasesLanded() const {
+        return fenced_landed.load(std::memory_order_acquire) >= unnoted_releases_landed;
+    }
+    [[nodiscard]] u64 OtherWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address) const;
     /// Whether compute or copy work sent so far is still queued (EDEN_NX2_DRAIN_CHECK).
     [[nodiscard]] bool WritersPending() const;
     /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<device address>): whether releases to the semaphore word
@@ -874,7 +907,8 @@ private:
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
-    u64 last_entry_start{}; ///< Where the last entry sent starts
+    u64 last_entry_start{};
+    u64 unnoted_releases_landed{}; ///< Where the last entry sent starts
     struct SemaphoreWrite {
         u64 position; ///< write_position once it was sent
         /// `fenced`: the entry (EntryTag) whose fenced write must have landed (NoteFencedWrite)

@@ -2871,6 +2871,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    ++h2_frame_draws;
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -3021,7 +3022,6 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         gpu.TickWork();
         return;
     }
-    ++h2_frame_draws;
     PrepareDraw(
         is_indexed,
         [this, is_indexed, instance_count] {
@@ -3113,6 +3113,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    ++h2_frame_draws;
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -3389,6 +3390,7 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    ++h2_frame_draws;
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::RtOrClear);
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -4365,7 +4367,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::VtgPrimitivesOut ||
         type == VideoCommon::QueryType::StreamingPrimitivesSucceeded ||
         type == VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded;
-    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_fence && !is_tfb_query) [[unlikely]] {
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_tfb_query) [[unlikely]] {
         // Reports and semaphore releases reach guest memory the CPU may wait on.
         VideoCommon::Nx2FastDraw::NoteSync();
         if (VideoCommon::Nx2DrainCheck::g_enabled && type == VideoCommon::QueryType::Payload)

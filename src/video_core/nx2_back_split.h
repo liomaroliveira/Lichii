@@ -110,9 +110,20 @@ inline bool OnStageA() noexcept {
     return t_stage_a;
 }
 
+/// E04.T14: Dynamic bypass of H2 split under light draw load (< EDEN_NX2_H2_BYPASS_THRESHOLD draws/s).
+inline bool g_h2_dynamic_bypass_enabled = [] {
+    const char* val = std::getenv("EDEN_NX2_H2_DYNAMIC_BYPASS");
+    return val == nullptr || (val[0] != '0');
+}();
+inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
+
+inline bool H2DynamicBypassActive() noexcept {
+    return g_h2_dynamic_bypass_enabled && g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
+}
+
 /// True on Stage A under H2Async() when not inside a drained C2 barrier scope.
 inline bool UseH2AsyncQueue() noexcept {
-    return g_h2_async && t_stage_a && t_h2_drained_depth == 0;
+    return g_h2_async && t_stage_a && t_h2_drained_depth == 0 && !H2DynamicBypassActive();
 }
 
 /// E04.T6: set on GPUBackB, the thread that owns the rasterizer with the split on.
@@ -1152,7 +1163,7 @@ inline void DrainAsync() {
 
 /// Stage A under EDEN_NX2_H2_SPLIT=2: drains GPUBackB and accounts the barrier reason.
 inline void DrainAsyncH2(H2DrainReason reason) {
-    if (H2Async() && OnStageA()) [[unlikely]] {
+    if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
         if (g_state.WritePosition() != g_state.DrainedPosition()) {
             ++g_h2_drain_reasons[static_cast<size_t>(reason)];
             g_state.DrainAsync();
@@ -1160,11 +1171,6 @@ inline void DrainAsyncH2(H2DrainReason reason) {
     }
 }
 
-/// E04.T14: Dynamic bypass of H2 split under light draw load (< EDEN_NX2_H2_BYPASS_THRESHOLD draws/s).
-inline bool g_h2_dynamic_bypass_enabled = [] {
-    const char* val = std::getenv("EDEN_NX2_H2_DYNAMIC_BYPASS");
-    return val == nullptr || (val[0] != '0');
-}();
 inline u32 g_h2_bypass_threshold = [] {
     const char* val = std::getenv("EDEN_NX2_H2_BYPASS_THRESHOLD");
     if (val != nullptr) {
@@ -1175,14 +1181,9 @@ inline u32 g_h2_bypass_threshold = [] {
     }
     return 60000U;
 }();
-inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
 inline std::atomic<u32> g_h2_current_draw_rate{140000};
 inline std::atomic<u64> g_h2_bypass_frames{0};
 inline std::atomic<u64> g_h2_split_frames{0};
-
-inline bool H2DynamicBypassActive() noexcept {
-    return g_h2_dynamic_bypass_enabled && g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
-}
 
 inline void NoteH2FrameDrawCount(u32 frame_draws, u64 frame_duration_ns) {
     if (!g_h2_async || !g_h2_dynamic_bypass_enabled) {
@@ -1220,7 +1221,7 @@ struct H2DrainScope {
     bool active{};
 
     explicit H2DrainScope(H2DrainReason reason) {
-        if (H2Async() && OnStageA()) [[unlikely]] {
+        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
             DrainAsyncH2(reason);
             ++t_h2_drained_depth;
             active = true;
@@ -1231,7 +1232,7 @@ struct H2DrainScope {
     /// can be elided (e.g. SkipEmptyFence fast-path), but the scope must still prevent GPUBackB
     /// from enqueuing new tasks while the synchronous operation runs on Stage A.
     explicit H2DrainScope(H2DrainReason reason, bool do_drain) {
-        if (H2Async() && OnStageA()) [[unlikely]] {
+        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
             if (do_drain) {
                 DrainAsyncH2(reason);
             }
