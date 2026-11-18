@@ -1512,7 +1512,7 @@ void TextureCacheRuntime::BarrierFeedbackLoop() {
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
     if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
         if (h2_end_rp_cb != nullptr) {
-            h2_end_rp_cb(h2_end_rp_arg);
+            h2_end_rp_cb(h2_end_rp_arg, false);
         }
         Scheduler* const sched = &scheduler;
         VideoCommon::BackSplit::EmitTask(
@@ -2980,7 +2980,7 @@ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
 void TextureCacheRuntime::FlushDeferredClear() {
     if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
         if (h2_end_rp_cb != nullptr) {
-            h2_end_rp_cb(h2_end_rp_arg);
+            h2_end_rp_cb(h2_end_rp_arg, true);
         }
         Scheduler* const sched = &scheduler;
         VideoCommon::BackSplit::EmitTask(
@@ -5465,7 +5465,7 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
         };
         if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
             if (h2_end_rp_cb != nullptr) {
-                h2_end_rp_cb(h2_end_rp_arg);
+                h2_end_rp_cb(h2_end_rp_arg, false);
             }
             struct TransitionArgs {
                 Scheduler* sched;

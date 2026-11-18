@@ -482,6 +482,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    scheduler.SetRenderPassCache(render_pass_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -496,7 +497,14 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         };
         VideoCommon::BackSplit::g_h2_post_drain_arg = this;
         texture_cache_runtime.SetH2EndRpCallback(
-            [](void* argument) { static_cast<RasterizerVulkan*>(argument)->h2_mirror.EndRP(); },
+            [](void* argument, bool deferred_only) {
+                auto& mirror = static_cast<RasterizerVulkan*>(argument)->h2_mirror;
+                if (deferred_only) {
+                    mirror.FlushDeferredClear();
+                } else {
+                    mirror.EndRP();
+                }
+            },
             this);
     }
 }
@@ -520,6 +528,7 @@ void RasterizerVulkan::H2SchedulerMirror::SyncFrom(const Scheduler& sched) noexc
     render_pass_serial = sched.RenderPassSerial();
     render_pass_active = sched.IsRenderPassActive();
     framebuffer = sched.CurrentFramebuffer();
+    deferred_clear_fb = sched.DeferredClearFramebuffer();
     render_area = sched.CurrentRenderArea();
     bound_pipeline = sched.BoundGraphicsPipeline();
     has_fragment_barrier = sched.HasFragmentBarrier();
@@ -563,18 +572,23 @@ void RasterizerVulkan::FlushH2DeferredInvalidations(bool lock_texture_cache) {
 void RasterizerVulkan::ExecuteH2DrawOnB(const u64* payload) {
     H2DrawTaskHeader task;
     std::memcpy(&task, payload, sizeof(task));
-    const auto* entries = reinterpret_cast<const DescriptorUpdateEntry*>(
-        reinterpret_cast<const u8*>(payload) + sizeof(H2DrawTaskHeader));
-    task.rasterizer->ExecuteH2DrawTask(task, {entries, task.num_image_entries});
+    const u8* const tail = reinterpret_cast<const u8*>(payload) + sizeof(H2DrawTaskHeader);
+    const auto* entries = reinterpret_cast<const DescriptorUpdateEntry*>(tail);
+    const auto* tex_bufs = reinterpret_cast<const H2TexBufferBind*>(
+        tail + static_cast<size_t>(task.num_image_entries) * sizeof(DescriptorUpdateEntry));
+    task.rasterizer->ExecuteH2DrawTask(task, {entries, task.num_image_entries},
+                                       {tex_bufs, task.num_tex_buffers});
 }
 
 void RasterizerVulkan::ExecuteH2DrawTask(const H2DrawTaskHeader& task,
-                                         std::span<const DescriptorUpdateEntry> image_entries) {
+                                         std::span<const DescriptorUpdateEntry> image_entries,
+                                         std::span<const H2TexBufferBind> tex_buffers) {
     namespace Profile = VideoCommon::Nx2Profile;
     if (task.gpu_memory != nullptr) {
         task.gpu_memory->FlushCaching();
     }
     auto* const m3d_b = H2SideBMaxwell3D();
+    Tegra::Engines::Maxwell3D::ApplySplitBFlags(*m3d_b, task.split_b_flags);
     {
         std::scoped_lock lock{buffer_cache.mutex};
         {
@@ -596,7 +610,7 @@ void RasterizerVulkan::ExecuteH2DrawTask(const H2DrawTaskHeader& task,
         }
         {
             Profile::Scope scope{Profile::Zone::Configure};
-            if (!task.pipeline->ExecuteSideB(task.pkt, image_entries, *m3d_b)) {
+            if (!task.pipeline->ExecuteSideB(task.pkt, image_entries, tex_buffers, *m3d_b)) {
                 return;
             }
         }
@@ -660,6 +674,186 @@ void RasterizerVulkan::ExecuteH2DrawTask(const H2DrawTaskHeader& task,
             oot_live_dlss->SaveEffectsBase(task.save_effects_view, task.save_effects_extent,
                                            task.render_trace_frame);
         }
+    }
+}
+
+void RasterizerVulkan::ExecuteH2ClearOnB(const u64* payload) {
+    H2ClearTaskHeader task;
+    std::memcpy(&task, payload, sizeof(task));
+    task.rasterizer->ExecuteH2ClearTask(task);
+}
+
+void RasterizerVulkan::ExecuteH2ClearTask(const H2ClearTaskHeader& task) {
+    if (task.gpu_memory != nullptr) {
+        task.gpu_memory->FlushCaching();
+    }
+    auto* const m3d_b = H2SideBMaxwell3D();
+    Tegra::Engines::Maxwell3D::ApplySplitBFlags(*m3d_b, task.split_b_flags);
+    std::scoped_lock lock{buffer_cache.mutex};
+    const bool deferred = task.can_defer_clear && !scheduler.IsRenderPassActive();
+    if (!deferred) {
+        scheduler.RequestRenderpassSnapshot(task.fb_snapshot);
+    }
+    query_cache.NotifySegment(true);
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !deferred && m3d_b->regs.zpass_pixel_count_enable);
+    UpdateViewportsState(m3d_b->regs, task.is_rescaling);
+    if (task.do_color) {
+        if (deferred &&
+            scheduler.DeferColorClearSnapshot(task.fb_snapshot, task.color_attachment,
+                                              task.color_clear_value)) {
+            // Deferred into next render pass loadOp=CLEAR.
+        } else {
+            if (deferred) {
+                scheduler.RequestRenderpassSnapshot(task.fb_snapshot);
+            }
+            scheduler.Record([color_attachment = task.color_attachment,
+                              clear_value = task.color_clear_value,
+                              clear_rect = task.clear_rect](vk::CommandBuffer cmdbuf) {
+                const VkClearAttachment attachment{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .colorAttachment = color_attachment,
+                    .clearValue = clear_value,
+                };
+                cmdbuf.ClearAttachments(attachment, clear_rect);
+            });
+        }
+    }
+    if (task.do_ds) {
+        if (deferred &&
+            scheduler.DeferDepthStencilClearSnapshot(task.fb_snapshot, task.ds_clear_value)) {
+            // Deferred into next render pass loadOp=CLEAR.
+        } else {
+            if (deferred) {
+                scheduler.RequestRenderpassSnapshot(task.fb_snapshot);
+            }
+            scheduler.Record([ds_value = task.ds_clear_value, clear_rect = task.clear_rect,
+                              aspect_flags = task.ds_aspect_flags](vk::CommandBuffer cmdbuf) {
+                VkClearAttachment attachment{};
+                attachment.aspectMask = aspect_flags;
+                attachment.colorAttachment = 0;
+                attachment.clearValue = ds_value;
+                cmdbuf.ClearAttachments(attachment, clear_rect);
+            });
+        }
+    }
+}
+
+void RasterizerVulkan::ExecuteH2ComputeOnB(const u64* payload) {
+    H2ComputeTaskHeader task;
+    std::memcpy(&task, payload, sizeof(task));
+    const u8* const tail = reinterpret_cast<const u8*>(payload) + sizeof(H2ComputeTaskHeader);
+    const auto* entries = reinterpret_cast<const DescriptorUpdateEntry*>(tail);
+    const auto* tex_bufs = reinterpret_cast<const H2TexBufferBind*>(
+        tail + static_cast<size_t>(task.num_image_entries) * sizeof(DescriptorUpdateEntry));
+    task.rasterizer->ExecuteH2ComputeTask(task, {entries, task.num_image_entries},
+                                          {tex_bufs, task.num_tex_buffers});
+}
+
+void RasterizerVulkan::ExecuteH2ComputeTask(const H2ComputeTaskHeader& task,
+                                            std::span<const DescriptorUpdateEntry> image_entries,
+                                            std::span<const H2TexBufferBind> tex_buffers) {
+    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    if (task.gpu_memory != nullptr) {
+        task.gpu_memory->FlushCaching();
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.SetH2ComputeOverride(&task.compute_override);
+    const Tegra::Nx2ListStats::WriterScope list_writer{Tegra::Nx2ListStats::Writer::Dispatch,
+                                                       task.pipeline->ShaderHash()};
+    buffer_cache.Nx2CollectListCopies(true);
+    SCOPE_EXIT {
+        buffer_cache.Nx2CollectListCopies(false);
+        buffer_cache.SetH2ComputeOverride(nullptr);
+    };
+
+    scheduler.RequestOutsideRenderPassOperationContext();
+    if (!task.pipeline->ExecuteSideB(task.pkt, image_entries, tex_buffers, scheduler,
+                                     buffer_cache)) {
+        return;
+    }
+    TracePendingCpuWrites(true, std::array{task.pipeline->ShaderHash()});
+
+    switch (task.kind) {
+    case H2ComputeKind::ListSlot: {
+        auto& slots = buffer_cache_runtime.Nx2Slots();
+        if (!slots.Held(task.list_slot)) [[unlikely]] {
+            LOG_ERROR(Render_Vulkan, "Nx2 list slot {} dispatched without a hold", task.list_slot);
+            return;
+        }
+        const auto [args_buffer, args_offset] = slots.DispatchArguments(task.list_slot);
+        scheduler.NoteComputeWrites();
+        scheduler.TraceComputePipeline(task.pipeline->ShaderHash());
+        scheduler.Record([this, pipeline = task.pipeline, indirect_buffer = args_buffer,
+                          indirect_offset = args_offset](vk::CommandBuffer cmdbuf) {
+            RecordDispatchBarrier(cmdbuf);
+            if (!pipeline->IsBound()) {
+                return;
+            }
+            scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
+                cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+            });
+        });
+        Tegra::Nx2ListIndirect::Stats::Count(Tegra::Nx2ListIndirect::Stats::Get().slot_dispatches);
+        if (Tegra::Nx2ListIndirect::Stats::g_check) [[unlikely]] {
+            slots.CheckDispatch(task.list_slot);
+        }
+        buffer_cache.NoteWorkRecorded(true);
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+            scheduler.Flush();
+        }
+        return;
+    }
+    case H2ComputeKind::IndirectAddress: {
+        const auto [buffer, offset] =
+            VideoCommon::ObtainIndirectBuffer(buffer_cache, task.indirect_address);
+        scheduler.NoteComputeWrites();
+        scheduler.TraceComputePipeline(task.pipeline->ShaderHash());
+        scheduler.Record([this, pipeline = task.pipeline, indirect_buffer = buffer->Handle(),
+                          indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+            RecordDispatchBarrier(cmdbuf);
+            if (!pipeline->IsBound()) {
+                return;
+            }
+            scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, {}, [&] {
+                cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+            });
+        });
+        buffer_cache.NoteWorkRecorded(true);
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+            scheduler.Flush();
+        }
+        return;
+    }
+    case H2ComputeKind::Direct: {
+        const auto& qmd{task.compute_override.launch_description};
+        const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+        const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
+        if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
+            return;
+        }
+        scheduler.NoteComputeWrites();
+        scheduler.TraceComputePipeline(task.pipeline->ShaderHash());
+        scheduler.Record([this, pipeline = task.pipeline, dim](vk::CommandBuffer cmdbuf) {
+            RecordDispatchBarrier(cmdbuf);
+            if (!pipeline->IsBound()) {
+                return;
+            }
+            scheduler.TraceGpuWork(cmdbuf, pipeline->ShaderHash(), 0, dim,
+                                   [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
+        });
+        buffer_cache.NoteWorkRecorded(true);
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+            scheduler.Flush();
+        }
+        if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
+            const std::string params =
+                fmt::format("groupCountX={}, groupCountY={}, groupCountZ={}", dim[0], dim[1], dim[2]);
+            GPU::Logging::GPULogger::GetInstance().LogVulkanCall("vkCmdDispatch", params, VK_SUCCESS);
+        }
+        return;
+    }
     }
 }
 
@@ -1888,8 +2082,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
-    const bool use_h2_split = VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() &&
-                              !pipeline->UsesTextureOrImageBuffers() && !frame_dump.Capturing();
+    const bool use_h2_split =
+        VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() && !frame_dump.Capturing();
     const bool use_h2_async = use_h2_split && VideoCommon::BackSplit::UseH2AsyncQueue() &&
                               !is_indirect && !fast_draw_verify && reuse_start == 0 &&
                               !DrawRepeatEnabled();
@@ -2019,7 +2213,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (pipeline->HasDynamicVertexInput()) {
             maxwell3d->dirty.flags[Dirty::VertexInput] = false;
         }
-        maxwell3d->SplitSendFlagsH2();
+        const auto split_b_flags = maxwell3d->TakeSplitBFlags();
         uniform_writes_lost = taken_delta_unconsumed = false;
         if (path == DrawPath::Delta) {
             ++fast_draw_stats.delta;
@@ -2037,17 +2231,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             .pipeline = pipeline,
             .gpu_memory = gpu_memory,
             .pkt = static_cast<const H2DrawPacketBase&>(pkt),
+            .split_b_flags = split_b_flags,
             .hashes = hashes,
             .render_trace_frame = render_trace_frame,
             .save_effects_view = save_effects_view,
             .save_effects_extent = save_effects_extent,
             .instance_count = instance_count,
-            .num_image_entries = static_cast<u32>(pkt.image_entries.size()),
+            .num_image_entries = static_cast<u16>(pkt.image_entries.size()),
+            .num_tex_buffers = static_cast<u16>(pkt.tex_buffers.size()),
             .is_mesh_draw = mesh_draw,
         };
-        VideoCommon::BackSplit::EmitTask2(
+        VideoCommon::BackSplit::EmitTask3(
             &ExecuteH2DrawOnB, &task_header, sizeof(task_header), pkt.image_entries.data(),
-            pkt.image_entries.size() * sizeof(DescriptorUpdateEntry));
+            pkt.image_entries.size() * sizeof(DescriptorUpdateEntry), pkt.tex_buffers.data(),
+            pkt.tex_buffers.size() * sizeof(H2TexBufferBind));
         ++VideoCommon::BackSplit::g_h2_draws_enqueued;
         if (VideoCommon::Nx2H2SplitLockstepEnabled()) [[unlikely]] {
             VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Lockstep);
@@ -2227,7 +2424,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 : 0;
         {
             Profile::Scope scope{Profile::Zone::Configure};
-            if (!pipeline->ExecuteSideB(pkt, pkt.image_entries, *m3d_b)) {
+            if (!pipeline->ExecuteSideB(pkt, pkt.image_entries, pkt.tex_buffers, *m3d_b)) {
                 report_failure("configure failed");
                 TraceRenderState(is_indexed, "configure-failed", nullptr);
                 return;
@@ -3327,20 +3524,257 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::RtOrClear);
+
+    bool flushed_work = false;
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !frame_dump.Capturing()) [[unlikely]] {
+        auto& regs = maxwell3d->regs;
+        const bool use_color = regs.clear_surface.R || regs.clear_surface.G ||
+                               regs.clear_surface.B || regs.clear_surface.A;
+        const bool use_depth = regs.clear_surface.Z;
+        const bool use_stencil = regs.clear_surface.S;
+        if (!use_color && !use_depth && !use_stencil) {
+            return;
+        }
+        const bool color_full_channels = regs.clear_surface.R && regs.clear_surface.G &&
+                                         regs.clear_surface.B && regs.clear_surface.A;
+        if (!use_color || color_full_channels) {
+            if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
+                LOG_INFO(HW_GPU,
+                         "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} "
+                         "{} {} {}",
+                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                         static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw,
+                         regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                         regs.clear_color[3]);
+            }
+            TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+            FlushWork();
+            flushed_work = true;
+
+            std::unique_lock tex_lock{texture_cache.mutex};
+            FlushH2DeferredInvalidations(false);
+            texture_cache.UpdateRenderTargets(true);
+            const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+            const VkExtent2D render_area = framebuffer->RenderArea();
+            const u32 base_array_layer = regs.clear_surface.layer;
+            const u32 color_attachment = regs.clear_surface.RT;
+
+            const bool needs_volume_clear = [&] {
+                if (use_depth || use_stencil) {
+                    return false;
+                }
+                const auto& color_buffer_ids = texture_cache.GetRenderTargets().color_buffer_ids;
+                if (color_attachment >= color_buffer_ids.size()) {
+                    return false;
+                }
+                const auto view_id = color_buffer_ids[color_attachment];
+                const u32 depth = regs.rt[color_attachment].depth;
+                if (!view_id || depth <= framebuffer->Layers() || base_array_layer >= depth) {
+                    return false;
+                }
+                const auto& view = texture_cache.GetImageView(view_id);
+                const bool is_volume = True(view.flags & VideoCommon::ImageViewFlagBits::Slice);
+                const bool clears_to_zero =
+                    std::ranges::all_of(regs.clear_color, [](f32 value) { return value == 0.0f; });
+                return is_volume && color_full_channels && clears_to_zero;
+            }();
+            const bool stencil_partial = use_stencil && framebuffer->HasAspectStencilBit() &&
+                                         regs.stencil_front_mask != 0xFF &&
+                                         regs.stencil_front_mask != 0;
+
+            if (!needs_volume_clear && !stencil_partial) {
+                const auto clear_layers =
+                    GetFramebufferClearLayers(base_array_layer, layer_count, framebuffer->Layers());
+                if (clear_layers.count != layer_count) {
+                    LOG_DEBUG(
+                        Render_Vulkan,
+                        "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
+                        base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
+                }
+                if (clear_layers.count == 0) {
+                    return;
+                }
+                u32 up_scale = 1;
+                u32 down_shift = 0;
+                if (texture_cache.IsRescaling()) {
+                    up_scale = Settings::values.resolution_info.up_scale;
+                    down_shift = Settings::values.resolution_info.down_shift;
+                }
+                VkRect2D default_scissor{};
+                default_scissor.offset.x = 0;
+                default_scissor.offset.y = 0;
+                default_scissor.extent.width = (std::numeric_limits<s32>::max)();
+                default_scissor.extent.height = (std::numeric_limits<s32>::max)();
+                VkClearRect clear_rect{
+                    .rect = regs.clear_control.use_scissor
+                                ? GetScissorState(regs, 0, up_scale, down_shift)
+                                : default_scissor,
+                    .baseArrayLayer = base_array_layer,
+                    .layerCount = clear_layers.count,
+                };
+                const auto clamp_rect = [render_area](VkRect2D& rect) -> bool {
+                    const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
+                        auto clamp_offset = [&offset, limit]() {
+                            if (limit == 0) {
+                                offset = 0;
+                                return;
+                            }
+                            offset = std::clamp(offset, 0, static_cast<s32>(limit));
+                        };
+                        if (extent == 0) {
+                            clamp_offset();
+                            return;
+                        }
+                        if (offset < 0) {
+                            const u32 shrink = (std::min)(extent, static_cast<u32>(-offset));
+                            extent -= shrink;
+                            offset = 0;
+                        }
+                        if (limit == 0) {
+                            extent = 0;
+                            offset = 0;
+                            return;
+                        }
+                        if (offset >= s32(limit)) {
+                            offset = s32(limit);
+                            extent = 0;
+                            return;
+                        }
+                        const u64 end_coord = u64(offset) + extent;
+                        if (end_coord > limit) {
+                            extent = limit - u32(offset);
+                        }
+                    };
+                    clamp_axis(rect.offset.x, rect.extent.width, render_area.width);
+                    clamp_axis(rect.offset.y, rect.extent.height, render_area.height);
+                    return rect.extent.width != 0 && rect.extent.height != 0;
+                };
+                if (!clamp_rect(clear_rect.rect)) {
+                    return;
+                }
+
+                if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) &&
+                    render_trace_clears++ < 2048) {
+                    LOG_DEBUG(
+                        Render_Vulkan,
+                        "Render trace clear: frame={} docked={} color={} depth={} stencil={} "
+                        "color_target={} color_address={:#x} depth_address={:#x} depth_value={} "
+                        "base_layer={} layers={} framebuffer_layers={} rect=({},{} {}x{})",
+                        render_trace_frame, Settings::IsDockedMode(), use_color, use_depth,
+                        use_stencil, color_attachment,
+                        color_attachment < regs.rt.size() ? regs.rt[color_attachment].Address() : 0,
+                        regs.zeta.Address(), regs.clear_depth, clear_rect.baseArrayLayer,
+                        clear_rect.layerCount, framebuffer->Layers(), clear_rect.rect.offset.x,
+                        clear_rect.rect.offset.y, clear_rect.rect.extent.width,
+                        clear_rect.rect.extent.height);
+                }
+
+                constexpr bool ENABLE_DEFERRED_CLEAR = true;
+                const bool ds_used = use_depth || use_stencil;
+                const bool ds_deferrable =
+                    !ds_used || ((!framebuffer->HasAspectDepthBit() || use_depth) &&
+                                 (!framebuffer->HasAspectStencilBit() || use_stencil));
+                const bool clear_covers_render_area =
+                    clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
+                    clear_rect.rect.extent.width >= render_area.width &&
+                    clear_rect.rect.extent.height >= render_area.height;
+                const bool can_defer_clear =
+                    ENABLE_DEFERRED_CLEAR &&
+                    (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+                    clear_layers.covers_all_layers && !h2_mirror.render_pass_active &&
+                    ds_deferrable;
+
+                const bool do_color = use_color && framebuffer->HasAspectColorBit(color_attachment);
+                VkClearValue color_clear_value{};
+                if (do_color) {
+                    const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+                        regs.rt[color_attachment].format);
+                    const bool is_integer = IsPixelFormatInteger(format);
+                    const bool is_signed = IsPixelFormatSignedInteger(format);
+                    const size_t int_size = PixelComponentSizeBitsInteger(format);
+                    if (!is_integer) {
+                        std::memcpy(color_clear_value.color.float32, regs.clear_color.data(),
+                                    regs.clear_color.size() * sizeof(f32));
+                    } else if (!is_signed) {
+                        for (size_t i = 0; i < 4; ++i) {
+                            color_clear_value.color.uint32[i] =
+                                u32(f32(u64(int_size) << 1U) * regs.clear_color[i]);
+                        }
+                    } else {
+                        for (size_t i = 0; i < 4; ++i) {
+                            color_clear_value.color.int32[i] =
+                                s32(f32(s64(int_size - 1) << 1) * (regs.clear_color[i] - 0.5f));
+                        }
+                    }
+                }
+
+                VkImageAspectFlags ds_aspect_flags = 0;
+                if (use_depth && framebuffer->HasAspectDepthBit()) {
+                    ds_aspect_flags |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                }
+                if (use_stencil && framebuffer->HasAspectStencilBit()) {
+                    ds_aspect_flags |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                }
+                const bool do_ds = ds_aspect_flags != 0;
+                VkClearValue ds_clear_value{};
+                ds_clear_value.depthStencil.depth = regs.clear_depth;
+                ds_clear_value.depthStencil.stencil = regs.clear_stencil;
+
+                framebuffer->MarkResolveShadowsUpToDate();
+                const FramebufferSnapshot fb_snap = FramebufferSnapshot::From(*framebuffer);
+                const bool is_rescaling = texture_cache.IsRescaling();
+                if (!can_defer_clear) {
+                    h2_mirror.RequestRP(fb_snap);
+                } else if (do_color || do_ds) {
+                    h2_mirror.DeferClear(fb_snap);
+                }
+                const auto split_b_flags = maxwell3d->TakeSplitBFlags();
+                tex_lock.unlock();
+
+                const H2ClearTaskHeader hdr{
+                    .rasterizer = this,
+                    .gpu_memory = gpu_memory,
+                    .fb_snapshot = fb_snap,
+                    .clear_rect = clear_rect,
+                    .color_clear_value = color_clear_value,
+                    .ds_clear_value = ds_clear_value,
+                    .split_b_flags = split_b_flags,
+                    .color_attachment = color_attachment,
+                    .ds_aspect_flags = ds_aspect_flags,
+                    .can_defer_clear = can_defer_clear,
+                    .do_color = do_color,
+                    .do_ds = do_ds,
+                    .is_rescaling = is_rescaling,
+                };
+                VideoCommon::BackSplit::EmitTask(&ExecuteH2ClearOnB, &hdr, sizeof(hdr));
+                ++VideoCommon::BackSplit::g_h2_clears_enqueued;
+                if (VideoCommon::Nx2H2SplitLockstepEnabled()) [[unlikely]] {
+                    VideoCommon::BackSplit::DrainAsyncH2(
+                        VideoCommon::BackSplit::H2DrainReason::Lockstep);
+                }
+                return;
+            }
+        }
+    }
+
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
     }
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Clear};
-    if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
-        const auto& regs = maxwell3d->regs;
-        LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
-                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
-                 static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw, regs.clear_color[0],
-                 regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
+    if (!flushed_work) {
+        if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
+            const auto& regs = maxwell3d->regs;
+            LOG_INFO(HW_GPU,
+                     "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
+                     regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                     static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw,
+                     regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                     regs.clear_color[3]);
+        }
+        TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+        FlushWork();
     }
-    TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
-    FlushWork();
     gpu_memory->FlushCaching();
 
     auto& regs = maxwell3d->regs;
@@ -3559,10 +3993,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
-    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Compute);
-    const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Compute};
     // As after a draw: run the sync operations threads wait for, such as a guest read's flush,
     // rather than only at the next draw.
     SCOPE_EXIT {
@@ -3571,7 +4002,89 @@ void RasterizerVulkan::DispatchCompute() {
         gpu.TickWork();
     };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
-    FlushWork();
+
+    bool flushed_work = false;
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !frame_dump.Capturing()) [[unlikely]] {
+        FlushWork();
+        flushed_work = true;
+        u64 native_key{};
+        ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
+        if (pipeline != nullptr && pipeline->IsBuilt()) {
+            const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+            const auto list_slot = kepler_compute->GetIndirectListSlot();
+            const bool indirect = indirect_address || list_slot;
+            const bool can_replace =
+                OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
+                (pipeline->ShaderHash() != ComputePipeline::OcarinaFullSizeShader ||
+                 oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
+                !indirect;
+            const bool marking_effects =
+                oot_effects_frame == render_trace_frame && OcarinaTemporalEnabled() && !indirect;
+            constexpr u64 oot_depth_reader = 0x1fc7a0423116281fULL;
+            const bool oot_depth_track =
+                OcarinaTemporalEnabled() && pipeline->ShaderHash() == oot_depth_reader;
+
+            if (!can_replace && !marking_effects && !oot_depth_track) {
+                std::unique_lock tex_lock{texture_cache.mutex};
+                FlushH2DeferredInvalidations(false);
+                H2ComputePacket pkt{};
+                pipeline->PrepareSideA(*kepler_compute, *gpu_memory, texture_cache, pkt);
+                if (!pkt.fallback_sync) {
+                    const auto& qmd{kepler_compute->launch_description};
+                    if (native_key == 0x6e0ae200ee9aa220ULL &&
+                        (qmd.const_buffer_enable_mask & 1) != 0) {
+                        const auto& constants = qmd.const_buffer_config[0];
+                        if (constants.size >= 0x3c) {
+                            const u32 handle = VideoCommon::BackSplit::ReadWithForward<u32>(
+                                *gpu_memory, constants.Address() + 0x38);
+                            const u32 index =
+                                Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0).first;
+                            texture_cache.PublishComputeCollisionImage(index);
+                        }
+                    }
+                    h2_mirror.EndRP();
+                    tex_lock.unlock();
+
+                    H2ComputeTaskHeader hdr{
+                        .rasterizer = this,
+                        .pipeline = pipeline,
+                        .gpu_memory = gpu_memory,
+                        .compute_override =
+                            {
+                                .launch_description = qmd,
+                                .native_mode = kepler_compute->IsNativeMode(),
+                                .is_indirect = indirect,
+                            },
+                        .pkt = static_cast<const H2ComputePacketBase&>(pkt),
+                        .indirect_address = indirect_address.value_or(0),
+                        .list_slot = list_slot.value_or(0),
+                        .num_image_entries = static_cast<u16>(pkt.image_entries.size()),
+                        .num_tex_buffers = static_cast<u16>(pkt.tex_buffers.size()),
+                        .kind = list_slot         ? H2ComputeKind::ListSlot
+                                : indirect_address ? H2ComputeKind::IndirectAddress
+                                                   : H2ComputeKind::Direct,
+                    };
+                    VideoCommon::BackSplit::EmitTask3(
+                        &ExecuteH2ComputeOnB, &hdr, sizeof(hdr), pkt.image_entries.data(),
+                        pkt.image_entries.size() * sizeof(DescriptorUpdateEntry),
+                        pkt.tex_buffers.data(), pkt.tex_buffers.size() * sizeof(H2TexBufferBind));
+                    ++VideoCommon::BackSplit::g_h2_computes_enqueued;
+                    if (VideoCommon::Nx2H2SplitLockstepEnabled()) [[unlikely]] {
+                        VideoCommon::BackSplit::DrainAsyncH2(
+                            VideoCommon::BackSplit::H2DrainReason::Lockstep);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::Compute};
+    if (!flushed_work) {
+        FlushWork();
+    }
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
         frame_dump.EndPass();

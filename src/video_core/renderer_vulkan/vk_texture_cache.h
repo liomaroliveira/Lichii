@@ -98,8 +98,9 @@ public:
     void FlushDeferredClear();
 
     /// E04.T12: callback invoked on Stage A when an async texture op ends the active render pass
-    /// on GPUBackB, so RasterizerVulkan updates H2SchedulerMirror without draining.
-    void SetH2EndRpCallback(void (*cb)(void*), void* arg) noexcept {
+    /// (deferred_only=false) or flushes a deferred clear (deferred_only=true) on GPUBackB, so
+    /// RasterizerVulkan updates H2SchedulerMirror without draining.
+    void SetH2EndRpCallback(void (*cb)(void*, bool), void* arg) noexcept {
         h2_end_rp_cb = cb;
         h2_end_rp_arg = arg;
     }
@@ -266,7 +267,7 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
-    void (*h2_end_rp_cb)(void*){};
+    void (*h2_end_rp_cb)(void*, bool){};
     void* h2_end_rp_arg{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
@@ -494,24 +495,48 @@ private:
     mutable u32 num_memoized_variants{};
 };
 
-/// Value snapshot of a Framebuffer for H2 Side B render pass requests without dereferencing
-/// TextureCache-owned objects.
+/// Value snapshot of a Framebuffer for H2 Side B render pass and deferred clear requests without
+/// dereferencing TextureCache-owned objects.
 struct FramebufferSnapshot {
     VkFramebuffer handle{VK_NULL_HANDLE};
     VkRenderPass renderpass{VK_NULL_HANDLE};
     VkExtent2D render_area{};
     u32 num_images{};
+    u32 layers{};
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
+    RenderPassKey render_pass_key_base{};
+    u8 color_aspect_mask{};
+    bool discards_msaa_color{};
+    bool discards_msaa_depth_stencil{};
+    bool has_aspect_depth{};
+    bool has_aspect_stencil{};
+
+    [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
+        return index < 8 && ((color_aspect_mask >> index) & 1U) != 0;
+    }
 
     [[nodiscard]] static FramebufferSnapshot From(const Framebuffer& fb) noexcept {
+        u8 color_mask{};
+        for (size_t i = 0; i < 8; ++i) {
+            if (fb.HasAspectColorBit(i)) {
+                color_mask |= static_cast<u8>(1U << i);
+            }
+        }
         return FramebufferSnapshot{
             .handle = fb.Handle(),
             .renderpass = fb.RenderPass(),
             .render_area = fb.RenderArea(),
             .num_images = fb.NumImages(),
+            .layers = fb.Layers(),
             .images = fb.Images(),
             .image_ranges = fb.ImageRanges(),
+            .render_pass_key_base = fb.RenderPassKeyBase(),
+            .color_aspect_mask = color_mask,
+            .discards_msaa_color = fb.DiscardsMsaaColor(),
+            .discards_msaa_depth_stencil = fb.DiscardsMsaaDepthStencil(),
+            .has_aspect_depth = fb.HasAspectDepthBit(),
+            .has_aspect_stencil = fb.HasAspectStencilBit(),
         };
     }
 };

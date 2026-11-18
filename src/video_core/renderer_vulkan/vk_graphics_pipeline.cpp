@@ -1856,10 +1856,11 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
     pkt.is_rescaling = false;
     pkt.replay_images = false;
     pkt.image_entries.clear();
+    pkt.tex_buffers.clear();
     pkt.image_ranges = {};
     pkt.rescaling_words = {};
 
-    if (uses_texture_or_image_buffers || mesh_emulation) {
+    if (mesh_emulation) {
         pkt.fallback_sync = true;
         return true;
     }
@@ -2044,7 +2045,11 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
             const auto note_computed{[&](const auto& desc, u32 element, u32 value) {
                 using Desc = std::remove_cvref_t<decltype(desc)>;
                 const auto [kind, first] = [&]() -> std::pair<ComputedHandleKind, const Desc*> {
-                    if constexpr (std::is_same_v<Desc, Shader::TextureDescriptor>) {
+                    if constexpr (std::is_same_v<Desc, Shader::TextureBufferDescriptor>) {
+                        return {TextureBuffer, info.texture_buffer_descriptors.data()};
+                    } else if constexpr (std::is_same_v<Desc, Shader::ImageBufferDescriptor>) {
+                        return {ImageBuffer, info.image_buffer_descriptors.data()};
+                    } else if constexpr (std::is_same_v<Desc, Shader::TextureDescriptor>) {
                         return {Texture, info.texture_descriptors.data()};
                     } else {
                         return {Image, info.image_descriptors.data()};
@@ -2072,7 +2077,9 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
                 const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
                 const u32 primary_word{
                     VideoCommon::BackSplit::ReadWithForward<u32>(*gpu_memory, addr)};
-                if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
+                if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
+                              std::is_same_v<decltype(desc),
+                                             const Shader::TextureBufferDescriptor&>) {
                     if (desc.has_secondary) {
                         ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                         const u32 second_offset{desc.secondary_cbuf_offset};
@@ -2088,6 +2095,24 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
                 }
                 return TexturePair(primary_word, via_header_index);
             }};
+            const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    const auto handle{read_handle(desc, index)};
+                    views.push_back({
+                        .index = handle.first,
+                        .blacklist = blacklist,
+                        .id = {},
+                    });
+                }
+            }};
+            if (uses_texture_or_image_buffers) {
+                for (const auto& desc : info.texture_buffer_descriptors) {
+                    add_image(desc, false);
+                }
+                for (const auto& desc : info.image_buffer_descriptors) {
+                    add_image(desc, false);
+                }
+            }
             if (resolve_in_full) {
                 u32 texture{};
                 for (const auto& desc : info.texture_descriptors) {
@@ -2210,6 +2235,10 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
                 continue;
             }
             const Shader::Info& info{stage_infos[stage]};
+            if (uses_texture_or_image_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
             const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
             for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
                 sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
@@ -2247,6 +2276,58 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         NextDeltaGeneration();
         kept_image_entries.clear();
         kept_image_ranges = {};
+    }
+
+    if (uses_texture_or_image_buffers) {
+        const VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (!immutable_enabled_stages[stage]) {
+                continue;
+            }
+            size_t index{};
+            const auto add_buffer{[&](const auto& desc) {
+                constexpr bool is_image =
+                    std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
+                for (u32 i = 0; i < desc.count; ++i) {
+                    bool is_written{false};
+                    if constexpr (is_image) {
+                        is_written = desc.is_written;
+                    }
+                    ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
+                    PixelFormat format{image_view.format};
+                    if constexpr (is_image) {
+                        if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                            format = *explicit_format;
+                        }
+                    }
+                    pkt.tex_buffers.push_back(H2TexBufferBind{
+                        .gpu_addr = image_view.GpuAddr(),
+                        .size = image_view.BufferSize(),
+                        .format = format,
+                        .index = static_cast<u16>(index),
+                        .stage = static_cast<u8>(stage),
+                        .is_image = static_cast<u8>(is_image ? 1 : 0),
+                        .is_written = static_cast<u8>(is_written ? 1 : 0),
+                    });
+                    ++index;
+                    ++texture_buffer_it;
+                }
+            }};
+            const Shader::Info& info{stage_infos[stage]};
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                add_buffer(desc);
+            }
+            for (const auto& desc : info.image_buffer_descriptors) {
+                add_buffer(desc);
+            }
+            texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
+            if (has_image_descriptors) {
+                texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+        if (!pkt.tex_buffers.empty()) {
+            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexBufferBind);
+        }
     }
 
     pkt.unbind_tex_buffers = true;
@@ -2320,6 +2401,7 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
 
 bool GraphicsPipeline::ExecuteSideB(const H2DrawPacketBase& pkt,
                                     std::span<const DescriptorUpdateEntry> image_entries,
+                                    std::span<const H2TexBufferBind> tex_buffers,
                                     const Tegra::Engines::Maxwell3D& m3d_b) {
     namespace Profile = VideoCommon::Nx2Profile;
     const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
@@ -2331,6 +2413,14 @@ bool GraphicsPipeline::ExecuteSideB(const H2DrawPacketBase& pkt,
             if (immutable_enabled_stages[stage]) {
                 buffer_cache.UnbindGraphicsTextureBuffers(stage);
             }
+        }
+    }
+    if (!tex_buffers.empty()) {
+        Profile::Scope scope{Profile::Zone::TextureBuffers};
+        for (const H2TexBufferBind& tb : tex_buffers) {
+            buffer_cache.BindGraphicsTextureBuffer(tb.stage, tb.index, tb.gpu_addr, tb.size,
+                                                   tb.format, tb.is_written != 0,
+                                                   tb.is_image != 0);
         }
     }
 

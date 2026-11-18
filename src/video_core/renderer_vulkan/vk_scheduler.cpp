@@ -771,33 +771,67 @@ void Scheduler::BeginRenderPassSnapshotImpl(const FramebufferSnapshot& fb, VkRen
     renderpass_image_ranges = fb.image_ranges;
 }
 
+Scheduler::DeferredClear::DeferredClear() = default;
+Scheduler::DeferredClear::~DeferredClear() = default;
+
 void Scheduler::RealizeDeferredClear() {
-    if (deferred_clear.framebuffer == nullptr) {
+    if (!deferred_clear.Active()) {
         return;
     }
-    const DeferredClear dc = deferred_clear;
-    deferred_clear = {};
+    const Framebuffer* const dc_framebuffer = deferred_clear.framebuffer;
+    const bool dc_has_snapshot = deferred_clear.has_snapshot;
+    FramebufferSnapshot dc_snapshot{};
+    if (dc_has_snapshot) {
+        dc_snapshot = *deferred_clear.snapshot;
+    }
+    const u32 dc_color_clear_mask = deferred_clear.color_clear_mask;
+    const std::array<VkClearValue, 8> dc_color_values = deferred_clear.color_values;
+    const bool dc_depth_stencil = deferred_clear.depth_stencil;
+    const VkClearValue dc_depth_stencil_value = deferred_clear.depth_stencil_value;
+    deferred_clear.Reset();
 
     std::array<VkClearValue, 9> clear_values{};
     u32 count = 0;
-    const RenderPassKey& base = dc.framebuffer->RenderPassKeyBase();
+    const RenderPassKey& base = dc_has_snapshot ? dc_snapshot.render_pass_key_base
+                                                : dc_framebuffer->RenderPassKeyBase();
     for (u32 slot = 0; slot < 8; ++slot) {
         if (base.color_formats[slot] == VideoCore::Surface::PixelFormat::Invalid) {
             continue;
         }
-        clear_values[count++] = dc.color_values[slot];
+        clear_values[count++] = dc_color_values[slot];
     }
     if (base.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
-        clear_values[count++] = dc.depth_stencil_value;
+        clear_values[count++] = dc_depth_stencil_value;
     }
-    const u32 color_discard_mask =
-        dc.framebuffer->DiscardsMsaaColor() ? dc.color_clear_mask : 0u;
-    const bool depth_stencil_discard =
-        dc.depth_stencil && dc.framebuffer->DiscardsMsaaDepthStencil();
-    const VkRenderPass renderpass = dc.framebuffer->RenderPassVariant(
-        dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
+    const bool discards_color = dc_has_snapshot ? dc_snapshot.discards_msaa_color
+                                                : dc_framebuffer->DiscardsMsaaColor();
+    const bool discards_ds = dc_has_snapshot ? dc_snapshot.discards_msaa_depth_stencil
+                                             : dc_framebuffer->DiscardsMsaaDepthStencil();
+    const u32 color_discard_mask = discards_color ? dc_color_clear_mask : 0u;
+    const bool depth_stencil_discard = dc_depth_stencil && discards_ds;
+    VkRenderPass renderpass{VK_NULL_HANDLE};
+    if (dc_has_snapshot) {
+        if (dc_color_clear_mask == 0 && !dc_depth_stencil && color_discard_mask == 0 &&
+            !depth_stencil_discard) {
+            renderpass = dc_snapshot.renderpass;
+        } else {
+            RenderPassKey key = base;
+            key.color_clear_mask = dc_color_clear_mask;
+            key.depth_stencil_clear = dc_depth_stencil;
+            key.color_discard_mask = color_discard_mask;
+            key.depth_stencil_discard = depth_stencil_discard;
+            renderpass = render_pass_cache->Get(key);
+        }
+    } else {
+        renderpass = dc_framebuffer->RenderPassVariant(dc_color_clear_mask, dc_depth_stencil,
+                                                       color_discard_mask, depth_stencil_discard);
+    }
     EndRenderPass();
-    BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    if (dc_has_snapshot) {
+        BeginRenderPassSnapshotImpl(dc_snapshot, renderpass, clear_values.data(), count);
+    } else {
+        BeginRenderPassImpl(dc_framebuffer, renderpass, clear_values.data(), count);
+    }
 }
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
@@ -805,10 +839,12 @@ bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
     if (IsRenderPassActive()) {
         return false;
     }
-    if (deferred_clear.framebuffer != nullptr && deferred_clear.framebuffer != framebuffer) {
+    if (deferred_clear.Active() &&
+        (deferred_clear.has_snapshot || deferred_clear.framebuffer != framebuffer)) {
         RealizeDeferredClear();
         EndRenderPass();
     }
+    deferred_clear.has_snapshot = false;
     deferred_clear.framebuffer = framebuffer;
     deferred_clear.color_clear_mask |= 1u << rt_slot;
     deferred_clear.color_values[rt_slot] = value;
@@ -819,28 +855,90 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
     if (IsRenderPassActive()) {
         return false;
     }
-    if (deferred_clear.framebuffer != nullptr && deferred_clear.framebuffer != framebuffer) {
+    if (deferred_clear.Active() &&
+        (deferred_clear.has_snapshot || deferred_clear.framebuffer != framebuffer)) {
         RealizeDeferredClear();
         EndRenderPass();
     }
+    deferred_clear.has_snapshot = false;
     deferred_clear.framebuffer = framebuffer;
     deferred_clear.depth_stencil = true;
     deferred_clear.depth_stencil_value = value;
     return true;
 }
 
+bool Scheduler::DeferColorClearSnapshot(const FramebufferSnapshot& fb, u32 rt_slot,
+                                        const VkClearValue& value) {
+    if (IsRenderPassActive()) {
+        return false;
+    }
+    if (deferred_clear.Active() &&
+        (!deferred_clear.has_snapshot || deferred_clear.snapshot->handle != fb.handle)) {
+        RealizeDeferredClear();
+        EndRenderPass();
+    }
+    deferred_clear.framebuffer = nullptr;
+    if (!deferred_clear.snapshot) {
+        deferred_clear.snapshot = std::make_unique<FramebufferSnapshot>();
+    }
+    *deferred_clear.snapshot = fb;
+    deferred_clear.has_snapshot = true;
+    deferred_clear.color_clear_mask |= 1u << rt_slot;
+    deferred_clear.color_values[rt_slot] = value;
+    return true;
+}
+
+bool Scheduler::DeferDepthStencilClearSnapshot(const FramebufferSnapshot& fb,
+                                               const VkClearValue& value) {
+    if (IsRenderPassActive()) {
+        return false;
+    }
+    if (deferred_clear.Active() &&
+        (!deferred_clear.has_snapshot || deferred_clear.snapshot->handle != fb.handle)) {
+        RealizeDeferredClear();
+        EndRenderPass();
+    }
+    deferred_clear.framebuffer = nullptr;
+    if (!deferred_clear.snapshot) {
+        deferred_clear.snapshot = std::make_unique<FramebufferSnapshot>();
+    }
+    *deferred_clear.snapshot = fb;
+    deferred_clear.has_snapshot = true;
+    deferred_clear.depth_stencil = true;
+    deferred_clear.depth_stencil_value = value;
+    return true;
+}
+
 void Scheduler::FlushDeferredClear() {
-    if (deferred_clear.framebuffer == nullptr) {
+    if (!deferred_clear.Active()) {
         return;
     }
     RealizeDeferredClear();
     EndRenderPass();
 }
 
+VkFramebuffer Scheduler::DeferredClearFramebuffer() const noexcept {
+    if (deferred_clear.has_snapshot) {
+        return deferred_clear.snapshot->handle;
+    }
+    if (deferred_clear.framebuffer != nullptr) {
+        return deferred_clear.framebuffer->Handle();
+    }
+    return VK_NULL_HANDLE;
+}
+
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
-    if (deferred_clear.framebuffer == framebuffer) {
+    if (deferred_clear.Active()) {
+        const VkFramebuffer dc_handle = deferred_clear.has_snapshot
+                                            ? deferred_clear.snapshot->handle
+                                            : deferred_clear.framebuffer->Handle();
+        if ((!deferred_clear.has_snapshot && deferred_clear.framebuffer == framebuffer) ||
+            (deferred_clear.has_snapshot && dc_handle == framebuffer->Handle())) {
+            RealizeDeferredClear();
+            return;
+        }
         RealizeDeferredClear();
-        return;
+        EndRenderPass(location);
     }
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
@@ -867,8 +965,11 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 
 void Scheduler::RequestRenderpassSnapshot(const FramebufferSnapshot& fb,
                                           std::source_location location) {
-    if (deferred_clear.framebuffer != nullptr) {
-        if (deferred_clear.framebuffer->Handle() == fb.handle) {
+    if (deferred_clear.Active()) {
+        const VkFramebuffer dc_handle = deferred_clear.has_snapshot
+                                            ? deferred_clear.snapshot->handle
+                                            : deferred_clear.framebuffer->Handle();
+        if (dc_handle == fb.handle) {
             RealizeDeferredClear();
             return;
         }

@@ -46,6 +46,7 @@ class Framebuffer;
 struct FramebufferSnapshot;
 class GpuCost;
 class GraphicsPipeline;
+class RenderPassCache;
 class ReorderedUploadBatch;
 class StateTracker;
 class UploadBatch;
@@ -170,8 +171,18 @@ public:
     /// Defers a full depth/stencil clear so it becomes the next render pass.
     bool DeferDepthStencilClear(const Framebuffer* framebuffer, const VkClearValue& value);
 
+    /// Defers a full-attachment color clear from a value snapshot (H2 Side B).
+    bool DeferColorClearSnapshot(const FramebufferSnapshot& fb, u32 rt_slot,
+                                 const VkClearValue& value);
+
+    /// Defers a full depth/stencil clear from a value snapshot (H2 Side B).
+    bool DeferDepthStencilClearSnapshot(const FramebufferSnapshot& fb, const VkClearValue& value);
+
     /// Realizes any pending deferred clear before its framebuffer can be moved or freed.
     void FlushDeferredClear();
+
+    /// Returns the framebuffer handle of a pending deferred clear, or VK_NULL_HANDLE.
+    [[nodiscard]] VkFramebuffer DeferredClearFramebuffer() const noexcept;
 
     /// Requests the current execution context to be able to execute operations only allowed outside
     /// of a renderpass.
@@ -248,6 +259,11 @@ public:
         query_cache = &query_cache_;
     }
 
+    /// Assigns the render pass cache (for realizing snapshot-based deferred clears on H2 Side B).
+    void SetRenderPassCache(RenderPassCache& render_pass_cache_) noexcept {
+        render_pass_cache = &render_pass_cache_;
+    }
+
     // Registers a callback to perform on queue submission.
     void RegisterOnSubmit(std::function<void()>&& func) {
         on_submit = std::move(func);
@@ -292,7 +308,7 @@ public:
     /// record or submit.
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
         return record_serial != submitted_serial || uploads_pending || reordered_uploads_pending ||
-               deferred_clear.framebuffer != nullptr;
+               deferred_clear.Active();
     }
     /// Counts a flush skipped because nothing was recorded (GPU profile).
     static void CountSkippedFlush();
@@ -545,11 +561,31 @@ private:
     };
 
     struct DeferredClear {
+        DeferredClear();
+        ~DeferredClear();
+        DeferredClear(const DeferredClear&) = delete;
+        DeferredClear& operator=(const DeferredClear&) = delete;
+
         const Framebuffer* framebuffer = nullptr;
+        std::unique_ptr<FramebufferSnapshot> snapshot;
+        bool has_snapshot = false;
         u32 color_clear_mask = 0;
         std::array<VkClearValue, 8> color_values{};
         bool depth_stencil = false;
         VkClearValue depth_stencil_value{};
+
+        [[nodiscard]] bool Active() const noexcept {
+            return framebuffer != nullptr || has_snapshot;
+        }
+
+        void Reset() noexcept {
+            framebuffer = nullptr;
+            has_snapshot = false;
+            color_clear_mask = 0;
+            color_values = {};
+            depth_stencil = false;
+            depth_stencil_value = {};
+        }
     };
 
     /// Begins a render pass for the given framebuffer, optionally with clear values.
@@ -673,6 +709,7 @@ private:
     std::source_location last_pass_end{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
+    RenderPassCache* render_pass_cache = nullptr;
 
     vk::CommandBuffer current_cmdbuf;
     vk::CommandBuffer current_upload_cmdbuf;

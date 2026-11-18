@@ -169,6 +169,7 @@ static_assert(std::is_trivially_copyable_v<H2DrawPacketBase>);
 /// and consumed by Side B (BufferCache/descriptor queue/scheduler) under EDEN_NX2_H2_SPLIT=1/2.
 struct H2DrawPacket : H2DrawPacketBase {
     boost::container::small_vector<DescriptorUpdateEntry, 32> image_entries;
+    boost::container::small_vector<H2TexBufferBind, 16> tex_buffers;
 };
 
 class GraphicsPipeline {
@@ -536,6 +537,7 @@ public:
     /// TextureCache, `configured_stages`, or Side A's Maxwell3D.
     bool ExecuteSideB(const H2DrawPacketBase& pkt,
                       std::span<const DescriptorUpdateEntry> image_entries,
+                      std::span<const H2TexBufferBind> tex_buffers,
                       const Tegra::Engines::Maxwell3D& m3d_b);
 
     template <typename Spec>

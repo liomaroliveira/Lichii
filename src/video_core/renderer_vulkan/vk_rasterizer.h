@@ -236,6 +236,7 @@ private:
         u64 render_pass_serial{};
         bool render_pass_active{};
         VkFramebuffer framebuffer{VK_NULL_HANDLE};
+        VkFramebuffer deferred_clear_fb{VK_NULL_HANDLE};
         VkExtent2D render_area{};
         const GraphicsPipeline* bound_pipeline{};
         bool has_fragment_barrier{};
@@ -243,7 +244,32 @@ private:
 
         void SyncFrom(const Scheduler& sched) noexcept;
 
+        void FlushDeferredClear() noexcept {
+            if (deferred_clear_fb != VK_NULL_HANDLE) {
+                deferred_clear_fb = VK_NULL_HANDLE;
+                render_pass_serial += 2;
+            }
+        }
+
+        void DeferClear(const FramebufferSnapshot& fb) noexcept {
+            if (deferred_clear_fb != VK_NULL_HANDLE && deferred_clear_fb != fb.handle) {
+                render_pass_serial += 2;
+                deferred_clear_fb = VK_NULL_HANDLE;
+            }
+            deferred_clear_fb = fb.handle;
+        }
+
         void EndRP() noexcept {
+            if (deferred_clear_fb != VK_NULL_HANDLE) {
+                deferred_clear_fb = VK_NULL_HANDLE;
+                render_pass_active = false;
+                framebuffer = VK_NULL_HANDLE;
+                render_area = {};
+                has_fragment_barrier = false;
+                rp_has_stores = false;
+                render_pass_serial += 2;
+                return;
+            }
             if (render_pass_active) {
                 render_pass_active = false;
                 framebuffer = VK_NULL_HANDLE;
@@ -255,6 +281,18 @@ private:
         }
 
         void RequestRP(const FramebufferSnapshot& fb) noexcept {
+            if (deferred_clear_fb != VK_NULL_HANDLE) {
+                if (deferred_clear_fb == fb.handle) {
+                    deferred_clear_fb = VK_NULL_HANDLE;
+                    render_pass_active = true;
+                    framebuffer = fb.handle;
+                    render_area = fb.render_area;
+                    ++render_pass_serial;
+                    return;
+                }
+                deferred_clear_fb = VK_NULL_HANDLE;
+                render_pass_serial += 2;
+            }
             if (render_pass_active && framebuffer == fb.handle &&
                 render_area.width == fb.render_area.width &&
                 render_area.height == fb.render_area.height) {
@@ -273,20 +311,69 @@ private:
         GraphicsPipeline* pipeline{};
         Tegra::MemoryManager* gpu_memory{};
         H2DrawPacketBase pkt{};
+        std::array<u64, 4> split_b_flags{};
         std::array<u64, 6> hashes{};
         u64 render_trace_frame{};
         VkImageView save_effects_view{VK_NULL_HANDLE};
         VkExtent2D save_effects_extent{};
         u32 instance_count{};
-        u32 num_image_entries{};
+        u16 num_image_entries{};
+        u16 num_tex_buffers{};
         bool is_mesh_draw{};
     };
     static_assert(std::is_trivially_copyable_v<H2DrawTaskHeader>);
     static_assert(sizeof(H2DrawTaskHeader) % 8 == 0);
+    static_assert(sizeof(DescriptorUpdateEntry) % 8 == 0);
+
+    struct alignas(8) H2ClearTaskHeader {
+        RasterizerVulkan* rasterizer{};
+        Tegra::MemoryManager* gpu_memory{};
+        FramebufferSnapshot fb_snapshot{};
+        VkClearRect clear_rect{};
+        VkClearValue color_clear_value{};
+        VkClearValue ds_clear_value{};
+        std::array<u64, 4> split_b_flags{};
+        u32 color_attachment{};
+        VkImageAspectFlags ds_aspect_flags{};
+        bool can_defer_clear{};
+        bool do_color{};
+        bool do_ds{};
+        bool is_rescaling{};
+    };
+    static_assert(std::is_trivially_copyable_v<H2ClearTaskHeader>);
+    static_assert(sizeof(H2ClearTaskHeader) % 8 == 0);
+
+    enum class H2ComputeKind : u8 {
+        Direct,
+        IndirectAddress,
+        ListSlot,
+    };
+
+    struct alignas(8) H2ComputeTaskHeader {
+        RasterizerVulkan* rasterizer{};
+        ComputePipeline* pipeline{};
+        Tegra::MemoryManager* gpu_memory{};
+        BufferCache::H2ComputeOverride compute_override{};
+        H2ComputePacketBase pkt{};
+        GPUVAddr indirect_address{};
+        u32 list_slot{};
+        u16 num_image_entries{};
+        u16 num_tex_buffers{};
+        H2ComputeKind kind{H2ComputeKind::Direct};
+    };
+    static_assert(std::is_trivially_copyable_v<H2ComputeTaskHeader>);
+    static_assert(sizeof(H2ComputeTaskHeader) % 8 == 0);
 
     static void ExecuteH2DrawOnB(const u64* payload);
     void ExecuteH2DrawTask(const H2DrawTaskHeader& task,
-                           std::span<const DescriptorUpdateEntry> image_entries);
+                           std::span<const DescriptorUpdateEntry> image_entries,
+                           std::span<const H2TexBufferBind> tex_buffers);
+    static void ExecuteH2ClearOnB(const u64* payload);
+    void ExecuteH2ClearTask(const H2ClearTaskHeader& task);
+    static void ExecuteH2ComputeOnB(const u64* payload);
+    void ExecuteH2ComputeTask(const H2ComputeTaskHeader& task,
+                              std::span<const DescriptorUpdateEntry> image_entries,
+                              std::span<const H2TexBufferBind> tex_buffers);
     void FlushH2DeferredInvalidations(bool lock_texture_cache);
     void OnH2PostDrain();
 

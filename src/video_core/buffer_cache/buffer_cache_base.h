@@ -426,6 +426,17 @@ public:
     void BindComputeTextureBuffer(size_t tbo_index, GPUVAddr gpu_addr, u32 size, PixelFormat format,
                                   bool is_written, bool is_image);
 
+    /// E04.T12c (EDEN_NX2_H2_SPLIT=2): per-dispatch KeplerCompute snapshot read by GPUBackB
+    /// during async compute without racing with Stage A's KeplerCompute.
+    struct H2ComputeOverride {
+        Tegra::Engines::KeplerCompute::LaunchParams launch_description{};
+        bool native_mode{};
+        bool is_indirect{};
+    };
+    void SetH2ComputeOverride(const H2ComputeOverride* ov) noexcept {
+        h2_compute_override = ov;
+    }
+
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(GPUVAddr gpu_addr, u32 size,
                                                        ObtainBufferSynchronize sync_info,
                                                        ObtainBufferOperation post_op);
@@ -925,6 +936,7 @@ private:
     std::unique_ptr<GraphicsStorageSnapshot> storage_verify_snapshot;
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
+    const H2ComputeOverride* h2_compute_override{};
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged
     /// every 10 s, and each creation of 64 MiB or more with the line that asked for it.
     struct CreateTrace {

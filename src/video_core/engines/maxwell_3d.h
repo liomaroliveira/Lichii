@@ -106,6 +106,10 @@ public:
     /// E04.T12 (EDEN_NX2_H2_SPLIT=2): ships split_b_flags to maxwell_3d_b without clearing A's
     /// dirty.flags (which TextureCache and PipelineCache read on Stage A).
     void SplitSendFlagsH2();
+    /// E04.T12c: takes and resets split_b_flags as 4 u64 words to fold into an H2 task header.
+    [[nodiscard]] std::array<u64, 4> TakeSplitBFlags();
+    /// E04.T12c: applies folded split_b_flags words into Side B's shadow engine.
+    static void ApplySplitBFlags(Maxwell3D& shadow, const std::array<u64, 4>& words) noexcept;
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {

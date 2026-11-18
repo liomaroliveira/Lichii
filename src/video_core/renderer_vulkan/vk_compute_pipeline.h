@@ -36,6 +36,20 @@ class PipelineBinaries;
 class PipelineStatistics;
 class Scheduler;
 
+/// Trivially-copyable header of a per-dispatch compute packet produced by Side A and consumed by
+/// Side B under EDEN_NX2_H2_SPLIT=2.
+struct H2ComputePacketBase {
+    bool fallback_sync{};
+    bool is_rescaling{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling_words{};
+};
+static_assert(std::is_trivially_copyable_v<H2ComputePacketBase>);
+
+struct H2ComputePacket : H2ComputePacketBase {
+    boost::container::small_vector<DescriptorUpdateEntry, 32> image_entries;
+    boost::container::small_vector<H2TexBufferBind, 16> tex_buffers;
+};
+
 class ComputePipeline {
 public:
     /// `binary_key` is the pipeline's key for shader cache v2's driver layer, `binaries` (or null)
@@ -67,6 +81,19 @@ public:
                                  TextureCacheRuntime& texture_runtime,
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
+
+    /// E04.T12c (EDEN_NX2_H2_SPLIT=2): Side A resolves compute TextureCache descriptors, texture
+    /// buffer bindings, and image descriptor entries into `pkt` under `texture_cache.mutex` only.
+    void PrepareSideA(const Tegra::Engines::KeplerCompute& kepler_compute,
+                      Tegra::MemoryManager& gpu_memory, TextureCache& texture_cache,
+                      H2ComputePacket& pkt);
+
+    /// E04.T12c (EDEN_NX2_H2_SPLIT=2): Side B binds BufferCache compute buffers, pushes buffered
+    /// image descriptors, allocates descriptor buffer space and records pipeline/descriptor bind.
+    [[nodiscard]] bool ExecuteSideB(const H2ComputePacketBase& pkt,
+                                    std::span<const DescriptorUpdateEntry> image_entries,
+                                    std::span<const H2TexBufferBind> tex_buffers,
+                                    Scheduler& scheduler, BufferCache& buffer_cache);
 
     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
     /// The same upscale to 2560x1440 from a scene the DLSS render scale shrank (ProfessorTee's

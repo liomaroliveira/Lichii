@@ -1751,6 +1751,29 @@ void Maxwell3D::SplitSendFlagsH2() {
     dirty.split_b_flags.reset();
 }
 
+std::array<u64, 4> Maxwell3D::TakeSplitBFlags() {
+    std::array<u64, 4> words{};
+    if (g_split_all_dirty) [[unlikely]] {
+        words.fill(~u64{0});
+        dirty.split_b_flags.reset();
+        return words;
+    }
+    if (dirty.split_b_flags.any()) {
+        std::memcpy(words.data(), &dirty.split_b_flags, sizeof(words));
+        dirty.split_b_flags.reset();
+    }
+    return words;
+}
+
+void Maxwell3D::ApplySplitBFlags(Maxwell3D& shadow, const std::array<u64, 4>& words) noexcept {
+    if ((words[0] | words[1] | words[2] | words[3]) == 0) {
+        return;
+    }
+    DirtyState::Flags flags;
+    std::memcpy(&flags, words.data(), sizeof(flags));
+    shadow.dirty.flags |= flags;
+}
+
 void Maxwell3D::SplitSendDraw() {
     if (split_engine == nullptr) {
         return;

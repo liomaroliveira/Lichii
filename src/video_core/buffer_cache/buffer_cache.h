@@ -2586,7 +2586,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
 
-    const auto& launch_desc = kepler_compute->launch_description;
+    const auto& launch_desc = h2_compute_override ? h2_compute_override->launch_description
+                                                  : kepler_compute->launch_description;
     if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
         LOG_WARNING(HW_GPU, "Skipped binding SSBO: cbuf index {} is not enabled", cbuf_index);
         return;
@@ -2601,7 +2602,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         holder = gpu_memory->Read<u64>(ssbo_addr);
         ssbo_addr = holder + indirect_offset;
     }
-    const bool native_pointer = kepler_compute->IsNativeMode();
+    const bool native_pointer =
+        h2_compute_override ? h2_compute_override->native_mode : kepler_compute->IsNativeMode();
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
         (u64{native_pointer ? 1U : 0U} << ssbo_index);
@@ -2629,8 +2631,11 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             std::optional<std::array<u32, 3>> grid;
             // A dispatch from GPU-written list words (Nx2ListIndirect) has the slot's placeholders
             // in its grid, not the counts the host GPU dispatches: its grid is unknown here too.
-            if (!kepler_compute->GetIndirectComputeAddress() &&
-                !kepler_compute->GetIndirectListSlot()) {
+            const bool is_direct =
+                h2_compute_override ? !h2_compute_override->is_indirect
+                                    : (!kepler_compute->GetIndirectComputeAddress() &&
+                                       !kepler_compute->GetIndirectListSlot());
+            if (is_direct) {
                 grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                           qmd.grid_dim_z.Value()};
             }
@@ -4057,7 +4062,8 @@ void BufferCache<P>::UpdateComputeUniformBuffers() {
     ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
         Binding& binding = channel_state->compute_uniform_buffers[index];
         binding = NULL_BINDING;
-        const auto& launch_desc = kepler_compute->launch_description;
+        const auto& launch_desc = h2_compute_override ? h2_compute_override->launch_description
+                                                      : kepler_compute->launch_description;
         if (((launch_desc.const_buffer_enable_mask >> index) & 1) != 0) {
             const auto& cbuf = launch_desc.const_buffer_config[index];
             const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(cbuf.Address());

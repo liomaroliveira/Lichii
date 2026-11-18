@@ -149,6 +149,8 @@ enum class H2DrainReason : u8 {
 inline void (*g_h2_post_drain_cb)(void*){};
 inline void* g_h2_post_drain_arg{};
 inline u64 g_h2_draws_enqueued{};
+inline u64 g_h2_computes_enqueued{};
+inline u64 g_h2_clears_enqueued{};
 inline u64 g_h2_stlf_hits{};
 inline u64 g_h2_stlf_misses{};
 inline std::array<u64, static_cast<size_t>(H2DrainReason::Count)> g_h2_drain_reasons{};
@@ -417,6 +419,33 @@ public:
         (void)PushTask2WithPtr(fn, head, head_bytes, tail, tail_bytes);
     }
 
+    /// Stage A: zero-copy three-segment PushTask (header + two inline tail arrays) directly into
+    /// the ring.
+    void PushTask3(AsyncFn fn, const void* head, size_t head_bytes, const void* tail1,
+                   size_t tail1_bytes, const void* tail2, size_t tail2_bytes) {
+        const size_t total = head_bytes + tail1_bytes + tail2_bytes;
+        const size_t payload = (total + sizeof(u64) - 1) / sizeof(u64);
+        const size_t words = 2 + payload;
+        u64* dst = Reserve(words);
+        dst[0] = MakeHeader(Kind::Task, static_cast<u32>(payload));
+        dst[1] = reinterpret_cast<u64>(fn);
+        if (payload != 0) {
+            dst[words - 1] = 0;
+            auto* out = reinterpret_cast<u8*>(dst + 2);
+            if (head_bytes != 0) {
+                std::memcpy(out, head, head_bytes);
+            }
+            if (tail1_bytes != 0) {
+                std::memcpy(out + head_bytes, tail1, tail1_bytes);
+            }
+            if (tail2_bytes != 0) {
+                std::memcpy(out + head_bytes + tail1_bytes, tail2, tail2_bytes);
+            }
+        }
+        Commit(words);
+        ++stat_async;
+    }
+
     /// Stage A: waits until GPUBackB consumed everything sent since the last wait: tasks sent
     /// without waiting and register deltas (a Call closure on stage A reads B's shadow).
     /// Stage A (step 4d): the ring position after everything sent so far, and the one GPUBackB
@@ -645,15 +674,20 @@ public:
                 }
             }
             LOG_INFO(HW_GPU,
-                     "Nx2BackSplit H2: draws_enqueued {:.0f}/s, async {:.0f}/s, drains {:.0f}/s, "
+                     "Nx2BackSplit H2: draws_enqueued {:.0f}/s, computes_enqueued {:.0f}/s, "
+                     "clears_enqueued {:.0f}/s, async {:.0f}/s, drains {:.0f}/s, "
                      "a_wait {:.1f} ms/s, b_busy {:.1f} ms/s, stlf_hits {:.0f}/s, "
                      "stlf_misses {:.0f}/s, b_bad_checks {}; drain reasons: {}",
                      static_cast<double>(g_h2_draws_enqueued) / sec,
+                     static_cast<double>(g_h2_computes_enqueued) / sec,
+                     static_cast<double>(g_h2_clears_enqueued) / sec,
                      static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec,
                      a_wait_ms_s, b_busy_ms_s, static_cast<double>(g_h2_stlf_hits) / sec,
                      static_cast<double>(g_h2_stlf_misses) / sec, b_bad_win,
                      reasons.empty() ? "none" : reasons);
             g_h2_draws_enqueued = 0;
+            g_h2_computes_enqueued = 0;
+            g_h2_clears_enqueued = 0;
             g_h2_stlf_hits = 0;
             g_h2_stlf_misses = 0;
             g_h2_drain_reasons.fill(0);
@@ -1038,6 +1072,12 @@ inline void EmitTask(RingState::AsyncFn fn, const void* data, size_t bytes) {
 inline void EmitTask2(RingState::AsyncFn fn, const void* head, size_t head_bytes, const void* tail,
                       size_t tail_bytes) {
     g_state.PushTask2(fn, head, head_bytes, tail, tail_bytes);
+}
+
+/// Stage A: zero-copy three-segment EmitTask directly into the ring.
+inline void EmitTask3(RingState::AsyncFn fn, const void* head, size_t head_bytes, const void* tail1,
+                      size_t tail1_bytes, const void* tail2, size_t tail2_bytes) {
+    g_state.PushTask3(fn, head, head_bytes, tail1, tail1_bytes, tail2, tail2_bytes);
 }
 
 /// Stage A: zero-copy two-segment EmitTask returning ring positions and inline tail pointer.

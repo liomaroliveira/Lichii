@@ -407,6 +407,20 @@ public:
            VideoCore::Surface::IsPixelFormatETC2(format);
 }
 
+/// Value binding for a graphics or compute texture/image buffer resolved on H2 Side A and
+/// applied to BufferCache on H2 Side B (packed inline in the A->B ring).
+struct alignas(8) H2TexBufferBind {
+    GPUVAddr gpu_addr{};
+    u32 size{};
+    VideoCore::Surface::PixelFormat format{};
+    u16 index{};
+    u8 stage{};
+    u8 is_image{};
+    u8 is_written{};
+};
+static_assert(std::is_trivially_copyable_v<H2TexBufferBind>);
+static_assert(sizeof(H2TexBufferBind) % 8 == 0);
+
 /// Value sink for PushImageDescriptors on H2 Side A (avoids touching GuestDescriptorQueue).
 struct ImageDescriptorSink {
     boost::container::small_vector<DescriptorUpdateEntry, 32> entries;
