@@ -51,6 +51,7 @@ enum class Barrier : u8 {
     FeedbackBreak,
     PushImgDesc,
     RtOrClear,
+    FenceSkipped,
     Count,
 };
 
@@ -347,12 +348,12 @@ inline void MaybeReport() {
     LOG_INFO(HW_GPU,
              "Nx2H2Model barriers per second: C2[texbuf {:.0f} dmabi {:.0f} compute {:.0f} "
              "flushinval {:.0f} fence {:.0f} submit {:.0f} call {:.0f}] C1extra[wfi {:.0f} "
-             "tcsched {:.0f} feedback {:.0f} pushimg {:.0f} rtclear {:.0f}]",
+             "tcsched {:.0f} feedback {:.0f} pushimg {:.0f} rtclear {:.0f} fskip {:.0f}]",
              b_rate(Barrier::TexBufferBind), b_rate(Barrier::DmaBufImg), b_rate(Barrier::Compute),
              b_rate(Barrier::FlushInvalBoth), b_rate(Barrier::Fence), b_rate(Barrier::Submit),
              b_rate(Barrier::Call), b_rate(Barrier::Wfi), b_rate(Barrier::TexCacheSched),
              b_rate(Barrier::FeedbackBreak), b_rate(Barrier::PushImgDesc),
-             b_rate(Barrier::RtOrClear));
+             b_rate(Barrier::RtOrClear), b_rate(Barrier::FenceSkipped));
 
     state.total_ticks.fill(0);
     state.total_draws = 0;

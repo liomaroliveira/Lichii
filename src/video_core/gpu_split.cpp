@@ -902,8 +902,8 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return 1 + StateFlagWords + count;
     }
     case Kind::Call: {
-        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Call);
         if ((head & FastDrawNeutral) == 0) {
+            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Call);
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
