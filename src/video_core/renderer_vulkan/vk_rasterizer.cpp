@@ -2085,7 +2085,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool use_h2_split =
         VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() && !frame_dump.Capturing();
     const bool use_h2_async = use_h2_split && VideoCommon::BackSplit::UseH2AsyncQueue() &&
-                              !VideoCommon::BackSplit::H2DynamicBypassActive() &&
                               !is_indirect && !fast_draw_verify && reuse_start == 0 &&
                               !DrawRepeatEnabled();
 
@@ -2268,8 +2267,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     const VideoCommon::BackSplit::H2DrainScope h2_fallback_drain{
         is_indirect ? VideoCommon::BackSplit::H2DrainReason::DrawIndirect
-                    : VideoCommon::BackSplit::H2DrainReason::DrawFallback,
-        !VideoCommon::BackSplit::H2DynamicBypassActive()};
+                    : VideoCommon::BackSplit::H2DrainReason::DrawFallback};
     if (h2_fallback_drain.active) [[unlikely]] {
         gpu_memory->FlushCaching();
         FlushH2DeferredInvalidations(true);
