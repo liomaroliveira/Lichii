@@ -384,15 +384,15 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         installed_games = cache.ListEntriesFilterOrigin(
             ContentProviderUnionSlot::SysNAND, TitleType::Application, ContentRecordType::Program);
         // E53.T10: Listar QLaunch (0100000000001000) na pasta SysNAND
-        if (cache.HasEntry(ContentProviderUnionSlot::SysNAND, QLaunchId, ContentRecordType::Program)) {
+        if (cache.HasEntry(QLaunchId, ContentRecordType::Program)) {
             installed_games.emplace_back(ContentProviderUnionSlot::SysNAND,
-                ContentProviderEntry{QLaunchId, ContentRecordType::Program, TitleType::SystemProgram});
+                ContentProviderEntry{QLaunchId, ContentRecordType::Program});
         }
     } else {
         // Modo lista plana sem pastas: inclui o QLaunch se presente no SysNAND
-        if (cache.HasEntry(ContentProviderUnionSlot::SysNAND, QLaunchId, ContentRecordType::Program)) {
+        if (cache.HasEntry(QLaunchId, ContentRecordType::Program)) {
             installed_games.emplace_back(ContentProviderUnionSlot::SysNAND,
-                ContentProviderEntry{QLaunchId, ContentRecordType::Program, TitleType::SystemProgram});
+                ContentProviderEntry{QLaunchId, ContentRecordType::Program});
         }
     }
 
