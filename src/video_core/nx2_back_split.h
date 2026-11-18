@@ -1172,6 +1172,19 @@ struct H2DrainScope {
             active = true;
         }
     }
+    /// Conditional variant: when `do_drain` is false, suppresses async queueing (depth increment)
+    /// but skips the actual DrainAsync call. Use when the caller has determined that the drain
+    /// can be elided (e.g. SkipEmptyFence fast-path), but the scope must still prevent GPUBackB
+    /// from enqueuing new tasks while the synchronous operation runs on Stage A.
+    explicit H2DrainScope(H2DrainReason reason, bool do_drain) {
+        if (H2Async() && OnStageA()) [[unlikely]] {
+            if (do_drain) {
+                DrainAsyncH2(reason);
+            }
+            ++t_h2_drained_depth;
+            active = true;
+        }
+    }
     ~H2DrainScope() {
         if (active) [[unlikely]] {
             --t_h2_drained_depth;

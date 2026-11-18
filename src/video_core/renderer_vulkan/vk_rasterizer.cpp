@@ -5029,13 +5029,18 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
+    // Drain GPUBackB only when SignalFence will not take the SkipEmptyFence fast-path.
+    // The ~81 % of fences that are skipped (no flushes, no pending work, skipped_fences < 64)
+    // run func() inline and need no drain; draining them was the primary Fence bottleneck.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
+    // SyncOperation always queues into uncommitted_operations, which makes NeedH2DrainForFence
+    // return true for the next SignalFence; draining here is correct and necessary.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Fence};
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Fence);
@@ -5044,20 +5049,28 @@ void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
+    // SignalSyncPoint -> SignalFence with a syncpoint increment callback: apply the same
+    // drain guard so the ~81 % empty-fence fast-path avoids the drain too.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
+    // SignalReference -> SignalFence with an empty callback: same drain guard.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    // In async-check mode (Vulkan), WaitPendingFences(false) is a no-op; skip the drain.
+    if (!fence_manager.NeedH2DrainForReleaseFences(force)) {
+        fence_manager.WaitPendingFences(force);
+        return;
+    }
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Fence};
     fence_manager.WaitPendingFences(force);

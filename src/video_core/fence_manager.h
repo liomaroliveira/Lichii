@@ -164,6 +164,46 @@ public:
         SignalFence(std::move(func));
     }
 
+    /// Returns true if SignalFence will need to drain GPUBackB (i.e. it will NOT take the
+    /// SkipEmptyFence fast-path). Called from Stage A before creating H2DrainScope{Fence}.
+    /// Does not modify any state; safe to call speculatively on the GPU thread.
+    bool NeedH2DrainForFence() {
+        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
+                                 (Settings::IsGPUFenceBehaviorDefault()
+                                      ? Settings::IsGPULevelHigh()
+                                      : Settings::IsGPUFenceBehaviorBalanced() ||
+                                            Settings::IsGPUFenceBehaviorAccurate());
+        if (delay_fence) {
+            return true;
+        }
+        // CommitCacheFlushes peek: check whether either cache has uncommitted work without
+        // locking (relaxed reads; the GPU thread is the only writer of these flags).
+        if (texture_cache.HasUncommittedFlushes() || buffer_cache.HasUncommittedFlushes()) {
+            return true;
+        }
+        // Mirror of SkipEmptyFence() without the state change. uncommitted_operations is read
+        // without the lock: this peek is called only from the GPU thread, which is the only
+        // thread that removes entries; a spurious true (missed empty) is safe and conservative.
+        if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+            if (skipped_fences >= 64 || query_cache.HasPendingFenceWork()) {
+                return true;
+            }
+            return !uncommitted_operations.empty();
+        }
+        return true; // non-async path always makes fences
+    }
+
+    /// Returns true if ReleaseFences(force) will need to drain GPUBackB.
+    bool NeedH2DrainForReleaseFences(bool force) {
+        if constexpr (!can_async_check) {
+            return true; // sync path always processes fences
+        }
+        if (!force) {
+            return false; // WaitPendingFences(false) is a no-op in async mode
+        }
+        return true;
+    }
+
     void WaitPendingFences([[maybe_unused]] bool force) {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();
