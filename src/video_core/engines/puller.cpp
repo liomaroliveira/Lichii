@@ -161,26 +161,6 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
     using Why = VideoCommon::Nx2AcquireStats::WaitWhy;
     const auto& split = VideoCommon::GpuSplit::Get();
     const auto memory = [&] { return dma_pusher.memory_manager.Read<u32>(acquire.address); };
-    if (!acquire.WaitsToReach()) {
-        VideoCommon::AcquireUnsettled unsettled_why{};
-        const auto settled_word =
-            split.SettledWordAt(dma_pusher.memory_manager, acquire.address, device, unsettled_why);
-        if (settled_word && acquire.Matches(settled_word->value)) {
-            if (!settled_word->release) {
-                return {Kind::Met};
-            }
-            return {Kind::MetByQueued, *settled_word->release};
-        }
-        if (!dma_pusher.rasterizer->MustFlushRegion(device, sizeof(u32),
-                                                    VideoCommon::CacheType::BufferCache)) {
-            if (acquire.Matches(memory())) {
-                if (split.Ran(acquire.writers_before)) {
-                    return {Kind::Met};
-                }
-            }
-        }
-        return {Kind::Flush};
-    }
     // The words Switch 2 syncs on only advance (NVN2 even releases QMD completions as maxima,
     // KeplerCompute::ProcessNativeMethod): memory that meets a greater-or-equal acquire now still
     // does once the back ran the queued work, also where the buffer cache holds it newer.

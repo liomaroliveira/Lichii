@@ -116,17 +116,11 @@ inline bool g_h2_dynamic_bypass_enabled = [] {
     return val == nullptr || (val[0] != '0');
 }();
 inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
+inline thread_local bool t_h2_bypass_active{};
 
 inline bool H2DynamicBypassActive() noexcept {
-    return g_h2_dynamic_bypass_enabled && g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
+    return t_h2_bypass_active;
 }
-
-inline std::atomic<u64> g_h2_total_draws_window{0};
-inline void NoteDrawEntered() noexcept {
-    g_h2_total_draws_window.fetch_add(1, std::memory_order_relaxed);
-}
-
-void NoteH2ReportDraws(double sec);
 
 /// True on Stage A under H2Async() when not inside a drained C2 barrier scope.
 inline bool UseH2AsyncQueue() noexcept {
@@ -709,7 +703,6 @@ public:
             g_h2_stlf_hits = 0;
             g_h2_stlf_misses = 0;
             g_h2_drain_reasons.fill(0);
-            NoteH2ReportDraws(sec);
         }
         stat_async = 0;
         stat_drains = 0;
@@ -1206,16 +1199,18 @@ inline H2BypassTransition UpdateH2BypassState(u32 rate, const char* source) {
         return H2BypassTransition::None;
     }
     const u32 low_thresh = g_h2_bypass_threshold;
-    const u32 high_thresh = g_h2_bypass_threshold + 20000U;
-    const bool currently_bypassed = g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
+    const u32 high_thresh = low_thresh == 65000U ? 95000U : (low_thresh * 145) / 100;
+    const bool currently_bypassed = t_h2_bypass_active;
     if (!currently_bypassed && rate < low_thresh) {
-        g_h2_dynamic_bypass_active.store(true, std::memory_order_release);
+        t_h2_bypass_active = true;
+        g_h2_dynamic_bypass_active.store(true, std::memory_order_relaxed);
         g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass ACTIVATED via {} (draw_rate={}/s < {})",
                  source, rate, low_thresh);
         return H2BypassTransition::EnteredBypass;
     } else if (currently_bypassed && rate > high_thresh) {
-        g_h2_dynamic_bypass_active.store(false, std::memory_order_release);
+        t_h2_bypass_active = false;
+        g_h2_dynamic_bypass_active.store(false, std::memory_order_relaxed);
         g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass DEACTIVATED via {} (draw_rate={}/s > {})",
                  source, rate, high_thresh);
@@ -1239,27 +1234,12 @@ inline H2BypassTransition NoteH2FrameDrawCount(u32 frame_draws, u64 frame_durati
 
     const H2BypassTransition transition = UpdateH2BypassState(new_rate, "FrameTick");
 
-    if (g_h2_dynamic_bypass_active.load(std::memory_order_relaxed)) {
+    if (t_h2_bypass_active) {
         g_h2_bypass_frames.fetch_add(1, std::memory_order_relaxed);
     } else {
         g_h2_split_frames.fetch_add(1, std::memory_order_relaxed);
     }
     return transition;
-}
-
-inline void NoteH2ReportDraws(double sec) {
-    if (!g_h2_async || !g_h2_dynamic_bypass_enabled || sec <= 0.0) {
-        return;
-    }
-    const u64 win_draws = g_h2_total_draws_window.exchange(0, std::memory_order_relaxed);
-    const double win_draws_sec = static_cast<double>(win_draws) / sec;
-    LOG_INFO(HW_GPU,
-             "Nx2BackSplit H2: bypass_active={}, bypass_frames={}, split_frames={}, current_rate={}/s, win_rate={:.0f}/s (thresh={})",
-             g_h2_dynamic_bypass_active.load(std::memory_order_relaxed),
-             g_h2_bypass_frames.load(std::memory_order_relaxed),
-             g_h2_split_frames.load(std::memory_order_relaxed),
-             g_h2_current_draw_rate.load(std::memory_order_relaxed),
-             win_draws_sec, g_h2_bypass_threshold);
 }
 
 /// RAII C2 barrier under H2Async(): drains GPUBackB on entry, suppresses async queueing while

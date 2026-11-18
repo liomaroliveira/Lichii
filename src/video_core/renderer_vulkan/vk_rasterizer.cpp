@@ -2869,8 +2869,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
-    VideoCommon::BackSplit::NoteDrawEntered();
+    ++h2_frame_draws;
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -3112,8 +3111,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
-    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
-    VideoCommon::BackSplit::NoteDrawEntered();
+    ++h2_frame_draws;
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -3390,8 +3388,7 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
-    h2_frame_draws.fetch_add(1, std::memory_order_relaxed);
-    VideoCommon::BackSplit::NoteDrawEntered();
+    ++h2_frame_draws;
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::RtOrClear);
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
         maxwell3d->SplitSendFlagsH2();
@@ -5805,7 +5802,7 @@ void RasterizerVulkan::TickFrame() {
                                            now - h2_last_frame_time)
                                            .count());
         h2_last_frame_time = now;
-        const u32 draws = h2_frame_draws.exchange(0, std::memory_order_relaxed);
+        const u32 draws = std::exchange(h2_frame_draws, 0U);
         const auto transition = VideoCommon::BackSplit::NoteH2FrameDrawCount(draws, frame_ns);
         if (transition == VideoCommon::BackSplit::H2BypassTransition::EnteredBypass) {
             if (maxwell3d != nullptr && maxwell3d_b != nullptr && maxwell3d_b != maxwell3d) {
