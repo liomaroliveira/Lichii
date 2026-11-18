@@ -27,7 +27,7 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
                 std::scoped_lock lk{scheduling_guard};
                 gpu_ptr->BindChannel(bind_id);
             },
-            VideoCommon::GpuSplit::Writes::Noted);
+            VideoCommon::GpuSplit::Writes::Noted, VideoCommon::GpuSplit::H2SelfGuarded);
         return;
     }
     std::scoped_lock lk{scheduling_guard};

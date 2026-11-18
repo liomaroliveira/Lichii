@@ -149,17 +149,35 @@ enum class H2DrainReason : u8 {
 inline void (*g_h2_post_drain_cb)(void*){};
 inline void* g_h2_post_drain_arg{};
 inline u64 g_h2_draws_enqueued{};
+inline u64 g_h2_stlf_hits{};
+inline u64 g_h2_stlf_misses{};
 inline std::array<u64, static_cast<size_t>(H2DrainReason::Count)> g_h2_drain_reasons{};
 
-/// E04.T12: exact pending guest write ranges sent to GPUBackB (Stage A only).
-struct PendingRange {
-    u64 begin;
-    u64 end;
-    u64 write_pos;
+/// E04.T12b: return value of PushTask2WithPtr / EmitTask2WithPtr so Stage A can record
+/// zero-copy Store-to-Load Forwarding (STLF) pointers directly into the SPSC ring.
+struct EmitTask2Result {
+    u64 start_pos;
+    u64 end_pos;
+    const u8* tail_ptr;
 };
-inline std::array<PendingRange, 128> g_pending_exact{};
-inline u32 g_pending_exact_count{};
-inline bool g_pending_exact_overflow{};
+
+/// E04.T12b: pending guest writes sent to GPUBackB (Stage A only, FIFO ring without coalescing).
+struct PendingWrite {
+    u64 begin;
+    u32 bytes;
+    u32 _pad;
+    u64 start_word_pos;
+    u64 end_word_pos;
+    const u8* ring_data; ///< nullptr when no copyable payload exists in the ring (e.g., Query)
+};
+static constexpr u32 PendingWriteCap = 1024;
+inline std::array<PendingWrite, PendingWriteCap> g_pending_writes{};
+inline u32 g_pending_write_head{};
+inline u32 g_pending_write_tail{};
+inline bool g_pending_write_overflow{};
+inline u64 g_consumed_cache{};
+
+enum class ForwardResult : u8 { NoPending, Forwarded, NeedDrain };
 
 /// GPUBackB, once at its start: marks it as a back thread for GpuSplit (OnBackThread and
 /// OwnsScheduler hold on both stages). Defined in nx2_back_split_rasterizer.cpp.
@@ -312,8 +330,10 @@ public:
         if (hard) {
             ModelSegmentClose(wait_end);
         }
-        g_pending_exact_count = 0;
-        g_pending_exact_overflow = false;
+        g_pending_write_tail = 0;
+        g_pending_write_head = 0;
+        g_pending_write_overflow = false;
+        g_consumed_cache = write_position;
         if (H2Async() && OnStageA() && g_h2_post_drain_cb != nullptr) {
             g_h2_post_drain_cb(g_h2_post_drain_arg);
         }
@@ -363,15 +383,18 @@ public:
         ++stat_async;
     }
 
-    /// Stage A: zero-copy two-segment PushTask (header + inline tail array) directly into the ring.
-    void PushTask2(AsyncFn fn, const void* head, size_t head_bytes, const void* tail,
-                   size_t tail_bytes) {
+    /// Stage A: zero-copy two-segment PushTask (header + inline tail array) directly into the ring,
+    /// returning ring positions and pointer to the inline tail payload for STLF.
+    EmitTask2Result PushTask2WithPtr(AsyncFn fn, const void* head, size_t head_bytes,
+                                     const void* tail, size_t tail_bytes) {
         const size_t total = head_bytes + tail_bytes;
         const size_t payload = (total + sizeof(u64) - 1) / sizeof(u64);
         const size_t words = 2 + payload;
         u64* dst = Reserve(words);
+        const u64 start_pos = write_position;
         dst[0] = MakeHeader(Kind::Task, static_cast<u32>(payload));
         dst[1] = reinterpret_cast<u64>(fn);
+        const u8* tail_ptr = nullptr;
         if (payload != 0) {
             dst[words - 1] = 0;
             auto* out = reinterpret_cast<u8*>(dst + 2);
@@ -380,10 +403,18 @@ public:
             }
             if (tail_bytes != 0) {
                 std::memcpy(out + head_bytes, tail, tail_bytes);
+                tail_ptr = out + head_bytes;
             }
         }
         Commit(words);
         ++stat_async;
+        return EmitTask2Result{start_pos, write_position, tail_ptr};
+    }
+
+    /// Stage A: zero-copy two-segment PushTask (header + inline tail array) directly into the ring.
+    void PushTask2(AsyncFn fn, const void* head, size_t head_bytes, const void* tail,
+                   size_t tail_bytes) {
+        (void)PushTask2WithPtr(fn, head, head_bytes, tail, tail_bytes);
     }
 
     /// Stage A: waits until GPUBackB consumed everything sent since the last wait: tasks sent
@@ -395,6 +426,9 @@ public:
     }
     [[nodiscard]] u64 DrainedPosition() const {
         return drained_position;
+    }
+    [[nodiscard]] u64 ConsumedPosition() const noexcept {
+        return consumed.load(std::memory_order_acquire);
     }
 
     /// Stage A: makes everything sent so far visible to GPUBackB now (and wakes it).
@@ -410,6 +444,11 @@ public:
         if (write_position != drained_position) {
             ++stat_drains;
             RunOnB([](void*) {}, nullptr);
+        } else {
+            g_pending_write_tail = 0;
+            g_pending_write_head = 0;
+            g_pending_write_overflow = false;
+            g_consumed_cache = write_position;
         }
     }
 
@@ -607,11 +646,16 @@ public:
             }
             LOG_INFO(HW_GPU,
                      "Nx2BackSplit H2: draws_enqueued {:.0f}/s, async {:.0f}/s, drains {:.0f}/s, "
-                     "a_wait {:.1f} ms/s, b_busy {:.1f} ms/s, b_bad_checks {}; drain reasons: {}",
+                     "a_wait {:.1f} ms/s, b_busy {:.1f} ms/s, stlf_hits {:.0f}/s, "
+                     "stlf_misses {:.0f}/s, b_bad_checks {}; drain reasons: {}",
                      static_cast<double>(g_h2_draws_enqueued) / sec,
                      static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec,
-                     a_wait_ms_s, b_busy_ms_s, b_bad_win, reasons.empty() ? "none" : reasons);
+                     a_wait_ms_s, b_busy_ms_s, static_cast<double>(g_h2_stlf_hits) / sec,
+                     static_cast<double>(g_h2_stlf_misses) / sec, b_bad_win,
+                     reasons.empty() ? "none" : reasons);
             g_h2_draws_enqueued = 0;
+            g_h2_stlf_hits = 0;
+            g_h2_stlf_misses = 0;
             g_h2_drain_reasons.fill(0);
         }
         stat_async = 0;
@@ -996,6 +1040,12 @@ inline void EmitTask2(RingState::AsyncFn fn, const void* head, size_t head_bytes
     g_state.PushTask2(fn, head, head_bytes, tail, tail_bytes);
 }
 
+/// Stage A: zero-copy two-segment EmitTask returning ring positions and inline tail pointer.
+inline EmitTask2Result EmitTask2WithPtr(RingState::AsyncFn fn, const void* head, size_t head_bytes,
+                                        const void* tail, size_t tail_bytes) {
+    return g_state.PushTask2WithPtr(fn, head, head_bytes, tail, tail_bytes);
+}
+
 /// E04.T6d F2: the packets below are dead (GPUBackB only XORs them); they are sent only with
 /// EDEN_NX2_BACK_SPLIT_DEAD_PACKETS=1 (the old behavior, as a control).
 inline const bool g_dead_packets = [] {
@@ -1103,60 +1153,164 @@ inline constexpr size_t MaxAsyncInlineBytes = 4096;
 /// sent to GPUBackB there. Stage A only.
 inline std::array<u64, 4096> g_pending_pages{};
 
-/// Stage A: guest memory [gpu_addr, gpu_addr + bytes) is written by GPUBackB in ring order.
-inline void NotePendingWrite(u64 gpu_addr, u64 bytes) {
+/// Stage A: guest memory [gpu_addr, gpu_addr + bytes) is written by GPUBackB in ring order,
+/// optionally with a zero-copy pointer to its inline payload inside the SPSC ring.
+inline void NotePendingWriteData(u64 gpu_addr, u64 bytes, u64 start_pos, u64 end_pos,
+                                 const u8* ring_data) {
     if (bytes == 0) {
         return;
     }
-    const u64 position = g_state.WritePosition();
     for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
-        g_pending_pages[page & 4095] = position;
+        g_pending_pages[page & 4095] = end_pos;
     }
-    if (H2Async() && !g_pending_exact_overflow) {
-        const u64 begin = gpu_addr;
-        const u64 end = gpu_addr + bytes;
-        for (u32 i = 0; i < g_pending_exact_count; ++i) {
-            auto& r = g_pending_exact[i];
-            if (begin <= r.end && r.begin <= end) {
-                r.begin = (std::min)(r.begin, begin);
-                r.end = (std::max)(r.end, end);
-                r.write_pos = position;
-                return;
+    if (H2Async() && !g_pending_write_overflow) {
+        if (g_pending_write_head - g_pending_write_tail >= PendingWriteCap) [[unlikely]] {
+            g_consumed_cache = g_state.ConsumedPosition();
+            while (g_pending_write_tail != g_pending_write_head &&
+                   g_pending_writes[g_pending_write_tail & (PendingWriteCap - 1)].end_word_pos <=
+                       g_consumed_cache) {
+                ++g_pending_write_tail;
             }
         }
-        if (g_pending_exact_count < g_pending_exact.size()) {
-            g_pending_exact[g_pending_exact_count++] = PendingRange{begin, end, position};
+        if (g_pending_write_head - g_pending_write_tail >= PendingWriteCap ||
+            bytes > UINT32_MAX) [[unlikely]] {
+            g_pending_write_overflow = true;
         } else {
-            g_pending_exact_overflow = true;
+            g_pending_writes[g_pending_write_head++ & (PendingWriteCap - 1)] = PendingWrite{
+                .begin = gpu_addr,
+                .bytes = static_cast<u32>(bytes),
+                ._pad = 0,
+                .start_word_pos = start_pos,
+                .end_word_pos = end_pos,
+                .ring_data = ring_data,
+            };
         }
     }
 }
 
-/// Stage A under H2Async(): O(1) fast check against pending writes, draining only on exact byte
-/// range overlap with an in-flight GPUBackB guest write.
-inline void GuardReadExact(u64 gpu_addr, u64 bytes) {
-    if (bytes == 0 || (g_pending_exact_count == 0 && !g_pending_exact_overflow)) [[likely]] {
-        return;
+/// Stage A: guest memory [gpu_addr, gpu_addr + bytes) is written by GPUBackB in ring order
+/// without a copyable payload in the ring (e.g., Query).
+inline void NotePendingWrite(u64 gpu_addr, u64 bytes) {
+    const u64 pos = g_state.WritePosition();
+    NotePendingWriteData(gpu_addr, bytes, pos, pos, nullptr);
+}
+
+/// Stage A under H2Async(): zero-copy Store-to-Load Forwarding (STLF) from the SPSC ring.
+/// Returns NoPending when RAM is already up to date, Forwarded when `dst` was populated directly
+/// from the ring without draining GPUBackB, or NeedDrain when Stage A must drain before reading.
+inline ForwardResult TryForwardRead(u64 gpu_addr, void* dst, size_t bytes) {
+    if (bytes == 0 || (g_pending_write_head == g_pending_write_tail && !g_pending_write_overflow))
+        [[likely]] {
+        return ForwardResult::NoPending;
     }
-    const u64 drained = g_state.DrainedPosition();
-    bool page_hit = false;
-    for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
-        if (g_pending_pages[page & 4095] > drained) [[unlikely]] {
-            page_hit = true;
+    const u64 first_page = gpu_addr >> 12;
+    const u64 last_page = (gpu_addr + bytes - 1) >> 12;
+    auto any_page_after = [&](u64 pos) {
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (g_pending_pages[page & 4095] > pos) [[unlikely]] {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!any_page_after(g_consumed_cache)) [[likely]] {
+        return ForwardResult::NoPending;
+    }
+    g_consumed_cache = g_state.ConsumedPosition();
+    if (!any_page_after(g_consumed_cache)) [[likely]] {
+        return ForwardResult::NoPending;
+    }
+    if (g_pending_write_overflow) [[unlikely]] {
+        ++g_h2_stlf_misses;
+        return ForwardResult::NeedDrain;
+    }
+    while (g_pending_write_tail != g_pending_write_head &&
+           g_pending_writes[g_pending_write_tail & (PendingWriteCap - 1)].end_word_pos <=
+               g_consumed_cache) {
+        ++g_pending_write_tail;
+    }
+    const u64 read_end = gpu_addr + bytes;
+    const u64 cur_write_pos = g_state.WritePosition();
+    for (u32 i = g_pending_write_head; i != g_pending_write_tail;) {
+        --i;
+        const auto& w = g_pending_writes[i & (PendingWriteCap - 1)];
+        if (w.end_word_pos <= g_consumed_cache) {
             break;
         }
+        const u64 w_end = w.begin + w.bytes;
+        if (gpu_addr >= w_end || read_end <= w.begin) {
+            continue;
+        }
+        if (w.ring_data != nullptr && w.begin <= gpu_addr && read_end <= w_end &&
+            (cur_write_pos - w.start_word_pos) < (RingWords - 4096)) [[likely]] {
+            std::memcpy(dst, w.ring_data + (gpu_addr - w.begin), bytes);
+            ++g_h2_stlf_hits;
+            return ForwardResult::Forwarded;
+        }
+        ++g_h2_stlf_misses;
+        return ForwardResult::NeedDrain;
     }
-    if (!page_hit) [[likely]] {
+    return ForwardResult::NoPending;
+}
+
+/// Stage A helper: reads a scalar `T` from guest GPU memory using STLF under H2Async(),
+/// draining GPUBackB only on an unforwardable overlap.
+template <typename T, typename Memory>
+inline T ReadWithForward(const Memory& gpu_memory, u64 gpu_addr) {
+    if (H2Async() && OnStageA()) [[unlikely]] {
+        T val{};
+        const auto fwd = TryForwardRead(gpu_addr, &val, sizeof(T));
+        if (fwd == ForwardResult::Forwarded) {
+            return val;
+        }
+        if (fwd == ForwardResult::NeedDrain) {
+            DrainAsyncH2(H2DrainReason::GuardRead);
+        }
+    }
+    return gpu_memory.template Read<T>(gpu_addr);
+}
+
+/// Stage A under H2Async(): consumed-aware fast check against pending writes, draining only on
+/// exact byte range overlap with an unconsumed GPUBackB guest write.
+inline void GuardReadExact(u64 gpu_addr, u64 bytes) {
+    if (bytes == 0 || (g_pending_write_head == g_pending_write_tail && !g_pending_write_overflow))
+        [[likely]] {
         return;
     }
-    if (g_pending_exact_overflow) [[unlikely]] {
+    const u64 first_page = gpu_addr >> 12;
+    const u64 last_page = (gpu_addr + bytes - 1) >> 12;
+    auto any_page_after = [&](u64 pos) {
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (g_pending_pages[page & 4095] > pos) [[unlikely]] {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!any_page_after(g_consumed_cache)) [[likely]] {
+        return;
+    }
+    g_consumed_cache = g_state.ConsumedPosition();
+    if (!any_page_after(g_consumed_cache)) [[likely]] {
+        return;
+    }
+    if (g_pending_write_overflow) [[unlikely]] {
         DrainAsyncH2(H2DrainReason::GuardRead);
         return;
     }
+    while (g_pending_write_tail != g_pending_write_head &&
+           g_pending_writes[g_pending_write_tail & (PendingWriteCap - 1)].end_word_pos <=
+               g_consumed_cache) {
+        ++g_pending_write_tail;
+    }
     const u64 read_end = gpu_addr + bytes;
-    for (u32 i = 0; i < g_pending_exact_count; ++i) {
-        const auto& r = g_pending_exact[i];
-        if (r.write_pos > drained && gpu_addr < r.end && r.begin < read_end) [[unlikely]] {
+    for (u32 i = g_pending_write_head; i != g_pending_write_tail;) {
+        --i;
+        const auto& w = g_pending_writes[i & (PendingWriteCap - 1)];
+        if (w.end_word_pos <= g_consumed_cache) {
+            break;
+        }
+        if (gpu_addr < w.begin + w.bytes && w.begin < read_end) [[unlikely]] {
             DrainAsyncH2(H2DrainReason::GuardRead);
             return;
         }

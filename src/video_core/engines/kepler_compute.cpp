@@ -53,10 +53,33 @@ namespace {
 /// there landed.
 u32 ReadGuarded(const Tegra::MemoryManager& memory, GPUVAddr address) {
     if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        if (VideoCommon::BackSplit::H2Async()) {
+            return VideoCommon::BackSplit::ReadWithForward<u32>(memory, address);
+        }
         VideoCommon::BackSplit::GuardRead(address, sizeof(u32),
                                           VideoCommon::BackSplit::GuardSite::Other);
     }
     return memory.Read<u32>(address);
+}
+
+void ReadBlockGuarded(const Tegra::MemoryManager& memory, GPUVAddr address, void* dst,
+                      size_t bytes) {
+    if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        if (VideoCommon::BackSplit::H2Async()) {
+            const auto fwd = VideoCommon::BackSplit::TryForwardRead(address, dst, bytes);
+            if (fwd == VideoCommon::BackSplit::ForwardResult::Forwarded) {
+                return;
+            }
+            if (fwd == VideoCommon::BackSplit::ForwardResult::NeedDrain) {
+                VideoCommon::BackSplit::DrainAsyncH2(
+                    VideoCommon::BackSplit::H2DrainReason::GuardRead);
+            }
+        } else {
+            VideoCommon::BackSplit::GuardRead(address, bytes,
+                                              VideoCommon::BackSplit::GuardSite::Other);
+        }
+    }
+    memory.ReadBlockUnsafe(address, dst, bytes);
 }
 } // Anonymous namespace
 
@@ -402,10 +425,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
-                if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] { // E04.T6 step 4d
-                    VideoCommon::BackSplit::GuardRead(address, sizeof(descriptor), VideoCommon::BackSplit::GuardSite::Other);
-                }
-                memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                ReadBlockGuarded(memory_manager, address, descriptor.data(), sizeof(descriptor));
                 if (VideoCommon::ListMacroTrace::g_enabled) {
                     VideoCommon::ListMacroTrace::NoteQmd(address, descriptor);
                 }
@@ -537,10 +557,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         native_macro->native_execution_failed = true;
         std::array<u32, 128> qmd{};
         if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
-            if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] { // E04.T6 step 4d
-                VideoCommon::BackSplit::GuardRead(qmd_address, sizeof(qmd), VideoCommon::BackSplit::GuardSite::Other);
-            }
-            memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
+            ReadBlockGuarded(memory_manager, qmd_address, qmd.data(), sizeof(qmd));
         }
         // Log a failing program's first few dispatches only (QMD words 48-49 hold its code
         // address); it fails the same way every frame.
@@ -1619,11 +1636,8 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
 
 void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
-    if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] { // E04.T6 step 4d
-        VideoCommon::BackSplit::GuardRead(launch_desc_loc, LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32), VideoCommon::BackSplit::GuardSite::Other);
-    }
-    memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
-                                   LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
+    ReadBlockGuarded(memory_manager, launch_desc_loc, &launch_description,
+                     LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
     rasterizer->DispatchCompute();
 }
 

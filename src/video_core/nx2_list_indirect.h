@@ -653,7 +653,7 @@ void ReleaseSlot(VideoCommon::GpuSplit& split, Rasterizer* rasterizer, u32 slot)
         return;
     }
     split.Defer([rasterizer, slot] { rasterizer->Nx2ReleaseListSlot(slot); },
-                VideoCommon::GpuSplit::Writes::Noted);
+                VideoCommon::GpuSplit::Writes::Noted, VideoCommon::GpuSplit::H2SelfGuarded);
 }
 
 /// The words of `slots` (three a slot), once the back ran what the front sent before and the

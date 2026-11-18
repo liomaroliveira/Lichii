@@ -432,7 +432,7 @@ void DmaPusher::DispatchCalls() {
                 gpu->FlushCommands();
                 gpu->OnCommandListEnd();
             },
-            VideoCommon::GpuSplit::Writes::Caches);
+            VideoCommon::GpuSplit::Writes::Caches, VideoCommon::GpuSplit::H2SelfGuarded);
         split.Publish();
         return;
     }
@@ -548,7 +548,9 @@ bool DmaPusher::Step() {
     const bool resumed = suspensions.load(std::memory_order_relaxed) != suspensions_before;
     if ((dma_pushbuffer_subindex == 0 && command_resume_offset == 0) || resumed) {
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            split.Defer([r = rasterizer] { r->InvalidateGPUCache(); });
+            split.Defer([r = rasterizer] { r->InvalidateGPUCache(); },
+                        VideoCommon::GpuSplit::Writes::Anywhere,
+                        VideoCommon::GpuSplit::H2SelfGuarded);
         } else {
             rasterizer->InvalidateGPUCache();
         }
@@ -1540,7 +1542,7 @@ bool DmaPusher::TakeGpuWrittenListWords(const CommandListHeader& header) {
                 rasterizer_->Nx2CheckListSlot(slot_, std::span{expected}.first(count));
             }
         },
-        VideoCommon::GpuSplit::Writes::Noted);
+        VideoCommon::GpuSplit::Writes::Noted, VideoCommon::GpuSplit::H2SelfGuarded);
     command_headers.resize_destructive(count);
     for (u32 k = 0; k < count; ++k) {
         command_headers[k].argument = Nx2ListIndirect::Placeholder(*slot, k);

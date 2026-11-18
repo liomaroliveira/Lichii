@@ -1334,6 +1334,15 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     buffer.address = gpu_addr;
     buffer.size = size;
     if (split_engine != nullptr) [[unlikely]] {
+        if (VideoCommon::BackSplit::UseH2AsyncQueue() &&
+            rasterizer->TrySplitBindGraphicsUniformBuffer(split_engine, stage_index, slot, gpu_addr,
+                                                          size, is_enabled)) {
+            if (VideoCommon::UboOptEnabled()) {
+                cb_bind_sent[stage_index][slot] = true;
+                cb_bind_map_serial[stage_index][slot] = memory_manager.MapSerial();
+            }
+            return;
+        }
         // Before the rasterizer's bind task, in ring order with it.
         SplitSendCbBind(stage_index, slot, buffer);
     }
@@ -1571,8 +1580,10 @@ bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const voi
         .bytes = static_cast<u32>(bytes),
         .flags = (b_note ? SplitCbNote : 0U) | (words ? SplitCbWords : 0U),
     };
-    VideoCommon::BackSplit::EmitTask2(&SplitApplyCbUpload, &header, sizeof(header), data, bytes);
-    VideoCommon::BackSplit::NotePendingWrite(address, bytes);
+    const auto res = VideoCommon::BackSplit::EmitTask2WithPtr(&SplitApplyCbUpload, &header,
+                                                              sizeof(header), data, bytes);
+    VideoCommon::BackSplit::NotePendingWriteData(address, bytes, res.start_pos, res.end_pos,
+                                                 res.tail_ptr);
     return true;
 }
 

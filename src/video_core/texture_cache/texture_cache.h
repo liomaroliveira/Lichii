@@ -1051,23 +1051,36 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
     // The bytes the ids came from are what they were: the handle words, then the texture and
     // sampler descriptors they select. Nothing else decides the views and samplers.
     if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        const auto matches = []<typename T>(GPUVAddr gpu_addr, const u8* host_ptr,
+                                            const T& expected) -> bool {
+            T tmp;
+            const auto fwd = VideoCommon::BackSplit::TryForwardRead(gpu_addr, &tmp, sizeof(T));
+            if (fwd == VideoCommon::BackSplit::ForwardResult::Forwarded) {
+                return std::memcmp(&tmp, &expected, sizeof(T)) == 0;
+            }
+            if (fwd == VideoCommon::BackSplit::ForwardResult::NeedDrain) {
+                VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::GuardRead);
+            }
+            return std::memcmp(host_ptr, &expected, sizeof(T)) == 0;
+        };
         for (size_t i = 0; i < handle_addresses.size(); ++i) {
             const SampledTextureMemo::Entry& entry = memo.entries[i];
-            if (entry.handle_address != handle_addresses[i]) {
+            if (entry.handle_address != handle_addresses[i] ||
+                !matches(entry.handle_address, entry.handle_host, entry.raw) ||
+                !matches(entry.tic_address, entry.tic_host, entry.tic) ||
+                !matches(entry.tsc_address, entry.tsc_host, entry.tsc)) {
                 return false;
             }
-            VideoCommon::BackSplit::GuardReadExact(entry.handle_address, sizeof(entry.raw));
-            VideoCommon::BackSplit::GuardReadExact(entry.tic_address, sizeof(entry.tic));
-            VideoCommon::BackSplit::GuardReadExact(entry.tsc_address, sizeof(entry.tsc));
         }
-    }
-    for (size_t i = 0; i < handle_addresses.size(); ++i) {
-        const SampledTextureMemo::Entry& entry = memo.entries[i];
-        if (entry.handle_address != handle_addresses[i] ||
-            std::memcmp(entry.handle_host, &entry.raw, sizeof(entry.raw)) != 0 ||
-            std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
-            std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0) {
-            return false;
+    } else {
+        for (size_t i = 0; i < handle_addresses.size(); ++i) {
+            const SampledTextureMemo::Entry& entry = memo.entries[i];
+            if (entry.handle_address != handle_addresses[i] ||
+                std::memcmp(entry.handle_host, &entry.raw, sizeof(entry.raw)) != 0 ||
+                std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
+                std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0) {
+                return false;
+            }
         }
     }
     has_deleted_images = false;

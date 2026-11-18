@@ -912,8 +912,8 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
             // it was sent without waiting.
             VideoCommon::BackSplit::DrainAsync();
-        } else if (VideoCommon::BackSplit::H2Async() && (head & FastDrawNeutral) == 0)
-            [[unlikely]] {
+        } else if (VideoCommon::BackSplit::H2Async() &&
+                   (head & (FastDrawNeutral | H2SelfGuarded)) == 0) [[unlikely]] {
             VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
             VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Call);
         }

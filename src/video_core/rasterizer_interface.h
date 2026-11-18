@@ -24,6 +24,7 @@ namespace Tegra {
 class MemoryManager;
 namespace Engines {
 class AccelerateDMAInterface;
+class Maxwell3D;
 }
 namespace Control {
 struct ChannelState;
@@ -90,6 +91,15 @@ public:
 
     /// Signal disabling of a uniform buffer
     virtual void DisableGraphicsUniformBuffer(size_t stage, u32 index) = 0;
+
+    /// E04.T12b: updates the shadow Maxwell3D const_buffer binding and binds/disables the
+    /// uniform buffer on GPUBackB in a single H2 async ring task. Returns true when handled.
+    virtual bool TrySplitBindGraphicsUniformBuffer(
+        [[maybe_unused]] Tegra::Engines::Maxwell3D* shadow, [[maybe_unused]] size_t stage,
+        [[maybe_unused]] u32 index, [[maybe_unused]] GPUVAddr gpu_addr, [[maybe_unused]] u32 size,
+        [[maybe_unused]] bool enabled) {
+        return false;
+    }
 
     /// Signal a GPU based semaphore as a fence
     virtual void SignalFence(std::function<void()>&& func) = 0;

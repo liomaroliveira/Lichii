@@ -149,7 +149,8 @@ public:
     void CounterClose(QueryType counter_type);
 
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
-                       u32 payload, u32 subreport);
+                       u32 payload, u32 subreport,
+                       std::optional<std::optional<u64>> split_entry_override = std::nullopt);
 
     void NotifyWFI();
 

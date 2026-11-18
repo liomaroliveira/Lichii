@@ -316,6 +316,10 @@ public:
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
+    /// Defer flag: under EDEN_NX2_H2_SPLIT=2, the deferred closure is already async or
+    /// takes its own H2DrainScope before touching GPUBackB state, so Kind::Call does not
+    /// need to drain GPUBackB before invoking it (without affecting Nx2FastDraw::Break).
+    static constexpr u64 H2SelfGuarded = 1 << 6;
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.

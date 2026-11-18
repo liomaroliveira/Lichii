@@ -52,18 +52,27 @@ public:
             invalidated = false;
         }
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
-        if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
-            BackSplit::GuardReadExact(gpu_addr, sizeof(T));
-        }
         std::pair<T, bool> result;
-        // This runs for every texture and sampler of every draw. An entry within one page is
-        // contiguous in host memory, so a single page lookup replaces the generic block read.
-        const bool one_page =
-            (gpu_addr & Core::Memory::LICHII_PAGEMASK) + sizeof(T) <= Core::Memory::LICHII_PAGESIZE;
-        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
-            std::memcpy(std::addressof(result.first), host, sizeof(T));
-        } else {
-            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+        bool forwarded = false;
+        if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+            const auto fwd =
+                BackSplit::TryForwardRead(gpu_addr, std::addressof(result.first), sizeof(T));
+            if (fwd == BackSplit::ForwardResult::Forwarded) {
+                forwarded = true;
+            } else if (fwd == BackSplit::ForwardResult::NeedDrain) {
+                BackSplit::DrainAsyncH2(BackSplit::H2DrainReason::GuardRead);
+            }
+        }
+        if (!forwarded) [[likely]] {
+            // This runs for every texture and sampler of every draw. An entry within one page is
+            // contiguous in host memory, so a single page lookup replaces the generic block read.
+            const bool one_page = (gpu_addr & Core::Memory::LICHII_PAGEMASK) + sizeof(T) <=
+                                  Core::Memory::LICHII_PAGESIZE;
+            if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+                std::memcpy(std::addressof(result.first), host, sizeof(T));
+            } else {
+                gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+            }
         }
         if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
             result.second = result.first != descriptors[index];

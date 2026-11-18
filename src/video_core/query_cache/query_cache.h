@@ -236,7 +236,8 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
-                                           QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+                                           QueryPropertiesFlags flags, u32 payload, u32 subreport,
+                                           std::optional<std::optional<u64>> split_entry_override) {
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
     const bool mirrored = True(flags & QueryPropertiesFlags::Nx2Mirror);
@@ -304,7 +305,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // memory once its operation ran with a fence (GpuSplit::NoteFencedWrite). A synced release's
     // operation doesn't run in fence order, so it must not count earlier reports as landed.
     const std::optional<u64> split_entry =
-        is_synced ? std::nullopt : VideoCommon::GpuSplit::Get().BackEntry();
+        is_synced ? std::nullopt
+                  : (split_entry_override ? *split_entry_override
+                                          : VideoCommon::GpuSplit::Get().BackEntry());
     const u64 report_size = has_timestamp ? 16 : 4;
     const bool immediate =
         !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;

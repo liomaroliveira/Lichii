@@ -3807,15 +3807,33 @@ void RasterizerVulkan::DispatchCompute() {
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
-    const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Query};
     switch (type) {
     case VideoCommon::QueryType::ZPassPixelCount64:
-    case VideoCommon::QueryType::StreamingByteCount:
-    case VideoCommon::QueryType::StreamingPrimitivesSucceeded:
-    case VideoCommon::QueryType::VtgPrimitivesOut:
+        if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
+            struct ResetArgs {
+                QueryCache* cache;
+                VideoCommon::QueryType type;
+            };
+            const ResetArgs args{&query_cache, type};
+            VideoCommon::BackSplit::EmitTask(
+                [](const u64* payload) {
+                    ResetArgs a;
+                    std::memcpy(&a, payload, sizeof(a));
+                    a.cache->CounterReset(a.type);
+                },
+                &args, sizeof(args));
+            return;
+        }
         query_cache.CounterReset(type);
         return;
+    case VideoCommon::QueryType::StreamingByteCount:
+    case VideoCommon::QueryType::StreamingPrimitivesSucceeded:
+    case VideoCommon::QueryType::VtgPrimitivesOut: {
+        const VideoCommon::BackSplit::H2DrainScope h2_drain{
+            VideoCommon::BackSplit::H2DrainReason::Query};
+        query_cache.CounterReset(type);
+        return;
+    }
     default:
         LOG_DEBUG(Render_Vulkan, "Unimplemented counter reset={}", type);
         return;
@@ -3824,6 +3842,57 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    const bool is_fence = True(flags & VideoCommon::QueryPropertiesFlags::IsAFence);
+    const bool is_tfb_query =
+        type == VideoCommon::QueryType::StreamingByteCount ||
+        type == VideoCommon::QueryType::StreamingPrimitivesNeeded ||
+        type == VideoCommon::QueryType::VtgPrimitivesOut ||
+        type == VideoCommon::QueryType::StreamingPrimitivesSucceeded ||
+        type == VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded;
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_fence && !is_tfb_query) [[unlikely]] {
+        // Reports and semaphore releases reach guest memory the CPU may wait on.
+        VideoCommon::Nx2FastDraw::NoteSync();
+        if (VideoCommon::Nx2DrainCheck::g_enabled && type == VideoCommon::QueryType::Payload)
+            [[unlikely]] {
+            if (const auto released = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                VideoCommon::Nx2DrainCheck::NoteRelease(*released);
+            }
+        }
+        const std::optional<u64> back_entry = VideoCommon::GpuSplit::Get().BackEntry();
+        const bool has_timestamp = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+        struct QueryArgs {
+            QueryCache* cache;
+            GPUVAddr gpu_addr;
+            u64 back_entry;
+            VideoCommon::QueryType type;
+            VideoCommon::QueryPropertiesFlags flags;
+            u32 payload;
+            u32 subreport;
+            u8 has_back_entry;
+        };
+        const QueryArgs args{
+            .cache = &query_cache,
+            .gpu_addr = gpu_addr,
+            .back_entry = back_entry.value_or(0),
+            .type = type,
+            .flags = flags,
+            .payload = payload,
+            .subreport = subreport,
+            .has_back_entry = static_cast<u8>(back_entry.has_value() ? 1 : 0),
+        };
+        VideoCommon::BackSplit::EmitTask(
+            [](const u64* task_payload) {
+                QueryArgs a;
+                std::memcpy(&a, task_payload, sizeof(a));
+                const std::optional<u64> entry =
+                    a.has_back_entry != 0 ? std::optional<u64>{a.back_entry} : std::nullopt;
+                a.cache->CounterReport(a.gpu_addr, a.type, a.flags, a.payload, a.subreport,
+                                       std::optional<std::optional<u64>>{entry});
+            },
+            &args, sizeof(args));
+        VideoCommon::BackSplit::NotePendingWrite(gpu_addr, has_timestamp ? 16 : 4);
+        return;
+    }
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
         VideoCommon::BackSplit::H2DrainReason::Query};
     // Reports and semaphore releases reach guest memory the CPU may wait on.
@@ -3878,6 +3947,48 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
         return;
     }
     buffer_cache.DisableGraphicsUniformBuffer(stage, index);
+}
+
+bool RasterizerVulkan::TrySplitBindGraphicsUniformBuffer(Tegra::Engines::Maxwell3D* shadow,
+                                                         size_t stage, u32 index, GPUVAddr gpu_addr,
+                                                         u32 size, bool enabled) {
+    if (!VideoCommon::BackSplit::UseH2AsyncQueue()) [[likely]] {
+        return false;
+    }
+    struct FusedCbBindArgs {
+        Tegra::Engines::Maxwell3D* shadow;
+        BufferCache* cache;
+        u64 gpu_addr;
+        u32 size;
+        u16 stage;
+        u8 index;
+        u8 enabled;
+    };
+    const FusedCbBindArgs args{
+        .shadow = shadow,
+        .cache = &buffer_cache,
+        .gpu_addr = gpu_addr,
+        .size = size,
+        .stage = static_cast<u16>(stage),
+        .index = static_cast<u8>(index),
+        .enabled = static_cast<u8>(enabled ? 1 : 0),
+    };
+    VideoCommon::BackSplit::EmitTask(
+        [](const u64* payload) {
+            FusedCbBindArgs a;
+            std::memcpy(&a, payload, sizeof(a));
+            auto& buffer = a.shadow->state.shader_stages[a.stage].const_buffers[a.index];
+            buffer.address = a.gpu_addr;
+            buffer.size = a.size;
+            buffer.enabled = a.enabled != 0;
+            if (a.enabled != 0) {
+                a.cache->BindGraphicsUniformBuffer(a.stage, a.index, a.gpu_addr, a.size);
+            } else {
+                a.cache->DisableGraphicsUniformBuffer(a.stage, a.index);
+            }
+        },
+        &args, sizeof(args));
+    return true;
 }
 
 void RasterizerVulkan::FlushAll() {}
@@ -5335,7 +5446,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
                 };
                 static_assert(sizeof(H2InlineHeader) % sizeof(u64) == 0);
                 const H2InlineHeader hdr{this, address, copy_size};
-                VideoCommon::BackSplit::EmitTask2(
+                const auto res = VideoCommon::BackSplit::EmitTask2WithPtr(
                     [](const u64* payload) {
                         H2InlineHeader h;
                         std::memcpy(&h, payload, sizeof(h));
@@ -5348,7 +5459,8 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
                         }
                     },
                     &hdr, sizeof(hdr), memory.data(), copy_size);
-                VideoCommon::BackSplit::NotePendingWrite(address, copy_size);
+                VideoCommon::BackSplit::NotePendingWriteData(address, copy_size, res.start_pos,
+                                                             res.end_pos, res.tail_ptr);
                 return;
             }
         }

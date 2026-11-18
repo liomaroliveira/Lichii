@@ -107,6 +107,9 @@ public:
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
     void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
+    bool TrySplitBindGraphicsUniformBuffer(Tegra::Engines::Maxwell3D* shadow, size_t stage,
+                                           u32 index, GPUVAddr gpu_addr, u32 size,
+                                           bool enabled) override;
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;

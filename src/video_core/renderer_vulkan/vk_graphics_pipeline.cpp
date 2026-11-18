@@ -1501,11 +1501,7 @@ bool GraphicsPipeline::ReadRawHandles(std::vector<u32>& out, std::vector<u32>* c
                 }
                 const GPUVAddr word_addr =
                     cbufs[desc.cbuf_index].address + desc.cbuf_offset + (index << desc.size_shift);
-                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
-                    [[unlikely]] {
-                    VideoCommon::BackSplit::GuardReadExact(word_addr, sizeof(u32));
-                }
-                const u32 word{gpu_memory->Read<u32>(word_addr)};
+                const u32 word{VideoCommon::BackSplit::ReadWithForward<u32>(*gpu_memory, word_addr)};
                 if (!desc.has_secondary) {
                     out.push_back(word);
                     continue;
@@ -1515,11 +1511,8 @@ bool GraphicsPipeline::ReadRawHandles(std::vector<u32>& out, std::vector<u32>* c
                 }
                 const GPUVAddr second_addr =
                     cbufs[desc.secondary_cbuf_index].address + desc.secondary_cbuf_offset;
-                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
-                    [[unlikely]] {
-                    VideoCommon::BackSplit::GuardReadExact(second_addr, sizeof(u32));
-                }
-                const u32 second{gpu_memory->Read<u32>(second_addr)};
+                const u32 second{
+                    VideoCommon::BackSplit::ReadWithForward<u32>(*gpu_memory, second_addr)};
                 out.push_back((word << desc.shift_left) | (second << desc.secondary_shift_left));
             }
         }
@@ -2077,28 +2070,23 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
                 const u32 index_offset{index << desc.size_shift};
                 const u32 offset{desc.cbuf_offset + index_offset};
                 const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
-                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
-                    [[unlikely]] {
-                    VideoCommon::BackSplit::GuardReadExact(addr, sizeof(u32));
-                }
+                const u32 primary_word{
+                    VideoCommon::BackSplit::ReadWithForward<u32>(*gpu_memory, addr)};
                 if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
                     if (desc.has_secondary) {
                         ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                         const u32 second_offset{desc.secondary_cbuf_offset};
                         const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                      second_offset};
-                        if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
-                            [[unlikely]] {
-                            VideoCommon::BackSplit::GuardReadExact(separate_addr, sizeof(u32));
-                        }
-                        const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                        const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
-                                          << desc.secondary_shift_left};
+                        const u32 secondary_word{VideoCommon::BackSplit::ReadWithForward<u32>(
+                            *gpu_memory, separate_addr)};
+                        const u32 lhs_raw{primary_word << desc.shift_left};
+                        const u32 rhs_raw{secondary_word << desc.secondary_shift_left};
                         const u32 raw{lhs_raw | rhs_raw};
                         return TexturePair(raw, via_header_index);
                     }
                 }
-                return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+                return TexturePair(primary_word, via_header_index);
             }};
             if (resolve_in_full) {
                 u32 texture{};
