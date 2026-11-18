@@ -29,6 +29,7 @@
 #include <atomic>
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_h2_model.h"
 #include "video_core/fsr.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -1497,6 +1498,7 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 }
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -1711,6 +1713,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dst_image, src_image, copy_buffer, src_aspect_mask, dst_aspect_mask,
                       vk_in_copies, vk_out_copies](vk::CommandBuffer cmdbuf) {
@@ -2310,6 +2313,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     const VkImageAspectFlags aspect_mask = ImageAspectMask(src.format);
     const bool is_dst_msaa = dst.Samples() != VK_SAMPLE_COUNT_1_BIT;
     const bool is_src_msaa = src.Samples() != VK_SAMPLE_COUNT_1_BIT;
@@ -2628,6 +2632,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
@@ -2718,6 +2723,7 @@ void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
         return;
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
 
     const bool msaa_to_non_msaa = src.info.num_samples > 1 && dst.info.num_samples == 1;
     const u32 num_samples = msaa_to_non_msaa ? src.info.num_samples : dst.info.num_samples;
@@ -3182,6 +3188,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
     }
 
     // TODO: Move this to another API
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
     }
@@ -5323,6 +5330,7 @@ bool TextureCacheRuntime::ClearImage(Image& image) {
         True(image.flags & VideoCommon::ImageFlagBits::Converted)) {
         return false;
     }
+    VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     FlushDeferredClear();
     TransitionImageLayout(image);
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -5361,6 +5369,7 @@ bool TextureCacheRuntime::ClearImage(Image& image) {
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
     if (!image.ExchangeInitialization()) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
         VkImageMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,

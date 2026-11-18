@@ -43,6 +43,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -857,6 +858,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const Shader::Info& info{stage_infos[stage]};
         if (!keep_ssbo) {
             const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
             buffer_cache.UnbindGraphicsStorageBuffers(stage);
             if constexpr (Spec::has_storage_buffers) {
                 size_t ssbo_index{};
@@ -1136,6 +1138,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
         VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        bool bound_tex_buffer = false;
         const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
             size_t index{};
             const auto add_buffer{[&](const auto& desc) {
@@ -1155,6 +1158,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
                                                            image_view.BufferSize(), format,
                                                            is_written, is_image);
+                    bound_tex_buffer = true;
                     ++index;
                     ++texture_buffer_it;
                 }
@@ -1178,6 +1182,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }};
         Profile::Scope scope{Profile::Zone::TextureBuffers};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         if constexpr (Spec::enabled_stages[0]) {
             bind_stage_info(0);
         }
@@ -1192,6 +1197,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             bind_stage_info(4);
+        }
+        if (bound_tex_buffer) {
+            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexBufferBind);
         }
     } else {
         if constexpr (Spec::enabled_stages[0]) {
@@ -1217,6 +1225,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
@@ -1224,6 +1233,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
 
@@ -1231,16 +1241,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    bool pushed_img_desc = false;
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
             buffer_cache.BindHostStageBuffers(stage);
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const VideoCommon::Nx2H2Model::SideScope h2_a{VideoCommon::Nx2H2Model::Side::A};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            if (guest_descriptor_queue.UpdateCount() > first_entry) {
+                pushed_img_desc = true;
+            }
             if (captured_delta) {
                 KeepImageDescriptors(stage, first_entry);
             }
@@ -1270,6 +1286,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
     }
+    if (pushed_img_desc) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::PushImgDesc);
+    }
     if (captured_delta) {
         kept_rescaling = rescaling.Data();
         kept_scale_epoch = texture_cache.ScaleEpoch();
@@ -1298,10 +1317,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
+        VideoCommon::Nx2H2Model::NoteFramebuffer(texture_cache.GetFramebuffer());
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
@@ -1309,6 +1330,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
     return ConfigureDraw(rescaling, render_area);
 }
 
@@ -1634,6 +1656,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         const auto bind_ssbos = [&]() LAMBDA_FORCEINLINE {
             for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
                 if (!configured_stages[stage]) {
@@ -1673,11 +1696,13 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
     const auto& regs{maxwell3d->regs};
@@ -1701,25 +1726,32 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         }
         kept_image_entries.clear();
     }
+    bool pushed_img_desc = false;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!configured_stages[stage]) {
             continue;
         }
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
             buffer_cache.BindHostStageBuffers(stage);
         }
         if (replay_images) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
             const auto [first, count] = kept_image_ranges[stage];
             if (count != 0) {
                 guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
             }
         } else {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const VideoCommon::Nx2H2Model::SideScope h2_a{VideoCommon::Nx2H2Model::Side::A};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            if (guest_descriptor_queue.UpdateCount() > first_entry) {
+                pushed_img_desc = true;
+            }
             KeepImageDescriptors(stage, first_entry);
         }
         if (stage_infos[stage].uses_render_area) {
@@ -1729,6 +1761,9 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
+    }
+    if (pushed_img_desc) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::PushImgDesc);
     }
     if (replay_images) {
         rescaling.Assign(kept_rescaling);
@@ -1765,10 +1800,12 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
+        VideoCommon::Nx2H2Model::NoteFramebuffer(texture_cache.GetFramebuffer());
         const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
         texture_cache.CheckFeedbackLoop(view_span);
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
@@ -1776,6 +1813,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
     return ConfigureDraw(rescaling, render_area);
 }
 

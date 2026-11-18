@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
@@ -684,6 +685,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }};
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
+    if (index > 0) {
+        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexBufferBind);
+    }
 
     buffer_cache.UpdateComputeBuffers();
     buffer_cache.BindHostComputeBuffers();
