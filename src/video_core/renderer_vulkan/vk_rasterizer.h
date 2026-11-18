@@ -6,6 +6,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <unordered_set>
@@ -18,6 +20,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
@@ -212,7 +215,77 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false, u32 instance_count = 1);
+
+    [[nodiscard]] bool UseSideAMaxwell3D() const noexcept override {
+        return true;
+    }
+
+    [[nodiscard]] Tegra::Engines::Maxwell3D* H2SideBMaxwell3D() const noexcept {
+        return (VideoCommon::BackSplit::H2Async() && maxwell3d_b != nullptr) ? maxwell3d_b
+                                                                             : maxwell3d;
+    }
+
+    /// Stage A's shadow of Scheduler state under EDEN_NX2_H2_SPLIT=2 so FastDraw and PrepareSideA
+    /// never race with GPUBackB's mutations to Scheduler.
+    struct H2SchedulerMirror {
+        u64 tick{};
+        u64 render_pass_serial{};
+        bool render_pass_active{};
+        VkFramebuffer framebuffer{VK_NULL_HANDLE};
+        VkExtent2D render_area{};
+        const GraphicsPipeline* bound_pipeline{};
+        bool has_fragment_barrier{};
+        bool rp_has_stores{};
+
+        void SyncFrom(const Scheduler& sched) noexcept;
+
+        void EndRP() noexcept {
+            if (render_pass_active) {
+                render_pass_active = false;
+                framebuffer = VK_NULL_HANDLE;
+                render_area = {};
+                has_fragment_barrier = false;
+                rp_has_stores = false;
+                ++render_pass_serial;
+            }
+        }
+
+        void RequestRP(const FramebufferSnapshot& fb) noexcept {
+            if (render_pass_active && framebuffer == fb.handle &&
+                render_area.width == fb.render_area.width &&
+                render_area.height == fb.render_area.height) {
+                return;
+            }
+            EndRP();
+            render_pass_active = true;
+            framebuffer = fb.handle;
+            render_area = fb.render_area;
+            ++render_pass_serial;
+        }
+    };
+
+    struct alignas(8) H2DrawTaskHeader {
+        RasterizerVulkan* rasterizer{};
+        GraphicsPipeline* pipeline{};
+        Tegra::MemoryManager* gpu_memory{};
+        H2DrawPacketBase pkt{};
+        std::array<u64, 6> hashes{};
+        u64 render_trace_frame{};
+        VkImageView save_effects_view{VK_NULL_HANDLE};
+        VkExtent2D save_effects_extent{};
+        u32 instance_count{};
+        u32 num_image_entries{};
+        bool is_mesh_draw{};
+    };
+    static_assert(std::is_trivially_copyable_v<H2DrawTaskHeader>);
+    static_assert(sizeof(H2DrawTaskHeader) % 8 == 0);
+
+    static void ExecuteH2DrawOnB(const u64* payload);
+    void ExecuteH2DrawTask(const H2DrawTaskHeader& task,
+                           std::span<const DescriptorUpdateEntry> image_entries);
+    void FlushH2DeferredInvalidations(bool lock_texture_cache);
+    void OnH2PostDrain();
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
@@ -695,6 +768,15 @@ private:
     u32 trace_captures{};
     u32 trace_capture_dropped{};
     u32 trace_failure_details{};
+
+    /// E04.T12 (EDEN_NX2_H2_SPLIT=2): Side B's Maxwell3D shadow, Stage A's scheduler mirror, and
+    /// rare deferred TextureCache/PipelineCache invalidations noticed on GPUBackB.
+    Tegra::Engines::Maxwell3D* maxwell3d_b{};
+    H2SchedulerMirror h2_mirror{};
+    std::atomic<bool> h2_has_deferred_invals{false};
+    std::mutex h2_inval_mutex;
+    std::vector<std::pair<DAddr, std::size_t>> h2_deferred_tex_invals;
+    std::vector<std::pair<DAddr, std::size_t>> h2_deferred_pipe_invals;
 };
 
 } // namespace Vulkan

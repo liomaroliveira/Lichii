@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_back_split.h"
 
 namespace VideoCommon {
 
@@ -36,11 +37,19 @@ GPUVAddr StorageBufferBase(const Shader::Info& info, u32 binding, Memory& gpu_me
     if (cbuf == 0) {
         return 0;
     }
-    GPUVAddr base{gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset)};
+    const GPUVAddr entry_addr{cbuf + descriptor.cbuf_offset};
+    if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+        BackSplit::GuardReadExact(entry_addr, sizeof(u64));
+    }
+    GPUVAddr base{gpu_memory.template Read<u64>(entry_addr)};
     if (base != 0 && descriptor.indirect_offset != ~0U) {
         // The table entry is read at its exact address. Only the buffer address it holds is
         // aligned down, as the shader does.
-        base = gpu_memory.template Read<u64>(base + descriptor.indirect_offset);
+        const GPUVAddr indirect_addr{base + descriptor.indirect_offset};
+        if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+            BackSplit::GuardReadExact(indirect_addr, sizeof(u64));
+        }
+        base = gpu_memory.template Read<u64>(indirect_addr);
     }
     return base & ~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1);
 }
@@ -57,12 +66,24 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 {
                    const GPUVAddr base{cbuf_address(index)};
-                   return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
+                   if (base == 0) {
+                       return 0U;
+                   }
+                   if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+                       BackSplit::GuardReadExact(base + offset, sizeof(u32));
+                   }
+                   return gpu_memory.template Read<u32>(base + offset);
                },
                [&](u32 binding, u32 offset) -> u32 {
                    const GPUVAddr base{StorageBufferBase(info, binding, gpu_memory, cbuf_address,
                                                          storage_alignment)};
-                   return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
+                   if (base == 0) {
+                       return 0U;
+                   }
+                   if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+                       BackSplit::GuardReadExact(base + offset, sizeof(u32));
+                   }
+                   return gpu_memory.template Read<u32>(base + offset);
                },
                element)
         .value_or(0U);
@@ -94,6 +115,9 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
             }
         }
         const GPUVAddr base{cbuf_address(index)};
+        if (base != 0 && BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+            BackSplit::GuardReadExact(base + offset, sizeof(u32));
+        }
         const u32 value{base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U};
         if (num_words < words.size()) {
             words[num_words++] = {index, offset, value};
@@ -108,6 +132,9 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
             bases[binding] =
                 StorageBufferBase(info, binding, gpu_memory, cbuf_address, storage_alignment);
             known_bases |= u64{1} << binding;
+        }
+        if (bases[binding] != 0 && BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+            BackSplit::GuardReadExact(bases[binding] + offset, sizeof(u32));
         }
         return bases[binding] != 0 ? gpu_memory.template Read<u32>(bases[binding] + offset) : 0U;
     };

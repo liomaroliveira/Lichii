@@ -42,6 +42,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
@@ -1136,6 +1137,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         delta_views_valid = true;
         kept_images_valid = false;
+        a_sent_kept_images = false;
         NextDeltaGeneration();
     }
     if (captured_delta) {
@@ -1299,6 +1301,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         kept_rescaling = rescaling.Data();
         kept_scale_epoch = texture_cache.ScaleEpoch();
         kept_images_valid = true;
+        a_sent_kept_images = false;
     }
     if (mesh_emulation) {
         if (!mesh_output_buffer) {
@@ -1421,8 +1424,8 @@ void GraphicsPipeline::TakeDeltaStateFrom(GraphicsPipeline& other) noexcept {
     kept_scale_epoch = other.kept_scale_epoch;
     delta_views_valid = std::exchange(other.delta_views_valid, false);
     kept_images_valid = std::exchange(other.kept_images_valid, false);
-    b_kept_images_valid = false;
-    other.b_kept_images_valid = false;
+    a_sent_kept_images = false;
+    other.a_sent_kept_images = false;
     NextDeltaGeneration();
     other.NextDeltaGeneration();
 }
@@ -1496,9 +1499,13 @@ bool GraphicsPipeline::ReadRawHandles(std::vector<u32>& out, std::vector<u32>* c
                 if (!cbufs[desc.cbuf_index].enabled) {
                     return false;
                 }
-                const u32 word{gpu_memory->Read<u32>(cbufs[desc.cbuf_index].address +
-                                                     desc.cbuf_offset +
-                                                     (index << desc.size_shift))};
+                const GPUVAddr word_addr =
+                    cbufs[desc.cbuf_index].address + desc.cbuf_offset + (index << desc.size_shift);
+                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
+                    [[unlikely]] {
+                    VideoCommon::BackSplit::GuardReadExact(word_addr, sizeof(u32));
+                }
+                const u32 word{gpu_memory->Read<u32>(word_addr)};
                 if (!desc.has_secondary) {
                     out.push_back(word);
                     continue;
@@ -1506,8 +1513,13 @@ bool GraphicsPipeline::ReadRawHandles(std::vector<u32>& out, std::vector<u32>* c
                 if (!cbufs[desc.secondary_cbuf_index].enabled) {
                     return false;
                 }
-                const u32 second{gpu_memory->Read<u32>(cbufs[desc.secondary_cbuf_index].address +
-                                                       desc.secondary_cbuf_offset)};
+                const GPUVAddr second_addr =
+                    cbufs[desc.secondary_cbuf_index].address + desc.secondary_cbuf_offset;
+                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
+                    [[unlikely]] {
+                    VideoCommon::BackSplit::GuardReadExact(second_addr, sizeof(u32));
+                }
+                const u32 second{gpu_memory->Read<u32>(second_addr)};
                 out.push_back((word << desc.shift_left) | (second << desc.secondary_shift_left));
             }
         }
@@ -1653,6 +1665,7 @@ bool GraphicsPipeline::ResolveChangedViews(std::span<const u32> elements,
     // The kept descriptors and rescaling words are for the old views: ConfigureDelta pushes and
     // keeps them again.
     kept_images_valid = false;
+    a_sent_kept_images = false;
     NextDeltaGeneration();
     return true;
 }
@@ -1780,6 +1793,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         kept_rescaling = rescaling.Data();
         kept_scale_epoch = texture_cache.ScaleEpoch();
         kept_images_valid = true;
+        a_sent_kept_images = false;
         ++delta_descriptor_stats.pushed;
         if (verify_kept) {
             ++delta_descriptor_stats.verified;
@@ -1835,6 +1849,7 @@ void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
 }
 
 bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_revisit,
+                                    bool has_fragment_barrier, bool rp_has_stores,
                                     H2DrawPacket& pkt) {
     namespace Profile = VideoCommon::Nx2Profile;
     const VideoCommon::Nx2H2Model::SideScope h2_a{VideoCommon::Nx2H2Model::Side::A};
@@ -1861,7 +1876,7 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
 
         const bool kept_usable = kept_images_valid &&
                                  kept_scale_epoch == texture_cache.ScaleEpoch() &&
-                                 b_kept_images_valid;
+                                 a_sent_kept_images;
         const bool replay_images = kept_usable && !delta_descriptors_verify;
         if (replay_images) {
             pkt.replay_images = true;
@@ -1942,8 +1957,8 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
             VideoCommon::Nx2H2Model::NoteFramebuffer(fb);
             const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
             texture_cache.CheckFeedbackLoop(view_span);
-            if (scheduler.HasFragmentBarrier() &&
-                (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            if (has_fragment_barrier &&
+                (rp_has_stores || texture_cache.SamplesRenderTarget(view_span))) {
                 pkt.feedback_break = true;
             }
             fb->MarkResolveShadowsUpToDate();
@@ -1953,6 +1968,9 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         if (IsBuilt() && (!pipeline || build->Failed())) {
             pkt.failed = true;
             return false;
+        }
+        if (!pkt.replay_images) {
+            a_sent_kept_images = true;
         }
         return true;
     }
@@ -2059,12 +2077,20 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
                 const u32 index_offset{index << desc.size_shift};
                 const u32 offset{desc.cbuf_offset + index_offset};
                 const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
+                if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
+                    [[unlikely]] {
+                    VideoCommon::BackSplit::GuardReadExact(addr, sizeof(u32));
+                }
                 if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
                     if (desc.has_secondary) {
                         ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                         const u32 second_offset{desc.secondary_cbuf_offset};
                         const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                      second_offset};
+                        if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA())
+                            [[unlikely]] {
+                            VideoCommon::BackSplit::GuardReadExact(separate_addr, sizeof(u32));
+                        }
                         const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
                         const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
                                           << desc.secondary_shift_left};
@@ -2229,6 +2255,7 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         }
         delta_views_valid = true;
         kept_images_valid = false;
+        a_sent_kept_images = false;
         NextDeltaGeneration();
         kept_image_entries.clear();
         kept_image_ranges = {};
@@ -2270,6 +2297,7 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         kept_rescaling = rescaling.Data();
         kept_scale_epoch = texture_cache.ScaleEpoch();
         kept_images_valid = true;
+        a_sent_kept_images = false;
     }
 
     {
@@ -2279,8 +2307,8 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         VideoCommon::Nx2H2Model::NoteFramebuffer(fb);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
-        if (scheduler.HasFragmentBarrier() &&
-            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+        if (has_fragment_barrier &&
+            (rp_has_stores || texture_cache.SamplesRenderTarget(view_span))) {
             pkt.feedback_break = true;
         }
         fb->MarkResolveShadowsUpToDate();
@@ -2291,14 +2319,20 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
     if (IsBuilt() && (!pipeline || build->Failed())) {
         if (captured_delta) {
             kept_images_valid = false;
+            a_sent_kept_images = false;
         }
         pkt.failed = true;
         return false;
     }
+    if (captured_delta) {
+        a_sent_kept_images = true;
+    }
     return true;
 }
 
-bool GraphicsPipeline::ExecuteSideB(const H2DrawPacket& pkt) {
+bool GraphicsPipeline::ExecuteSideB(const H2DrawPacketBase& pkt,
+                                    std::span<const DescriptorUpdateEntry> image_entries,
+                                    const Tegra::Engines::Maxwell3D& m3d_b) {
     namespace Profile = VideoCommon::Nx2Profile;
     const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
 
@@ -2353,7 +2387,7 @@ bool GraphicsPipeline::ExecuteSideB(const H2DrawPacket& pkt) {
         }
     }
 
-    const auto& regs{maxwell3d->regs};
+    const auto& regs{m3d_b.regs};
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
@@ -2371,10 +2405,9 @@ bool GraphicsPipeline::ExecuteSideB(const H2DrawPacket& pkt) {
     }
 
     if (!pkt.replay_images) {
-        b_kept_image_entries.assign(pkt.image_entries.begin(), pkt.image_entries.end());
+        b_kept_image_entries.assign(image_entries.begin(), image_entries.end());
         b_kept_image_ranges = pkt.image_ranges;
         b_kept_rescaling = pkt.rescaling_words;
-        b_kept_images_valid = true;
     }
 
     RenderAreaPushConstant render_area;

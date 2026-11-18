@@ -146,6 +146,9 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& 
     maxwell3d.regs.global_base_vertex_index = element_base;
     maxwell3d.regs.global_base_instance_index = base_instance;
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
@@ -161,6 +164,9 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& 
     params.max_draw_counts = 1;
     params.stride = 0;
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
     maxwell3d.draw_manager.DrawIndexedIndirect(maxwell3d, topology, 0, estimate);
     maxwell3d.regs.vertex_id_base = 0x0;
     maxwell3d.regs.global_base_vertex_index = 0x0;
@@ -179,6 +185,9 @@ void HLE_DrawIndexedIndirect::Fallback(Core::System& system, Engines::Maxwell3D&
     maxwell3d.regs.global_base_vertex_index = element_base;
     maxwell3d.regs.global_base_instance_index = base_instance;
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
@@ -221,6 +230,9 @@ void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::M
         const std::size_t draw_count = end_indirect - start_indirect;
         const u32 estimate = u32(maxwell3d.EstimateIndexBufferSize());
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
         auto& params = maxwell3d.draw_manager.indirect_state;
         params.is_byte_count = false;
         params.is_indexed = true;
@@ -231,6 +243,9 @@ void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::M
         params.max_draw_counts = draw_count;
         params.stride = stride;
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
         maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
@@ -274,6 +289,9 @@ void HLE_MultiDrawIndexedIndirectCount::Fallback(Core::System& system, Engines::
         maxwell3d.CallMethod(system, 0x8e3, 0x648, true);
         maxwell3d.CallMethod(system, 0x8e4, u32(index), true);
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::IndexBuffer] = true;
+    }
         maxwell3d.draw_manager.DrawIndex(maxwell3d, topology, parameters[base + 2], parameters[base], base_vertex, base_instance, parameters[base + 1]);
     }
 }
@@ -335,6 +353,9 @@ void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d
 
     regs.pipelines[index & 0xF].offset = parameters[2];
     maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        maxwell3d.dirty.split_b_flags[VideoCommon::Dirty::Shaders] = true;
+    }
     regs.shadow_scratch[28 + index] = parameters[1];
     regs.shadow_scratch[34 + index] = parameters[2];
 
@@ -1437,7 +1458,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                     // or the macro draws with an older frame's arguments (objects pop in and out).
                     const size_t read_bytes = size_t{std::min<u32>(value, 0x1000)} * 4;
                     // E04.T6 step 4d: a constant buffer upload sent to GPUBackB may not have landed.
-                    if (VideoCommon::Nx2FastDraw::t_stage_a) [[unlikely]] {
+                    if (VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
                         VideoCommon::BackSplit::GuardRead(source, read_bytes,
                                                           VideoCommon::BackSplit::GuardSite::Macro);
                     }
@@ -1627,7 +1648,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
     // E04.T6: HLE programs write registers directly; with the split, the ones they changed go to
     // GPUBackB's shadow afterwards (a value set and restored inside one program is not seen).
     const auto execute_variant = [&](AnyCachedMacro& cached) {
-        if (!VideoCommon::BackSplit::Enabled()) [[likely]] {
+        if (!VideoCommon::BackSplit::RingEnabled()) [[likely]] {
             return execute_variant_raw(cached);
         }
         const auto before = maxwell3d.regs.reg_array;

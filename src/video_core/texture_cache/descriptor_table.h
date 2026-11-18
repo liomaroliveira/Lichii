@@ -16,6 +16,7 @@
 #include "common/assert.h"
 #include "core/memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
@@ -51,6 +52,9 @@ public:
             invalidated = false;
         }
         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        if (BackSplit::H2Async() && BackSplit::OnStageA()) [[unlikely]] {
+            BackSplit::GuardReadExact(gpu_addr, sizeof(T));
+        }
         std::pair<T, bool> result;
         // This runs for every texture and sampler of every draw. An entry within one page is
         // contiguous in host memory, so a single page lookup replaces the generic block read.

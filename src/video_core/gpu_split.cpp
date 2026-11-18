@@ -784,7 +784,7 @@ std::string GpuSplit::MethodEndingAt(u64 end) const {
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
-    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+    if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
         VideoCommon::BackSplit::g_deferred.fetch_add(1, std::memory_order_relaxed);
     }
     auto* const heap = new std::function<void()>(std::move(func));
@@ -912,6 +912,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             // The closure may run rasterizer code here, on stage A: GPUBackB first runs what
             // it was sent without waiting.
             VideoCommon::BackSplit::DrainAsync();
+        } else if (VideoCommon::BackSplit::H2Async() && (head & FastDrawNeutral) == 0)
+            [[unlikely]] {
+            VideoCommon::BackSplit::g_calls.fetch_add(1, std::memory_order_relaxed);
+            VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Call);
         }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
@@ -931,9 +935,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     on_back_thread = true;
     VideoCommon::Nx2H2Model::MarkBackThread();
     back_running.store(true, std::memory_order_release);
-    // E04.T6 step 3g: with the back split, this thread is stage A; its FastDraw breaks ship
-    // with each draw.
+    // E04.T6 step 3g: with the legacy back split, FastDraw breaks ship with each draw;
+    // under E04.T12 H2Async, FastDraw runs on Stage A, so Nx2FastDraw::t_stage_a stays false
+    // while BackSplit::t_stage_a marks this thread as the ring producer.
     Nx2FastDraw::t_stage_a = VideoCommon::BackSplit::Enabled();
+    VideoCommon::BackSplit::t_stage_a = VideoCommon::BackSplit::RingEnabled();
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     if (Settings::values.pin_gpu_threads.GetValue()) {
@@ -949,7 +955,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     // E04.T6 step 4a: with the back split, `consumed` means GPUBackB ran it: stage A sends the
     // position in ring order and GPUBackB stores it (published at once, or a front waiting for it
     // while this thread sleeps would never wake).
-    const bool split_consumed = Nx2FastDraw::t_stage_a;
+    const bool split_consumed = VideoCommon::BackSplit::RingEnabled();
     const auto store_consumed = [&](u64 position) {
         if (split_consumed) [[unlikely]] {
             struct Mark {

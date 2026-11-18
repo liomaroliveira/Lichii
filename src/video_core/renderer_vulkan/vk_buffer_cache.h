@@ -130,6 +130,10 @@ public:
     /// Returns the mask of bindings whose repacked state changed.
     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
 
+    /// Thread-safe check (reads immutable config + regs only) for Side A under H2Async().
+    [[nodiscard]] bool WouldRepackVertex(const Tegra::Engines::Maxwell3D::Regs& regs,
+                                         bool dynamic_input) const noexcept;
+
     bool IsVertexRepacked(u32 binding) const {
         return (vertex_repack_mask & (1U << binding)) != 0;
     }

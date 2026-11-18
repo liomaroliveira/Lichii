@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <thread>
@@ -77,9 +78,41 @@ inline bool g_enabled = [] {
     return value != nullptr && value[0] == '1';
 }();
 
-/// Enables the Stage A -> Stage B SPSC prototype ring (E04.T5+).
+inline bool g_h2_async = [] {
+    const char* value = std::getenv("EDEN_NX2_H2_SPLIT");
+    return value != nullptr && value[0] == '2';
+}();
+
+/// Enables the Stage A -> Stage B SPSC prototype ring (E04.T5+ legacy mode).
 inline bool Enabled() noexcept {
     return g_enabled;
+}
+
+/// Enables H2 Passo 2 asynchronous Side B execution on GPUBackB (EDEN_NX2_H2_SPLIT=2).
+inline bool H2Async() noexcept {
+    return g_h2_async;
+}
+
+/// True whenever the A -> B SPSC ring and maxwell_3d_b shadow are active (legacy or H2 async).
+inline bool RingEnabled() noexcept {
+    return g_enabled || g_h2_async;
+}
+
+/// E04.T12: set on GPUBack (Stage A) whenever RingEnabled() is active.
+inline thread_local bool t_stage_a{};
+/// E04.T12: nesting depth of H2DrainScope on Stage A. While > 0, GPUBackB is drained and
+/// Stage A is executing a synchronous C2 barrier, so nested ops must run synchronously rather
+/// than enqueueing onto GPUBackB.
+inline thread_local u32 t_h2_drained_depth{};
+
+/// Whether the calling thread is Stage A (GPUBack with the ring active).
+inline bool OnStageA() noexcept {
+    return t_stage_a;
+}
+
+/// True on Stage A under H2Async() when not inside a drained C2 barrier scope.
+inline bool UseH2AsyncQueue() noexcept {
+    return g_h2_async && t_stage_a && t_h2_drained_depth == 0;
 }
 
 /// E04.T6: set on GPUBackB, the thread that owns the rasterizer with the split on.
@@ -89,6 +122,44 @@ inline thread_local bool t_on_b{};
 inline bool OnB() noexcept {
     return t_on_b;
 }
+
+/// E04.T12: reasons Stage A drains GPUBackB under EDEN_NX2_H2_SPLIT=2.
+enum class H2DrainReason : u8 {
+    DrawFallback = 0,
+    DrawIndirect,
+    DrawTexture,
+    Clear,
+    Compute,
+    Query,
+    Fence,
+    Flush,
+    Invalidation,
+    Channel,
+    DmaDisplay,
+    Call,
+    TexOp,
+    GuardRead,
+    Lockstep,
+    Other,
+    Count,
+};
+
+/// Optional callback invoked on Stage A after DrainAsync/RunOnB completes under H2Async() so
+/// RasterizerVulkan can synchronize H2SchedulerMirror from Scheduler.
+inline void (*g_h2_post_drain_cb)(void*){};
+inline void* g_h2_post_drain_arg{};
+inline u64 g_h2_draws_enqueued{};
+inline std::array<u64, static_cast<size_t>(H2DrainReason::Count)> g_h2_drain_reasons{};
+
+/// E04.T12: exact pending guest write ranges sent to GPUBackB (Stage A only).
+struct PendingRange {
+    u64 begin;
+    u64 end;
+    u64 write_pos;
+};
+inline std::array<PendingRange, 128> g_pending_exact{};
+inline u32 g_pending_exact_count{};
+inline bool g_pending_exact_overflow{};
 
 /// GPUBackB, once at its start: marks it as a back thread for GpuSplit (OnBackThread and
 /// OwnsScheduler hold on both stages). Defined in nx2_back_split_rasterizer.cpp.
@@ -136,6 +207,7 @@ constexpr size_t RegCount = 0xE00;
 constexpr size_t RingWords = size_t{1} << 20; // 8 MiB SPSC ring
 constexpr size_t RingMask = RingWords - 1;
 constexpr u64 PublishBatchWords = 4096;
+constexpr u64 H2PublishBatchWords = 512;
 constexpr size_t SnapshotWords = 2 + RegCount / 2;
 
 /// Draws between two shadow checks (EDEN_NX2_BACK_SPLIT_CHECK; 0 = no checks). Power of two.
@@ -240,6 +312,11 @@ public:
         if (hard) {
             ModelSegmentClose(wait_end);
         }
+        g_pending_exact_count = 0;
+        g_pending_exact_overflow = false;
+        if (H2Async() && OnStageA() && g_h2_post_drain_cb != nullptr) {
+            g_h2_post_drain_cb(g_h2_post_drain_arg);
+        }
     }
 
     /// E04.T6 step 5 model (refutation test before async draws): between two "hard" sync points
@@ -281,6 +358,29 @@ public:
         if (payload != 0) {
             dst[words - 1] = 0;
             std::memcpy(dst + 2, data, bytes);
+        }
+        Commit(words);
+        ++stat_async;
+    }
+
+    /// Stage A: zero-copy two-segment PushTask (header + inline tail array) directly into the ring.
+    void PushTask2(AsyncFn fn, const void* head, size_t head_bytes, const void* tail,
+                   size_t tail_bytes) {
+        const size_t total = head_bytes + tail_bytes;
+        const size_t payload = (total + sizeof(u64) - 1) / sizeof(u64);
+        const size_t words = 2 + payload;
+        u64* dst = Reserve(words);
+        dst[0] = MakeHeader(Kind::Task, static_cast<u32>(payload));
+        dst[1] = reinterpret_cast<u64>(fn);
+        if (payload != 0) {
+            dst[words - 1] = 0;
+            auto* out = reinterpret_cast<u8*>(dst + 2);
+            if (head_bytes != 0) {
+                std::memcpy(out, head, head_bytes);
+            }
+            if (tail_bytes != 0) {
+                std::memcpy(out + head_bytes, tail, tail_bytes);
+            }
         }
         Commit(words);
         ++stat_async;
@@ -469,19 +569,51 @@ public:
                  static_cast<double>(stat_guard_drains[0] + stat_guard_drains[1] +
                                      stat_guard_drains[2]) / sec,
                  stat_guard_drains[0], stat_guard_drains[1], stat_guard_drains[2]);
+        const u64 b_bad_win = b_bad_checks.exchange(0, std::memory_order_relaxed);
         LOG_INFO(HW_GPU,
                  "Nx2BackSplit shadow: engines {}, checks {}, diverged checks {}, diverged regs {} "
                  "(total since boot: checks {}, diverged checks {}); state checks {}, diverged "
                  "state {} (total {})",
                  b_engines.load(std::memory_order_relaxed),
-                 b_checks.exchange(0, std::memory_order_relaxed),
-                 b_bad_checks.exchange(0, std::memory_order_relaxed),
+                 b_checks.exchange(0, std::memory_order_relaxed), b_bad_win,
                  b_bad_regs.exchange(0, std::memory_order_relaxed),
                  b_checks_total.load(std::memory_order_relaxed),
                  b_bad_checks_total.load(std::memory_order_relaxed),
                  b_state_checks.exchange(0, std::memory_order_relaxed),
                  b_bad_state.exchange(0, std::memory_order_relaxed),
                  b_bad_state_total.load(std::memory_order_relaxed));
+        const u64 cur_b_busy_ns = b_busy_ns.load(std::memory_order_relaxed);
+        const double a_wait_ms_s =
+            static_cast<double>(a_wait_ns - last_report_a_wait_ns) / 1e6 / sec;
+        const double b_busy_ms_s =
+            static_cast<double>(cur_b_busy_ns - last_report_b_busy_ns) / 1e6 / sec;
+        last_report_a_wait_ns = a_wait_ns;
+        last_report_b_busy_ns = cur_b_busy_ns;
+        if (H2Async()) {
+            static constexpr std::array<const char*, static_cast<size_t>(H2DrainReason::Count)>
+                reason_names{
+                    "DrawFallback", "DrawIndirect", "DrawTexture", "Clear",     "Compute",
+                    "Query",        "Fence",        "Flush",       "Inval",     "Channel",
+                    "DmaDisplay",   "Call",         "TexOp",       "GuardRead", "Lockstep",
+                    "Other",
+                };
+            std::string reasons;
+            for (size_t i = 0; i < g_h2_drain_reasons.size(); ++i) {
+                if (g_h2_drain_reasons[i] != 0) {
+                    reasons += fmt::format("{}{} {:.0f}/s", reasons.empty() ? "" : ", ",
+                                           reason_names[i],
+                                           static_cast<double>(g_h2_drain_reasons[i]) / sec);
+                }
+            }
+            LOG_INFO(HW_GPU,
+                     "Nx2BackSplit H2: draws_enqueued {:.0f}/s, async {:.0f}/s, drains {:.0f}/s, "
+                     "a_wait {:.1f} ms/s, b_busy {:.1f} ms/s, b_bad_checks {}; drain reasons: {}",
+                     static_cast<double>(g_h2_draws_enqueued) / sec,
+                     static_cast<double>(stat_async) / sec, static_cast<double>(stat_drains) / sec,
+                     a_wait_ms_s, b_busy_ms_s, b_bad_win, reasons.empty() ? "none" : reasons);
+            g_h2_draws_enqueued = 0;
+            g_h2_drain_reasons.fill(0);
+        }
         stat_async = 0;
         stat_drains = 0;
         LOG_INFO(HW_GPU,
@@ -592,7 +724,8 @@ private:
 
     void Commit(size_t words) {
         write_position += words;
-        if (write_position - published_local >= PublishBatchWords) [[unlikely]] {
+        const u64 batch = H2Async() ? H2PublishBatchWords : PublishBatchWords;
+        if (write_position - published_local >= batch) [[unlikely]] {
             PublishNow();
         }
     }
@@ -802,6 +935,8 @@ private:
     u64 stat_drains = 0;
     // Step 5 model (A side, but b_busy_ns written by GPUBackB).
     u64 a_wait_ns = 0;
+    u64 last_report_a_wait_ns = 0;
+    u64 last_report_b_busy_ns = 0;
     std::atomic<u64> b_busy_ns{0};
     u64 model_last = 0, model_a_wait = 0, model_idle = 0, model_b = 0, model_seg_a = 0;
     u64 model_sum = 0, model_max = 0, model_a = 0, model_bb = 0, model_hard = 0;
@@ -853,6 +988,12 @@ inline bool CheckRegs(const void* engine, const u32* regs) {
 /// Stage A: has GPUBackB run fn(payload) in ring order without waiting (`bytes` copied).
 inline void EmitTask(RingState::AsyncFn fn, const void* data, size_t bytes) {
     g_state.PushTask(fn, data, bytes);
+}
+
+/// Stage A: zero-copy two-segment EmitTask directly into the ring.
+inline void EmitTask2(RingState::AsyncFn fn, const void* head, size_t head_bytes, const void* tail,
+                      size_t tail_bytes) {
+    g_state.PushTask2(fn, head, head_bytes, tail, tail_bytes);
 }
 
 /// E04.T6d F2: the packets below are dead (GPUBackB only XORs them); they are sent only with
@@ -919,9 +1060,44 @@ inline void DrainAsync() {
     g_state.DrainAsync();
 }
 
+/// Stage A under EDEN_NX2_H2_SPLIT=2: drains GPUBackB and accounts the barrier reason.
+inline void DrainAsyncH2(H2DrainReason reason) {
+    if (H2Async() && OnStageA()) [[unlikely]] {
+        if (g_state.WritePosition() != g_state.DrainedPosition()) {
+            ++g_h2_drain_reasons[static_cast<size_t>(reason)];
+            g_state.DrainAsync();
+        }
+    }
+}
+
+/// RAII C2 barrier under H2Async(): drains GPUBackB on entry, suppresses async queueing while
+/// active, and re-synchronizes H2SchedulerMirror on exit of the outermost scope.
+struct H2DrainScope {
+    bool active{};
+
+    explicit H2DrainScope(H2DrainReason reason) {
+        if (H2Async() && OnStageA()) [[unlikely]] {
+            DrainAsyncH2(reason);
+            ++t_h2_drained_depth;
+            active = true;
+        }
+    }
+    ~H2DrainScope() {
+        if (active) [[unlikely]] {
+            --t_h2_drained_depth;
+            if (t_h2_drained_depth == 0 && g_h2_post_drain_cb != nullptr) {
+                g_h2_post_drain_cb(g_h2_post_drain_arg);
+            }
+        }
+    }
+};
+
 inline void Flush() {
     g_state.Flush();
 }
+
+/// Largest inline write sent asynchronously to GPUBackB.
+inline constexpr size_t MaxAsyncInlineBytes = 4096;
 
 /// E04.T6 step 4d: per GPU page (hashed), the ring position after the last guest write stage A
 /// sent to GPUBackB there. Stage A only.
@@ -936,6 +1112,55 @@ inline void NotePendingWrite(u64 gpu_addr, u64 bytes) {
     for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
         g_pending_pages[page & 4095] = position;
     }
+    if (H2Async() && !g_pending_exact_overflow) {
+        const u64 begin = gpu_addr;
+        const u64 end = gpu_addr + bytes;
+        for (u32 i = 0; i < g_pending_exact_count; ++i) {
+            auto& r = g_pending_exact[i];
+            if (begin <= r.end && r.begin <= end) {
+                r.begin = (std::min)(r.begin, begin);
+                r.end = (std::max)(r.end, end);
+                r.write_pos = position;
+                return;
+            }
+        }
+        if (g_pending_exact_count < g_pending_exact.size()) {
+            g_pending_exact[g_pending_exact_count++] = PendingRange{begin, end, position};
+        } else {
+            g_pending_exact_overflow = true;
+        }
+    }
+}
+
+/// Stage A under H2Async(): O(1) fast check against pending writes, draining only on exact byte
+/// range overlap with an in-flight GPUBackB guest write.
+inline void GuardReadExact(u64 gpu_addr, u64 bytes) {
+    if (bytes == 0 || (g_pending_exact_count == 0 && !g_pending_exact_overflow)) [[likely]] {
+        return;
+    }
+    const u64 drained = g_state.DrainedPosition();
+    bool page_hit = false;
+    for (u64 page = gpu_addr >> 12; page <= (gpu_addr + bytes - 1) >> 12; ++page) {
+        if (g_pending_pages[page & 4095] > drained) [[unlikely]] {
+            page_hit = true;
+            break;
+        }
+    }
+    if (!page_hit) [[likely]] {
+        return;
+    }
+    if (g_pending_exact_overflow) [[unlikely]] {
+        DrainAsyncH2(H2DrainReason::GuardRead);
+        return;
+    }
+    const u64 read_end = gpu_addr + bytes;
+    for (u32 i = 0; i < g_pending_exact_count; ++i) {
+        const auto& r = g_pending_exact[i];
+        if (r.write_pos > drained && gpu_addr < r.end && r.begin < read_end) [[unlikely]] {
+            DrainAsyncH2(H2DrainReason::GuardRead);
+            return;
+        }
+    }
 }
 
 enum class GuardSite : u8 { Macro = 0, Query = 1, Other = 2 };
@@ -944,6 +1169,10 @@ enum class GuardSite : u8 { Macro = 0, Query = 1, Other = 2 };
 /// not have landed yet (a hashed page can drain needlessly, never miss).
 inline void GuardRead(u64 gpu_addr, u64 bytes, GuardSite site) {
     if (bytes == 0) {
+        return;
+    }
+    if (H2Async()) {
+        GuardReadExact(gpu_addr, bytes);
         return;
     }
     const u64 drained = g_state.DrainedPosition();
@@ -957,7 +1186,7 @@ inline void GuardRead(u64 gpu_addr, u64 bytes, GuardSite site) {
 }
 
 inline void MaybeReport() {
-    if (Enabled()) [[unlikely]] {
+    if (RingEnabled()) [[unlikely]] {
         g_state.MaybeReport();
     }
 }

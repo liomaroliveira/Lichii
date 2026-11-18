@@ -53,6 +53,9 @@ public:
     /// Whether the open command buffer has used the next frame's chunks, so this frame could not
     /// move on when it runs out. Checked between draws, where a submit is safe.
     [[nodiscard]] bool NeedsSubmit(const Scheduler& scheduler) const noexcept;
+    [[nodiscard]] bool NeedsSubmit(u64 current_tick) const noexcept {
+        return valid && frame_ticks[(frame_index + 1) % FRAMES_IN_FLIGHT] >= current_tick;
+    }
 
     [[nodiscard]] bool IsValid() const noexcept {
         return valid;

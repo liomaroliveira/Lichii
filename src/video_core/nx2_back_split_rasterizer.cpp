@@ -182,11 +182,6 @@ struct Context {
     }
 };
 
-/// Stage A: the split's back thread, with the back split on (GPUBackB is a back thread too).
-bool OnStageA() {
-    return Enabled() && VideoCommon::GpuSplit::OnBackThread() && !OnB();
-}
-
 template <typename F>
 struct Task {
     F* func;
@@ -264,9 +259,6 @@ void Route(Call call, F&& func) {
     RunWithContext(call, std::forward<F>(func));
 }
 
-/// Largest inline write whose caches' part GPUBackB runs without stage A waiting.
-constexpr size_t MaxAsyncInlineBytes = 4096;
-
 /// GPUBackB, a call sent without waiting: the FastDraw flags of a thread that does not read the
 /// serials (every break bumps them); exceptions cannot reach stage A, so they are logged.
 template <typename F>
@@ -331,6 +323,11 @@ void ReportCounts(double seconds) {
 
 void RunHook(void (*fn)(void*), void* arg) {
     if (!OnStageA()) {
+        fn(arg);
+        return;
+    }
+    if (H2Async()) {
+        const H2DrainScope drain{H2DrainReason::Flush};
         fn(arg);
         return;
     }

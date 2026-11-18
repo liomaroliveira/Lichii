@@ -83,6 +83,10 @@ public:
     /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
     VideoCommon::PageFilter page_filter;
 
+    [[nodiscard]] bool UseSideAMaxwell3D() const noexcept override {
+        return true;
+    }
+
     /// @brief Removes shaders inside a given region
     /// @note Checks for ranges
     /// @param addr Start address of the invalidation

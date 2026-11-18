@@ -84,6 +84,8 @@ struct TextureHandleRead {
 struct SampledTextureMemo {
     struct Entry {
         GPUVAddr handle_address{};
+        GPUVAddr tic_address{};
+        GPUVAddr tsc_address{};
         const u8* handle_host{}; ///< The handle word in host memory
         const u8* tic_host{};
         const u8* tsc_host{};

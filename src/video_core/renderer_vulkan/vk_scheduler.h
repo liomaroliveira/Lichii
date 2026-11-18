@@ -214,6 +214,14 @@ public:
         return state.graphics_pipeline;
     }
 
+    [[nodiscard]] VkFramebuffer CurrentFramebuffer() const noexcept {
+        return state.framebuffer;
+    }
+
+    [[nodiscard]] VkExtent2D CurrentRenderArea() const noexcept {
+        return state.render_area;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 

@@ -84,7 +84,7 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
                                                    macros.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
     }
-    if (VideoCommon::BackSplit::Enabled()) {
+    if (VideoCommon::BackSplit::RingEnabled()) {
         // Same defaults as the real engine; the ring's first snapshot seeds it with A's state.
         auto& shadow = payload->maxwell_3d_b.emplace(*memory_manager);
         if (g_nx2_ampere) {

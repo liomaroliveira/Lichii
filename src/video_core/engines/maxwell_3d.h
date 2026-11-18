@@ -78,7 +78,7 @@ public:
     /// E04.T6: sends a register the engine wrote without ProcessDirtyRegisters (an increment, a
     /// macro's direct write) to GPUBackB's shadow (EDEN_NX2_BACK_SPLIT=1).
     void NoteDirectWrite(u32 method) {
-        if (VideoCommon::BackSplit::Enabled() && split_shadow != nullptr) [[unlikely]] {
+        if (VideoCommon::BackSplit::RingEnabled() && split_shadow != nullptr) [[unlikely]] {
             VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method,
                                             regs.reg_array[method]);
         }
@@ -103,6 +103,9 @@ public:
     /// E04.T6 step 3, stage A before a draw or clear: the dirty flags set since the last one,
     /// which GPUBackB ORs into the shadow's (its rasterizer reads and clears those); A's reset.
     void SplitSendFlags();
+    /// E04.T12 (EDEN_NX2_H2_SPLIT=2): ships split_b_flags to maxwell_3d_b without clearing A's
+    /// dirty.flags (which TextureCache and PipelineCache read on Stage A).
+    void SplitSendFlagsH2();
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {
@@ -3280,6 +3283,7 @@ public:
         using Tables = std::array<std::array<u8, Regs::NUM_REGS>, 2>;
 
         Flags flags;
+        Flags split_b_flags;
         Tables tables{};
     } dirty;
 
@@ -3382,13 +3386,18 @@ private:
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
         }
-        if (VideoCommon::BackSplit::Enabled() && regs.reg_array[method] != argument &&
+        if (VideoCommon::BackSplit::RingEnabled() && regs.reg_array[method] != argument &&
             split_shadow != nullptr) [[unlikely]] {
             VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, argument);
         }
         regs.reg_array[method] = argument;
+        const bool h2_async = VideoCommon::BackSplit::H2Async();
         for (const auto& table : dirty.tables) {
-            dirty.flags[table[method]] = true;
+            const u8 flag = table[method];
+            dirty.flags[flag] = true;
+            if (h2_async) [[unlikely]] {
+                dirty.split_b_flags[flag] = true;
+            }
         }
     }
 

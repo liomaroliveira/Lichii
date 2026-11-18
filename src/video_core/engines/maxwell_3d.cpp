@@ -61,6 +61,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     , upload_state{memory_manager, regs.upload}
 {
     dirty.flags.flip();
+    dirty.split_b_flags.flip();
     InitializeRegisterDefaults();
     reports_fast_draw_breaks = true;
     execution_mask.reset();
@@ -752,8 +753,12 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             CallMethod(system, methods[i], arguments[i], true);
         }
         std::array<u32, 64> written;
-        if (VideoCommon::Nx2FastDraw::t_stage_a) {
-            VideoCommon::BackSplit::DrainAsync(); // GPUBackB writes the words (step 4b)
+        if (VideoCommon::BackSplit::OnStageA()) {
+            if (VideoCommon::BackSplit::H2Async()) {
+                VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Other);
+            } else {
+                VideoCommon::BackSplit::DrainAsync(); // GPUBackB writes the words (step 4b)
+            }
         }
         const bool mapped = memory_manager.IsFullyMappedRange(address + offset, bytes);
         if (mapped) {
@@ -840,7 +845,7 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         const u32 value = static_cast<u32>(write >> 32);
         // E04 back split: register blocks (#1585) bypass ProcessDirtyRegisters, so they feed
         // GPUBackB's shadow here, with the same changed-value filter.
-        if (VideoCommon::BackSplit::Enabled() && split_shadow != nullptr &&
+        if (VideoCommon::BackSplit::RingEnabled() && split_shadow != nullptr &&
             regs.reg_array[method] != value) [[unlikely]] {
             VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
         }
@@ -849,9 +854,14 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
             shadow_state.reg_array[method] = value;
         }
     }
+    const bool h2_async = VideoCommon::BackSplit::H2Async();
     for (size_t word = 0; word < flags.size(); ++word) {
         for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
-            dirty.flags[word * 64 + static_cast<size_t>(std::countr_zero(bits))] = true;
+            const size_t bit = word * 64 + static_cast<size_t>(std::countr_zero(bits));
+            dirty.flags[bit] = true;
+            if (h2_async) [[unlikely]] {
+                dirty.split_b_flags[bit] = true;
+            }
         }
     }
 }
@@ -1195,7 +1205,7 @@ void Maxwell3D::ProcessQueryCondition() {
         break;
     case Regs::RenderEnable::Override::UseRenderEnable: {
         // E04.T6 step 4d: a constant buffer upload sent to GPUBackB may not have landed.
-        if (VideoCommon::Nx2FastDraw::t_stage_a &&
+        if (VideoCommon::BackSplit::OnStageA() &&
             regs.render_enable.mode != Regs::RenderEnable::Mode::True &&
             regs.render_enable.mode != Regs::RenderEnable::Mode::False) [[unlikely]] {
             VideoCommon::BackSplit::GuardRead(condition_address, sizeof(cmp),
@@ -1361,7 +1371,7 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     // E04.T6 step 4: with the back split, stage A writes no guest memory (GPUBackB does,
     // in ring order), so constant buffer data takes SplitSendCbUpload.
-    if (VideoCommon::BackSplit::Enabled()) [[unlikely]] {
+    if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
         return false;
     }
     if (!FastDraw::Enabled()) {
@@ -1544,27 +1554,24 @@ void SplitApplyCbUpload(const u64* payload) {
 /// Stage A: sends a constant buffer upload to GPUBackB (false: not stage A, write it here).
 bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const void* data,
                        size_t bytes, bool note, bool words) {
-    if (!VideoCommon::Nx2FastDraw::t_stage_a) [[likely]] {
+    if (!VideoCommon::BackSplit::OnStageA()) [[likely]] {
         return false;
     }
     const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-    constexpr size_t MaxInline = 256;
-    alignas(8) std::array<u8, sizeof(SplitCbUploadHeader) + MaxInline> small;
-    std::vector<u8> large;
-    u8* buffer = small.data();
-    if (bytes > MaxInline) [[unlikely]] {
-        large.resize(sizeof(SplitCbUploadHeader) + bytes);
-        buffer = large.data();
+    const bool h2_async = VideoCommon::BackSplit::H2Async();
+    if (h2_async && note) {
+        // Under H2Async, FastDraw lives on Stage A: note the write ranges here without reading
+        // guest memory (which may have pending GPUBackB writes), and skip WriteData on GPUBackB.
+        VideoCommon::Nx2FastDraw::NoteWrittenData(memory, address, nullptr, bytes);
     }
+    const bool b_note = note && !h2_async;
     const SplitCbUploadHeader header{
         .memory = &memory,
         .address = address,
         .bytes = static_cast<u32>(bytes),
-        .flags = (note ? SplitCbNote : 0U) | (words ? SplitCbWords : 0U),
+        .flags = (b_note ? SplitCbNote : 0U) | (words ? SplitCbWords : 0U),
     };
-    std::memcpy(buffer, &header, sizeof(header));
-    std::memcpy(buffer + sizeof(header), data, bytes);
-    VideoCommon::BackSplit::EmitTask(&SplitApplyCbUpload, buffer, sizeof(header) + bytes);
+    VideoCommon::BackSplit::EmitTask2(&SplitApplyCbUpload, &header, sizeof(header), data, bytes);
     VideoCommon::BackSplit::NotePendingWrite(address, bytes);
     return true;
 }
@@ -1720,6 +1727,17 @@ void Maxwell3D::SplitSendFlags() {
     std::memcpy(&data[1], &dirty.flags, sizeof(dirty.flags));
     VideoCommon::BackSplit::EmitTask(&SplitApplyFlags, data.data(), sizeof(data));
     dirty.flags.reset();
+}
+
+void Maxwell3D::SplitSendFlagsH2() {
+    if (split_engine == nullptr || (!dirty.split_b_flags.any() && !g_split_all_dirty)) {
+        return;
+    }
+    std::array<u64, 1 + 4> data{};
+    std::memcpy(&data[0], &split_engine, sizeof(split_engine));
+    std::memcpy(&data[1], &dirty.split_b_flags, sizeof(dirty.split_b_flags));
+    VideoCommon::BackSplit::EmitTask(&SplitApplyFlags, data.data(), sizeof(data));
+    dirty.split_b_flags.reset();
 }
 
 void Maxwell3D::SplitSendDraw() {

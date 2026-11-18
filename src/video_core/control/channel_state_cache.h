@@ -34,7 +34,7 @@ namespace VideoCommon {
 class ChannelInfo {
 public:
     ChannelInfo() = delete;
-    explicit ChannelInfo(Tegra::Control::ChannelState& state);
+    explicit ChannelInfo(Tegra::Control::ChannelState& state, bool use_side_a = false);
     ChannelInfo(const ChannelInfo& state) = delete;
     ChannelInfo& operator=(const ChannelInfo&) = delete;
 
@@ -98,6 +98,11 @@ protected:
     mutable std::mutex config_mutex;
 
     virtual void OnGPUASRegister([[maybe_unused]] size_t map_id) {}
+    /// Under EDEN_NX2_H2_SPLIT=2, Side A caches (TextureCache, ShaderCache, RasterizerVulkan)
+    /// bind payload->maxwell_3d while Side B caches (BufferCache, QueryCache) bind maxwell_3d_b.
+    [[nodiscard]] virtual bool UseSideAMaxwell3D() const noexcept {
+        return false;
+    }
 };
 
 } // namespace VideoCommon

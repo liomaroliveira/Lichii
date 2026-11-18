@@ -9,7 +9,7 @@
 namespace VideoCommon {
 
 TextureCacheChannelInfo::TextureCacheChannelInfo(Tegra::Control::ChannelState& state) noexcept
-    : ChannelInfo(state)
+    : ChannelInfo(state, true)
 {}
 
 template class VideoCommon::ChannelSetupCaches<VideoCommon::TextureCacheChannelInfo>;

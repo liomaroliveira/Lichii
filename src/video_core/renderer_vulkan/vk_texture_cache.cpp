@@ -29,6 +29,7 @@
 #include <atomic>
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_h2_model.h"
 #include "video_core/fsr.h"
 #include "video_core/render_trace.h"
@@ -1134,6 +1135,8 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
 void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const ImageInfo& info,
                VkImageAspectFlags aspect_mask, const Settings::ResolutionScalingInfo& resolution,
                bool up_scaling = true) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     const bool is_2d = info.type == ImageType::e2D;
     auto resources = info.resources;
     resources.levels = static_cast<s32>(HostMipCount(info));
@@ -1345,18 +1348,26 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 }
 
 void TextureCacheRuntime::Finish() {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     scheduler.Finish();
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
 }
 
 StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
 void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     staging_buffer_pool.FreeDeferred(ref);
 }
 
@@ -1499,6 +1510,20 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FeedbackBreak);
+    if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
+        if (h2_end_rp_cb != nullptr) {
+            h2_end_rp_cb(h2_end_rp_arg);
+        }
+        Scheduler* const sched = &scheduler;
+        VideoCommon::BackSplit::EmitTask(
+            [](const u64* payload) {
+                Scheduler* s;
+                std::memcpy(&s, payload, sizeof(s));
+                s->RequestOutsideRenderPassOperationContext();
+            },
+            &sched, sizeof(sched));
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -1669,6 +1694,8 @@ void TextureCacheRuntime::CopyByteAddressedShadow(vk::CommandBuffer cmdbuf,
 
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -1854,6 +1881,8 @@ bool TextureCacheRuntime::UsesNvidiaDlss() const {
 
 std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
     ImageView& input, ImageView& output) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     if (!dlss_network_probe) {
         dlss_network_probe = std::make_unique<DlssNetworkProbe>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
@@ -1951,6 +1980,8 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
                                              VkImage output, VkSampler sampler) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     // Draw the result into the DLSS output, which keeps its own format; the blit leaves the
     // upscaler's output image in SHADER_READ_ONLY_OPTIMAL, so return it to GENERAL for the next
     // frame.
@@ -2078,6 +2109,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale, bool use_history) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
@@ -2313,6 +2346,8 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
     const VkImageAspectFlags aspect_mask = ImageAspectMask(src.format);
     const bool is_dst_msaa = dst.Samples() != VK_SAMPLE_COUNT_1_BIT;
@@ -2469,6 +2504,8 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     if (!dst->RenderPass()) {
         return;
     }
@@ -2598,6 +2635,8 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2719,6 +2758,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
 
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
                                         std::span<const VideoCommon::ImageCopy> copies) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2937,6 +2978,20 @@ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
 }
 
 void TextureCacheRuntime::FlushDeferredClear() {
+    if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
+        if (h2_end_rp_cb != nullptr) {
+            h2_end_rp_cb(h2_end_rp_arg);
+        }
+        Scheduler* const sched = &scheduler;
+        VideoCommon::BackSplit::EmitTask(
+            [](const u64* payload) {
+                Scheduler* s;
+                std::memcpy(&s, payload, sizeof(s));
+                s->FlushDeferredClear();
+            },
+            &sched, sizeof(sched));
+        return;
+    }
     scheduler.FlushDeferredClear();
 }
 
@@ -3177,6 +3232,8 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
     if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(
@@ -3302,6 +3359,8 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> host_copies;
     if (HostMipLevels() < static_cast<u32>(info.resources.levels)) {
         VideoCommon::AppendHostMipEntries(
@@ -3702,6 +3761,8 @@ bool Image::InitSparseTiles() {
 }
 
 bool Image::BindZeroBlock() {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     SparseLayerMemory& s = sparse_layers;
     const Device& device = runtime->device;
     const u64 tile = s.requirements.alignment;
@@ -3809,6 +3870,8 @@ bool Image::BindZeroBlock() {
 }
 
 void Image::ClearTiles() {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     scheduler->RequestOutsideRenderPassOperationContext();
     const VkImage vk_image = *original_image;
     const bool was_initialized = std::exchange(initialized, true);
@@ -3879,6 +3942,8 @@ bool Image::BackTilesWhole() {
 }
 
 bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     SparseLayerMemory& s = sparse_layers;
     if (s.allocator == nullptr) {
         return false;
@@ -4029,6 +4094,8 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
 }
 
 std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     SparseLayerMemory& s = sparse_layers;
     std::vector<u32> bound;
     if (s.layer_memory.empty()) {
@@ -5158,6 +5225,8 @@ void TextureCacheRuntime::AccelerateImageUpload(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles,
     u32 z_start, u32 z_count) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
 
     if (IsPixelFormatASTC(image.info.format)) {
         if (bc_encoder_pass && WillUseGpuBcnTranscode(device, image.info)) {
@@ -5184,12 +5253,16 @@ void TextureCacheRuntime::AccelerateImageUpload(
 void TextureCacheRuntime::AccelerateImageUploadLayers(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     const ImageInfo& info = image.info;
     const u32 width = info.size.width;
     const u32 height = info.size.height;
@@ -5331,6 +5404,8 @@ bool TextureCacheRuntime::ClearImage(Image& image) {
         return false;
     }
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
     FlushDeferredClear();
     TransitionImageLayout(image);
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -5388,6 +5463,28 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
+        if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
+            if (h2_end_rp_cb != nullptr) {
+                h2_end_rp_cb(h2_end_rp_arg);
+            }
+            struct TransitionArgs {
+                Scheduler* sched;
+                VkImageMemoryBarrier barrier;
+            };
+            const TransitionArgs args{&scheduler, barrier};
+            VideoCommon::BackSplit::EmitTask(
+                [](const u64* payload) {
+                    TransitionArgs a;
+                    std::memcpy(&a, payload, sizeof(a));
+                    a.sched->RequestOutsideRenderPassOperationContext();
+                    a.sched->Record([barrier = a.barrier](vk::CommandBuffer cmdbuf) {
+                        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier);
+                    });
+                },
+                &args, sizeof(args));
+            return;
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,

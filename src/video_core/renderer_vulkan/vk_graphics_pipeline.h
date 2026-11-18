@@ -139,10 +139,14 @@ struct KeptGraphicsStages {
     [[nodiscard]] u64 Bytes() const noexcept;
 };
 
-/// Per-draw packet produced by Side A (TextureCache/handles/image descriptors/render targets)
-/// and consumed by Side B (BufferCache/descriptor queue/scheduler) under EDEN_NX2_H2_SPLIT=1.
-struct H2DrawPacket {
+/// Trivially-copyable header of a per-draw packet produced by Side A and consumed by Side B
+/// under EDEN_NX2_H2_SPLIT=1/2 (packed directly into the A->B ring in mode 2).
+struct H2DrawPacketBase {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+    struct ImageRange {
+        u32 first{};
+        u32 second{};
+    };
 
     bool fallback_sync{};
     bool failed{};
@@ -156,9 +160,15 @@ struct H2DrawPacket {
     VideoCommon::Nx2FastDraw::Delta taken_delta{};
     std::array<f32, 2> oot_jitter{};
     FramebufferSnapshot fb_snapshot{};
-    boost::container::small_vector<DescriptorUpdateEntry, 32> image_entries;
-    std::array<std::pair<u32, u32>, NUM_STAGES> image_ranges{};
+    std::array<ImageRange, NUM_STAGES> image_ranges{};
     std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling_words{};
+};
+static_assert(std::is_trivially_copyable_v<H2DrawPacketBase>);
+
+/// Per-draw packet produced by Side A (TextureCache/handles/image descriptors/render targets)
+/// and consumed by Side B (BufferCache/descriptor queue/scheduler) under EDEN_NX2_H2_SPLIT=1/2.
+struct H2DrawPacket : H2DrawPacketBase {
+    boost::container::small_vector<DescriptorUpdateEntry, 32> image_entries;
 };
 
 class GraphicsPipeline {
@@ -515,15 +525,18 @@ public:
     /// changed), or nothing when the draw must resolve in full.
     std::optional<u32> RetextureComputed();
 
-    /// H2 split (EDEN_NX2_H2_SPLIT=1): Side A prepares TextureCache descriptors, image descriptor
+    /// H2 split (EDEN_NX2_H2_SPLIT=1/2): Side A prepares TextureCache descriptors, image descriptor
     /// entries, render targets and feedback state into `pkt`, touching neither BufferCache nor
     /// GuestDescriptorQueue nor recording Scheduler commands.
-    bool PrepareSideA(bool is_indexed, bool is_delta, bool taken_revisit, H2DrawPacket& pkt);
+    bool PrepareSideA(bool is_indexed, bool is_delta, bool taken_revisit, bool has_fragment_barrier,
+                      bool rp_has_stores, H2DrawPacket& pkt);
 
-    /// H2 split (EDEN_NX2_H2_SPLIT=1): Side B binds BufferCache state, pushes buffered image
+    /// H2 split (EDEN_NX2_H2_SPLIT=1/2): Side B binds BufferCache state, pushes buffered image
     /// descriptors to GuestDescriptorQueue and records the draw via Scheduler without touching
-    /// TextureCache or `configured_stages`.
-    bool ExecuteSideB(const H2DrawPacket& pkt);
+    /// TextureCache, `configured_stages`, or Side A's Maxwell3D.
+    bool ExecuteSideB(const H2DrawPacketBase& pkt,
+                      std::span<const DescriptorUpdateEntry> image_entries,
+                      const Tegra::Engines::Maxwell3D& m3d_b);
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
@@ -664,12 +677,13 @@ private:
     std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
     u64 kept_scale_epoch{};
     bool kept_images_valid{};
+    /// Side A only: true once the current kept_image_entries were sent to Side B in ring order.
+    bool a_sent_kept_images{};
 
     /// Side B private copy of the kept image descriptors for H2 split replay.
     std::vector<DescriptorUpdateEntry> b_kept_image_entries;
-    std::array<std::pair<u32, u32>, NUM_STAGES> b_kept_image_ranges{};
+    std::array<H2DrawPacketBase::ImageRange, NUM_STAGES> b_kept_image_ranges{};
     std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> b_kept_rescaling{};
-    bool b_kept_images_valid{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

@@ -97,6 +97,13 @@ public:
 
     void FlushDeferredClear();
 
+    /// E04.T12: callback invoked on Stage A when an async texture op ends the active render pass
+    /// on GPUBackB, so RasterizerVulkan updates H2SchedulerMirror without draining.
+    void SetH2EndRpCallback(void (*cb)(void*), void* arg) noexcept {
+        h2_end_rp_cb = cb;
+        h2_end_rp_arg = arg;
+    }
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
@@ -259,6 +266,8 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    void (*h2_end_rp_cb)(void*){};
+    void* h2_end_rp_arg{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,

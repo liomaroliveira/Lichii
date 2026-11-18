@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <type_traits>
 
 #include "video_core/control/channel_state.h"
 #include "video_core/control/channel_state_cache.h"
@@ -24,10 +25,18 @@ void ChannelSetupCaches<P>::CreateChannel(struct Tegra::Control::ChannelState& c
         if (!free_channel_ids.empty()) {
             auto id = free_channel_ids.front();
             free_channel_ids.pop_front();
-            new (&channel_storage[id]) P(channel);
+            if constexpr (std::is_constructible_v<P, Tegra::Control::ChannelState&, bool>) {
+                new (&channel_storage[id]) P(channel, UseSideAMaxwell3D());
+            } else {
+                new (&channel_storage[id]) P(channel);
+            }
             return id;
         }
-        channel_storage.emplace_back(channel);
+        if constexpr (std::is_constructible_v<P, Tegra::Control::ChannelState&, bool>) {
+            channel_storage.emplace_back(channel, UseSideAMaxwell3D());
+        } else {
+            channel_storage.emplace_back(channel);
+        }
         return channel_storage.size() - 1;
     }();
     channel_map.emplace(channel.bind_id, new_id);

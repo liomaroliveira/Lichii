@@ -42,7 +42,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     , page_table{address_space_bits, address_space_bits + page_bits - 38, page_bits != big_page_bits ? page_bits : 0}
     , kind_map{PTEKind::INVALID}, unique_identifier{unique_identifier_generator.fetch_add(1, std::memory_order_acq_rel)}
     , accumulator{}
-    , lock_accumulator{VideoCommon::BackSplit::Enabled()}
+    , lock_accumulator{VideoCommon::BackSplit::RingEnabled()}
 {
     address_space_size = 1ULL << address_space_bits;
     page_size = 1ULL << page_bits;
@@ -1185,6 +1185,9 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        VideoCommon::BackSplit::DrainAsyncH2(VideoCommon::BackSplit::H2DrainReason::Invalidation);
+    }
     // Flush from the invalidate accumulator
     std::unique_lock lock{accumulator_mutex, std::defer_lock};
     if (lock_accumulator) [[unlikely]] {

@@ -27,6 +27,7 @@
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_back_split.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/gpu_wait_stats.h"
@@ -225,7 +226,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         trace_delete_reason = aggressive_mode      ? "gc-aggressive"
                               : high_priority_mode ? "gc-high-priority"
                                                    : "gc";
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        DeleteImage(image_id, !VideoCommon::BackSplit::H2Async() && image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
         }
@@ -1049,6 +1050,17 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
     }
     // The bytes the ids came from are what they were: the handle words, then the texture and
     // sampler descriptors they select. Nothing else decides the views and samplers.
+    if (VideoCommon::BackSplit::H2Async() && VideoCommon::BackSplit::OnStageA()) [[unlikely]] {
+        for (size_t i = 0; i < handle_addresses.size(); ++i) {
+            const SampledTextureMemo::Entry& entry = memo.entries[i];
+            if (entry.handle_address != handle_addresses[i]) {
+                return false;
+            }
+            VideoCommon::BackSplit::GuardReadExact(entry.handle_address, sizeof(entry.raw));
+            VideoCommon::BackSplit::GuardReadExact(entry.tic_address, sizeof(entry.tic));
+            VideoCommon::BackSplit::GuardReadExact(entry.tsc_address, sizeof(entry.tsc));
+        }
+    }
     for (size_t i = 0; i < handle_addresses.size(); ++i) {
         const SampledTextureMemo::Entry& entry = memo.entries[i];
         if (entry.handle_address != handle_addresses[i] ||
@@ -1104,13 +1116,16 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
             sampler_index > sampler_table.current_limit) {
             return;
         }
+        const GPUVAddr tic_address = image_table.current_gpu_addr + tic_index * sizeof(TICEntry);
+        const GPUVAddr tsc_address =
+            sampler_table.current_gpu_addr + sampler_index * sizeof(TSCEntry);
         SampledTextureMemo::Entry entry{
             .handle_address = reads[i].address,
+            .tic_address = tic_address,
+            .tsc_address = tsc_address,
             .handle_host = host_of(reads[i].address, sizeof(u32)),
-            .tic_host = host_of(image_table.current_gpu_addr + tic_index * sizeof(TICEntry),
-                                sizeof(TICEntry)),
-            .tsc_host = host_of(sampler_table.current_gpu_addr + sampler_index * sizeof(TSCEntry),
-                                sizeof(TSCEntry)),
+            .tic_host = host_of(tic_address, sizeof(TICEntry)),
+            .tsc_host = host_of(tsc_address, sizeof(TSCEntry)),
             .tic = image_table.descriptors[tic_index],
             .tsc = sampler_table.descriptors[sampler_index],
             .raw = reads[i].raw,
@@ -1423,6 +1438,10 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     if (is_rescaling != rescaled) {
         flags[Dirty::RescaleViewports] = true;
         flags[Dirty::RescaleScissors] = true;
+        if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+            maxwell3d->dirty.split_b_flags[Dirty::RescaleViewports] = true;
+            maxwell3d->dirty.split_b_flags[Dirty::RescaleScissors] = true;
+        }
         is_rescaling = rescaled;
     }
 
@@ -4441,6 +4460,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    if (VideoCommon::BackSplit::H2Async()) [[unlikely]] {
+        immediate_delete = false;
+    }
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;

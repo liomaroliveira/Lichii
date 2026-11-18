@@ -465,6 +465,14 @@ u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::R
     return old_mask ^ vertex_repack_mask;
 }
 
+bool BufferCacheRuntime::WouldRepackVertex(const Tegra::Engines::Maxwell3D::Regs& regs,
+                                           bool dynamic_input) const noexcept {
+    if (!vertex_repack_pass || !VertexRepackInputSupported(dynamic_input, static_vertex_repack)) {
+        return false;
+    }
+    return VertexRepackMask(regs) != 0;
+}
+
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
     return staging_pool.Request(size, MemoryUsage::Upload);
 }
