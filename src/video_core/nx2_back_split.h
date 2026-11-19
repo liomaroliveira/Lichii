@@ -116,10 +116,9 @@ inline bool g_h2_dynamic_bypass_enabled = [] {
     return val == nullptr || (val[0] != '0');
 }();
 inline std::atomic<bool> g_h2_dynamic_bypass_active{false};
-inline thread_local bool t_h2_bypass_active{};
 
 inline bool H2DynamicBypassActive() noexcept {
-    return t_h2_bypass_active;
+    return g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
 }
 
 /// True on Stage A under H2Async() when not inside a drained C2 barrier scope.
@@ -1200,16 +1199,14 @@ inline H2BypassTransition UpdateH2BypassState(u32 rate, const char* source) {
     }
     const u32 low_thresh = g_h2_bypass_threshold;
     const u32 high_thresh = low_thresh == 65000U ? 95000U : (low_thresh * 145) / 100;
-    const bool currently_bypassed = t_h2_bypass_active;
+    const bool currently_bypassed = g_h2_dynamic_bypass_active.load(std::memory_order_relaxed);
     if (!currently_bypassed && rate < low_thresh) {
-        t_h2_bypass_active = true;
         g_h2_dynamic_bypass_active.store(true, std::memory_order_relaxed);
         g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass ACTIVATED via {} (draw_rate={}/s < {})",
                  source, rate, low_thresh);
         return H2BypassTransition::EnteredBypass;
     } else if (currently_bypassed && rate > high_thresh) {
-        t_h2_bypass_active = false;
         g_h2_dynamic_bypass_active.store(false, std::memory_order_relaxed);
         g_h2_bypass_cooldown_frames = 30;
         LOG_INFO(HW_GPU, "Nx2BackSplit H2: bypass DEACTIVATED via {} (draw_rate={}/s > {})",
@@ -1234,7 +1231,7 @@ inline H2BypassTransition NoteH2FrameDrawCount(u32 frame_draws, u64 frame_durati
 
     const H2BypassTransition transition = UpdateH2BypassState(new_rate, "FrameTick");
 
-    if (t_h2_bypass_active) {
+    if (g_h2_dynamic_bypass_active.load(std::memory_order_relaxed)) {
         g_h2_bypass_frames.fetch_add(1, std::memory_order_relaxed);
     } else {
         g_h2_split_frames.fetch_add(1, std::memory_order_relaxed);
