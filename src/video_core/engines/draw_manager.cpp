@@ -94,16 +94,18 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
     if (maxwell3d.ShouldExecute()) {
-        if (VideoCommon::BackSplit::RingEnabled() &&
-            !VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
-            const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
-            if (VideoCommon::BackSplit::Enabled()) {
-                maxwell3d.SplitSendFlags();
-            }
-            VideoCommon::BackSplit::EmitClear(layer_count);
-            if (VideoCommon::BackSplit::CheckRegs(maxwell3d.split_shadow,
-                                                    maxwell3d.regs.reg_array.data())) {
-                maxwell3d.SplitSendStateCheck();
+        if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
+            if (!VideoCommon::BackSplit::H2DynamicBypassActive()) [[likely]] {
+                const VideoCommon::Nx2Profile::SampledScope ring_scope{
+                    VideoCommon::Nx2Profile::Zone::BackSplitRing};
+                if (VideoCommon::BackSplit::Enabled()) {
+                    maxwell3d.SplitSendFlags();
+                }
+                VideoCommon::BackSplit::EmitClear(layer_count);
+                if (VideoCommon::BackSplit::CheckRegs(maxwell3d.split_shadow,
+                                                        maxwell3d.regs.reg_array.data())) {
+                    maxwell3d.SplitSendStateCheck();
+                }
             }
         }
         maxwell3d.rasterizer->Clear(layer_count);
@@ -329,7 +331,7 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
     if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
-        if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+        if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
             maxwell3d.SplitSendDrawTexture();
         } else {
             const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
@@ -375,7 +377,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
-            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+            if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
                 maxwell3d.SplitSendDraw();
             } else {
                 const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
@@ -402,7 +404,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
-            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+            if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
                 maxwell3d.SplitSendDraw();
             } else {
                 const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};

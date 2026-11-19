@@ -1066,6 +1066,12 @@ private:
 inline RingState g_state;
 
 inline void EmitReg(const void* engine, const u32* regs, u32 method, u32 argument) {
+    if (H2DynamicBypassActive()) [[unlikely]] {
+        if (method < RegCount) [[likely]] {
+            static_cast<u32*>(const_cast<void*>(engine))[method] = argument;
+        }
+        return;
+    }
     g_state.PushReg(engine, regs, method, argument);
 }
 

@@ -854,11 +854,7 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         // GPUBackB's shadow here, with the same changed-value filter.
         if (VideoCommon::BackSplit::RingEnabled() && split_shadow != nullptr &&
             regs.reg_array[method] != value) [[unlikely]] {
-            if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
-                split_shadow[method] = value;
-            } else {
-                VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
-            }
+            VideoCommon::BackSplit::EmitReg(split_shadow, regs.reg_array.data(), method, value);
         }
         regs.reg_array[method] = value;
         if (tracked) {
@@ -1391,9 +1387,10 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     // E04.T6 step 4: with the back split, stage A writes no guest memory (GPUBackB does,
     // in ring order), so constant buffer data takes SplitSendCbUpload.
-    if (VideoCommon::BackSplit::RingEnabled() &&
-        !VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
-        return false;
+    if (VideoCommon::BackSplit::RingEnabled()) [[unlikely]] {
+        if (!VideoCommon::BackSplit::H2DynamicBypassActive()) [[likely]] {
+            return false;
+        }
     }
     if (!FastDraw::Enabled()) {
         return false;
@@ -1575,8 +1572,10 @@ void SplitApplyCbUpload(const u64* payload) {
 /// Stage A: sends a constant buffer upload to GPUBackB (false: not stage A, write it here).
 bool SplitSendCbUpload(Tegra::MemoryManager& memory, GPUVAddr address, const void* data,
                        size_t bytes, bool note, bool words) {
-    if (!VideoCommon::BackSplit::OnStageA() ||
-        VideoCommon::BackSplit::H2DynamicBypassActive()) [[likely]] {
+    if (!VideoCommon::BackSplit::OnStageA()) [[likely]] {
+        return false;
+    }
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         return false;
     }
     const VideoCommon::Nx2Profile::SampledScope ring_scope{VideoCommon::Nx2Profile::Zone::BackSplitRing};
@@ -1723,7 +1722,7 @@ void SplitApplyStateCheck(const u64* payload) {
         ring.b_bad_state_total.fetch_add(1, std::memory_order_relaxed);
     }
 }
-void CopyDrawStateInPlace(Maxwell3D& dst, const Maxwell3D& src) {
+[[gnu::noinline]] void CopyDrawStateInPlace(Maxwell3D& dst, const Maxwell3D& src) {
     const auto& s = src.draw_manager.draw_state;
     auto& d = dst.draw_manager.draw_state;
     d.topology = s.topology;
@@ -1744,7 +1743,7 @@ void CopyDrawStateInPlace(Maxwell3D& dst, const Maxwell3D& src) {
 } // Anonymous namespace
 
 void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& buffer) {
-    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         if (split_engine != nullptr) {
             split_engine->state.shader_stages[stage].const_buffers[slot] = buffer;
         }
@@ -1762,7 +1761,7 @@ void Maxwell3D::SplitSendCbBind(size_t stage, u32 slot, const ConstBufferInfo& b
 }
 
 void Maxwell3D::SplitSendRootLoad(u32 table, u32 index, u32 value) {
-    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         if (split_engine != nullptr) {
             split_engine->root_tables.tables[table][index] = value;
             split_engine->root_tables.loaded = true;
@@ -1788,7 +1787,7 @@ void Maxwell3D::SplitSendFlagsH2() {
     if (split_engine == nullptr || (!dirty.split_b_flags.any() && !g_split_all_dirty)) {
         return;
     }
-    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         if (g_split_all_dirty) [[unlikely]] {
             split_engine->dirty.flags.set();
         } else {
@@ -1831,7 +1830,7 @@ void Maxwell3D::SplitSendDraw() {
     if (split_engine == nullptr) {
         return;
     }
-    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         CopyDrawStateInPlace(*split_engine, *this);
         return;
     }
@@ -1879,7 +1878,7 @@ void Maxwell3D::SplitSendDrawTexture() {
     if (split_engine == nullptr) {
         return;
     }
-    if (VideoCommon::BackSplit::H2DynamicBypassActive()) {
+    if (VideoCommon::BackSplit::H2DynamicBypassActive()) [[unlikely]] {
         split_engine->draw_manager.draw_texture_state = draw_manager.draw_texture_state;
         return;
     }
