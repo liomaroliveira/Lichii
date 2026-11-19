@@ -2633,10 +2633,120 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
     }
 }
 
+namespace {
+struct CopyImageTaskArgs {
+    Scheduler* scheduler;
+    VkImage dst_image;
+    VkImage src_image;
+    VkImageAspectFlags aspect_mask;
+    u32 num_copies;
+};
+static_assert(sizeof(CopyImageTaskArgs) % 8 == 0);
+static_assert(std::is_trivially_copyable_v<CopyImageTaskArgs>);
+
+void RecordCopyImage(Scheduler& scheduler, VkImage dst_image, VkImage src_image,
+                     VkImageAspectFlags aspect_mask,
+                     boost::container::small_vector<VkImageCopy, 16> vk_copies) {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record(
+        [dst_image, src_image, aspect_mask, vk_copies = std::move(vk_copies)](
+            vk::CommandBuffer cmdbuf) {
+            RangedBarrierRange dst_range;
+            RangedBarrierRange src_range;
+            for (const VkImageCopy& copy : vk_copies) {
+                dst_range.AddLayers(copy.dstSubresource);
+                src_range.AddLayers(copy.srcSubresource);
+            }
+            const std::array pre_barriers{
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = src_image,
+                    .subresourceRange = src_range.SubresourceRange(aspect_mask),
+                },
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = dst_image,
+                    .subresourceRange = dst_range.SubresourceRange(aspect_mask),
+                },
+            };
+            const std::array post_barriers{
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = 0,
+                    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = src_image,
+                    .subresourceRange = src_range.SubresourceRange(aspect_mask),
+                },
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = dst_image,
+                    .subresourceRange = dst_range.SubresourceRange(aspect_mask),
+                },
+            };
+            cmdbuf.PipelineBarrier(
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, nullptr, pre_barriers);
+            cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk_copies);
+            cmdbuf.PipelineBarrier(
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, nullptr, nullptr, post_barriers);
+        });
+}
+
+void ExecuteH2CopyImageOnB(const u64* payload) {
+    CopyImageTaskArgs args;
+    std::memcpy(&args, payload, sizeof(args));
+    boost::container::small_vector<VkImageCopy, 16> vk_copies(args.num_copies);
+    std::memcpy(vk_copies.data(), reinterpret_cast<const u8*>(payload) + sizeof(args),
+                static_cast<size_t>(args.num_copies) * sizeof(VkImageCopy));
+    RecordCopyImage(*args.scheduler, args.dst_image, args.src_image, args.aspect_mask,
+                    std::move(vk_copies));
+}
+} // Anonymous namespace
+
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
-    const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::TexOp};
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2672,88 +2782,22 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
     VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexCacheSched);
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
-        RangedBarrierRange dst_range;
-        RangedBarrierRange src_range;
-        for (const VkImageCopy& copy : vk_copies) {
-            dst_range.AddLayers(copy.dstSubresource);
-            src_range.AddLayers(copy.srcSubresource);
-        }
-        const std::array pre_barriers{
-            VkImageMemoryBarrier{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = src_image,
-                .subresourceRange = src_range.SubresourceRange(aspect_mask),
-            },
-            VkImageMemoryBarrier{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = dst_image,
-                .subresourceRange = dst_range.SubresourceRange(aspect_mask),
-            },
+    if (VideoCommon::BackSplit::UseH2AsyncQueue()) [[unlikely]] {
+        const CopyImageTaskArgs args{
+            .scheduler = &scheduler,
+            .dst_image = dst_image,
+            .src_image = src_image,
+            .aspect_mask = aspect_mask,
+            .num_copies = static_cast<u32>(vk_copies.size()),
         };
-        const std::array post_barriers{
-            VkImageMemoryBarrier{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = 0,
-                .dstAccessMask = 0,
-                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = src_image,
-                .subresourceRange = src_range.SubresourceRange(aspect_mask),
-            },
-            VkImageMemoryBarrier{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = dst_image,
-                .subresourceRange = dst_range.SubresourceRange(aspect_mask),
-            },
-        };
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, pre_barriers);
-        cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk_copies);
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, post_barriers);
-    });
+        VideoCommon::BackSplit::EmitTask2(&ExecuteH2CopyImageOnB, &args, sizeof(args),
+                                          vk_copies.data(),
+                                          vk_copies.size() * sizeof(VkImageCopy));
+        return;
+    }
+    const VideoCommon::BackSplit::H2DrainScope h2_drain{
+        VideoCommon::BackSplit::H2DrainReason::TexOp};
+    RecordCopyImage(scheduler, dst_image, src_image, aspect_mask, std::move(vk_copies));
 }
 
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
