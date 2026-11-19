@@ -867,6 +867,7 @@ private:
     u32 h2_frame_draws{0};
     std::chrono::steady_clock::time_point h2_last_frame_time{};
     std::atomic<bool> h2_has_deferred_invals{false};
+    std::atomic<u32> h2_b_fence_pending{0};
     std::mutex h2_inval_mutex;
     std::vector<std::pair<DAddr, std::size_t>> h2_deferred_tex_invals;
     std::vector<std::pair<DAddr, std::size_t>> h2_deferred_pipe_invals;
