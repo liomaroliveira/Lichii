@@ -1163,7 +1163,7 @@ inline void DrainAsync() {
 
 /// Stage A under EDEN_NX2_H2_SPLIT=2: drains GPUBackB and accounts the barrier reason.
 inline void DrainAsyncH2(H2DrainReason reason) {
-    if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
+    if (H2Async() && OnStageA()) [[unlikely]] {
         if (g_state.WritePosition() != g_state.DrainedPosition()) {
             ++g_h2_drain_reasons[static_cast<size_t>(reason)];
             g_state.DrainAsync();
@@ -1245,7 +1245,9 @@ struct H2DrainScope {
     bool active{};
 
     explicit H2DrainScope(H2DrainReason reason) {
-        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
+        if (H2Async() && OnStageA() &&
+            (!H2DynamicBypassActive() ||
+             g_state.WritePosition() != g_state.DrainedPosition())) [[unlikely]] {
             DrainAsyncH2(reason);
             ++t_h2_drained_depth;
             active = true;
@@ -1256,7 +1258,9 @@ struct H2DrainScope {
     /// can be elided (e.g. SkipEmptyFence fast-path), but the scope must still prevent GPUBackB
     /// from enqueuing new tasks while the synchronous operation runs on Stage A.
     explicit H2DrainScope(H2DrainReason reason, bool do_drain) {
-        if (H2Async() && OnStageA() && !H2DynamicBypassActive()) [[unlikely]] {
+        if (H2Async() && OnStageA() &&
+            (!H2DynamicBypassActive() ||
+             g_state.WritePosition() != g_state.DrainedPosition())) [[unlikely]] {
             if (do_drain) {
                 DrainAsyncH2(reason);
             }

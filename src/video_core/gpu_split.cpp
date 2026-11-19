@@ -957,7 +957,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     // while this thread sleeps would never wake).
     const bool split_consumed = VideoCommon::BackSplit::RingEnabled();
     const auto store_consumed = [&](u64 position) {
-        if (split_consumed) [[unlikely]] {
+        if (split_consumed &&
+            (!VideoCommon::BackSplit::H2DynamicBypassActive() ||
+             VideoCommon::BackSplit::g_state.WritePosition() !=
+                 VideoCommon::BackSplit::g_state.DrainedPosition())) [[unlikely]] {
             struct Mark {
                 GpuSplit* split;
                 u64 position;
