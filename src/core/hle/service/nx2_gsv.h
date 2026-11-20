@@ -701,7 +701,7 @@ private:
                 FreeBackings(std::move(freed));
             }
             auto backing = back_whole ? AllocateGpuOnlyBacking(size, true, false) : std::nullopt;
-            std::scoped_lock lk{m_region_mutex};
+            std::unique_lock lk{m_region_mutex};
             // A title may create the same region again from the same start with a different size,
             // without 215 (Mario Kart World walks 300 MB -> 600 MB -> 1 GB on the same address):
             // the earlier region goes first, as 215 would drop it. Here, on the service thread:
@@ -715,7 +715,15 @@ private:
                 old_size = whole->second.size;
             }
             if (old_size != 0) {
+                // Ensure GPU (both Stage A and GPUBackB in H2 architecture) has completed all
+                // pending commands referencing the old region before unmapping physical pages.
+                system.GPU().WaitForIdle();
+                const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer_destroy;
                 DestroyRegion(start, start + old_size - 1);
+                auto freed_old = TakeReleasedRegions();
+                lk.unlock();
+                FreeBackings(std::move(freed_old));
+                lk.lock();
             }
             if ((w[7] & SparseRegionFlag) == 0) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
