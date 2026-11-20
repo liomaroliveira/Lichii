@@ -124,6 +124,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    std::scoped_lock lock{pool_mutex};
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }
@@ -131,6 +132,7 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+    std::scoped_lock lock{pool_mutex};
     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
     const auto is_this_one = [&ref](const StagingBuffer& entry) {
         return entry.index == ref.index;
@@ -143,6 +145,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
+    std::scoped_lock lock{pool_mutex};
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
@@ -285,6 +288,7 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
 }
 
 u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
+    std::scoped_lock lock{pool_mutex};
     u64 bytes{};
     const StagingBuffersCache& cache = GetCache(usage);
     for (size_t level = 0; level < NUM_LEVELS; ++level) {

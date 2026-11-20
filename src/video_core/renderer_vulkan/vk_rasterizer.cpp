@@ -584,11 +584,139 @@ void RasterizerVulkan::ExecuteH2DrawTask(const H2DrawTaskHeader& task,
                                          std::span<const DescriptorUpdateEntry> image_entries,
                                          std::span<const H2TexBufferBind> tex_buffers) {
     namespace Profile = VideoCommon::Nx2Profile;
+    SCOPE_EXIT {
+        ReleaseMeshEmulationBuffers();
+    };
     if (task.gpu_memory != nullptr) {
         task.gpu_memory->FlushCaching();
     }
     auto* const m3d_b = H2SideBMaxwell3D();
     Tegra::Engines::Maxwell3D::ApplySplitBFlags(*m3d_b, task.split_b_flags);
+    mesh_draw = task.is_mesh_draw;
+    mesh_emulation_groups = 0;
+    mesh_emulation_vertices_per_group = 0;
+    if (task.is_mesh_draw && task.pipeline->IsEmulatedMesh()) {
+        const auto& draw_state{m3d_b->draw_manager.draw_state};
+        const u32 groups{(std::min)(
+            MakeDrawParams(draw_state, 1, task.pkt.is_indexed).num_vertices,
+            device.GetMaxComputeWorkGroupCount()[0])};
+        {
+            static u64 draws{}, empty{}, total_groups{}, frames{}, frames_drawn{};
+            static u64 last_frame{~0ULL};
+            static bool frame_drawn{};
+            if (task.render_trace_frame != last_frame) {
+                if (last_frame != ~0ULL) {
+                    ++frames;
+                    frames_drawn += frame_drawn;
+                }
+                last_frame = task.render_trace_frame;
+                frame_drawn = false;
+            }
+            ++draws;
+            empty += groups == 0;
+            total_groups += groups;
+            frame_drawn |= groups != 0;
+            if (draws % 2000 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Mesh emulation draws: {} ({} with no groups), {} groups; frames with "
+                         "emulated draws: {} of {}",
+                         draws, empty, total_groups, frames_drawn, frames);
+            }
+        }
+        if (mesh_probe.pending && scheduler.IsFree(mesh_probe.tick)) {
+            ReadMeshEmulationProbe();
+        }
+        static const bool probe{std::getenv("EDEN_NX2_MESH_EMULATION_PROBE") != nullptr};
+        const bool has_task{task.pipeline->MeshEmulationHasTask()};
+        const bool probe_draw{probe && !has_task && !mesh_probe.pending && groups != 0 &&
+                              task.render_trace_frame % 60 == 0};
+        const u64 block_bytes{task.pipeline->MeshEmulationBlockBytes()};
+        StagingBufferRef output{};
+        u64 bytes{};
+        if (has_task) {
+            const MeshArena& arena{AcquireMeshArena()};
+            mesh_arena_used = true;
+            bytes = arena.size;
+            task.pipeline->SetMeshEmulationOutput(*arena.buffer, 0, bytes, groups);
+        } else {
+            bytes = (std::max)(u64{groups} * block_bytes, u64{4});
+            output = staging_pool.Request(
+                bytes, probe_draw ? MemoryUsage::Download : MemoryUsage::DeviceLocal, true);
+            mesh_draw_buffers.push_back(output);
+            task.pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
+        }
+        mesh_emulation_indirect = {};
+        if (mesh_task_probe.pending && scheduler.IsFree(mesh_task_probe.tick)) {
+            mesh_task_probe.pending = false;
+            std::array<u32, Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS> words{};
+            std::memcpy(words.data(), mesh_task_probe.args.data(), sizeof(words));
+            LOG_INFO(Render_Vulkan,
+                     "Mesh emulation task probe: {} tasks asked for {} mesh workgroups, {} "
+                     "dispatched at arena word {} (arena {} words)",
+                     mesh_task_probe.tasks,
+                     words[Shader::Backend::SPIRV::MESH_EMULATION_ARGS_REQUESTED], words[0],
+                     words[Shader::Backend::SPIRV::MESH_EMULATION_ARGS_BASE],
+                     mesh_task_probe.capacity);
+        }
+        if (has_task && groups != 0) {
+            const bool task_probe{probe && !mesh_task_probe.pending &&
+                                  task.render_trace_frame % 60 == 0};
+            const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
+                size = (std::max)(size, u64{16});
+                const StagingBufferRef ref{staging_pool.Request(size, usage, true)};
+                mesh_draw_buffers.push_back(ref);
+                return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
+                                                                            size},
+                                      ref.mapped_span.subspan(
+                                          (std::min)(ref.offset, u64{ref.mapped_span.size()})));
+            };
+            const auto payload{
+                request(u64{groups} * task.pipeline->MeshEmulationPayloadStride() * 4).first};
+            const auto offsets{request(u64{groups} * 4).first};
+            constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
+            const auto [args, args_span] =
+                request(args_bytes, task_probe ? MemoryUsage::Download : MemoryUsage::DeviceLocal);
+            const u32 capacity_words{static_cast<u32>(
+                (std::min)(bytes / 4, u64{(std::numeric_limits<u32>::max)()}))};
+            if (task_probe && args_span.size() >= args_bytes) {
+                mesh_task_probe = {
+                    .args = args_span,
+                    .tick = scheduler.CurrentTick(),
+                    .tasks = groups,
+                    .capacity = capacity_words,
+                    .pending = true,
+                };
+            }
+            const MeshArena& arena{mesh_arenas[mesh_arena_current]};
+            task.pipeline->SetMeshEmulationTaskBuffers(
+                payload, offsets, args, {*arena.counter, 0, sizeof(u32)}, capacity_words);
+            mesh_emulation_indirect = {args.buffer, args.offset};
+        }
+        if (probe_draw && output.mapped_span.size() >= output.offset + bytes) {
+            const MeshEmulationSetup& setup{*task.pipeline->MeshEmulation()};
+            mesh_probe = {
+                .data = output.mapped_span.subspan(output.offset, bytes),
+                .tick = scheduler.CurrentTick(),
+                .frame = task.render_trace_frame,
+                .groups = groups,
+                .block_words = setup.block_words,
+                .vertex_lines = setup.vertex_lines,
+                .max_vertices = setup.max_vertices,
+                .max_primitives = setup.max_primitives,
+                .primitive_vertices = setup.primitive_vertices,
+                .position_lines = setup.position_lines,
+                .pending = true,
+            };
+        } else if (probe_draw && output.mapped_span.empty()) {
+            static bool warned{};
+            if (!warned) {
+                warned = true;
+                LOG_WARNING(Render_Vulkan, "Mesh emulation probe: output buffer is not mapped");
+            }
+        }
+        mesh_emulation_groups = groups;
+        mesh_emulation_vertices_per_group = task.pipeline->MeshEmulationVerticesPerGroup();
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex};
         {
@@ -637,14 +765,38 @@ void RasterizerVulkan::ExecuteH2DrawTask(const H2DrawTaskHeader& task,
             const auto& draw_state = m3d_b->draw_manager.draw_state;
             const DrawParams draw_params{
                 MakeDrawParams(draw_state, task.instance_count, task.pkt.is_indexed)};
-            if (task.is_mesh_draw) {
+            if (task.is_mesh_draw && mesh_emulation_vertices_per_group != 0) {
+                const u32 vertices{mesh_emulation_groups * mesh_emulation_vertices_per_group};
+                if (vertices != 0) {
+                    if (mesh_emulation_indirect.buffer) {
+                        scheduler.Record(
+                            [this, indirect = mesh_emulation_indirect](vk::CommandBuffer cmdbuf) {
+                                if (scheduler.GraphicsPipelineMissing()) {
+                                    return;
+                                }
+                                cmdbuf.DrawIndirect(
+                                    indirect.buffer,
+                                    indirect.offset +
+                                        Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET,
+                                    1, 0);
+                            });
+                    } else {
+                        scheduler.Record([this, vertices](vk::CommandBuffer cmdbuf) {
+                            if (scheduler.GraphicsPipelineMissing()) {
+                                return;
+                            }
+                            cmdbuf.Draw(vertices, 1, 0, 0);
+                        });
+                    }
+                }
+            } else if (task.is_mesh_draw && device.IsExtMeshShaderSupported()) {
                 scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                     if (scheduler.GraphicsPipelineMissing()) {
                         return;
                     }
                     cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
                 });
-            } else {
+            } else if (!task.is_mesh_draw) {
                 scheduler.Record(
                     [this, draw_params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
                         if (scheduler.GraphicsPipelineMissing()) {
@@ -1789,6 +1941,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         gpu.TickWork();
     };
     bool submitted = false;
+    bool h2_async_dispatched = false;
     SCOPE_EXIT {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
@@ -1803,7 +1956,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     };
     SCOPE_EXIT {
-        ReleaseMeshEmulationBuffers();
+        if (!h2_async_dispatched) {
+            ReleaseMeshEmulationBuffers();
+        }
     };
     namespace Profile = VideoCommon::Nx2Profile;
     namespace FastDraw = VideoCommon::Nx2FastDraw;
@@ -1950,9 +2105,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // Mesh emulation: one output block per mesh workgroup, written by the pipeline's compute
     // dispatch and drawn as groups * vertices-per-group triangle list vertices.
+    const bool use_h2_split =
+        VideoCommon::Nx2H2SplitEnabled() && !frame_dump.Capturing();
+    const bool use_h2_async = use_h2_split && VideoCommon::BackSplit::UseH2AsyncQueue() &&
+                              !is_indirect && !fast_draw_verify && reuse_start == 0 &&
+                              !DrawRepeatEnabled();
     mesh_emulation_groups = 0;
     mesh_emulation_vertices_per_group = 0;
-    if (emulated_mesh) {
+    if (emulated_mesh && !use_h2_async) {
         // The same group count the native path hands vkCmdDrawMeshTasksEXT (MakeDrawParams:
         // the index count for indexed draws), within the device's dispatch limit.
         const auto& draw_state{maxwell3d->draw_manager.draw_state};
@@ -2082,13 +2242,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
-    const bool use_h2_split =
-        VideoCommon::Nx2H2SplitEnabled() && !pipeline->HasMeshEmulation() && !frame_dump.Capturing();
-    const bool use_h2_async = use_h2_split && VideoCommon::BackSplit::UseH2AsyncQueue() &&
-                              !is_indirect && !fast_draw_verify && reuse_start == 0 &&
-                              !DrawRepeatEnabled();
 
     if (use_h2_async) {
+        h2_async_dispatched = true;
         std::unique_lock tex_lock{texture_cache.mutex};
         FlushH2DeferredInvalidations(false);
         const u64 draw_serial = FastDraw::Serial();
@@ -2202,7 +2358,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
         }
 
-        if (maxwell3d->regs.transform_feedback_enabled != 0 || pkt.feedback_break) {
+        if (maxwell3d->regs.transform_feedback_enabled != 0 || pkt.feedback_break ||
+            emulated_mesh) {
             h2_mirror.EndRP();
         }
         h2_mirror.RequestRP(pkt.fb_snapshot);

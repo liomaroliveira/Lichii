@@ -1860,12 +1860,8 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
     pkt.image_ranges = {};
     pkt.rescaling_words = {};
 
-    if (mesh_emulation) {
-        pkt.fallback_sync = true;
-        return true;
-    }
-
     if (is_delta) {
+        ASSERT(!mesh_emulation);
         pkt.unbind_tex_buffers = taken_revisit;
 
         const bool kept_usable = kept_images_valid &&
@@ -2278,7 +2274,7 @@ bool GraphicsPipeline::PrepareSideA(bool is_indexed, bool is_delta, bool taken_r
         kept_image_ranges = {};
     }
 
-    if (uses_texture_or_image_buffers) {
+    if (uses_texture_or_image_buffers && !mesh_emulation) {
         const VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
         for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
             if (!immutable_enabled_stages[stage]) {
@@ -2510,6 +2506,23 @@ bool GraphicsPipeline::ExecuteSideB(const H2DrawPacketBase& pkt,
             const bool clip_set = clip_width != 0 && clip_height != 0;
             render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }
+
+    if (mesh_emulation) {
+        if (!mesh_output_buffer) {
+            return false;
+        }
+        guest_descriptor_queue.AddBuffer(mesh_output_buffer, mesh_output_offset, mesh_output_size);
+        if (mesh_emulation->has_task) {
+            for (size_t index = 0; index < 3; ++index) { // payload, offsets, arguments
+                const MeshEmulationBuffer& task_buffer{mesh_task_buffers[index]};
+                if (!task_buffer.buffer) {
+                    return false;
+                }
+                guest_descriptor_queue.AddBuffer(task_buffer.buffer, task_buffer.offset,
+                                                 task_buffer.size);
+            }
         }
     }
 
