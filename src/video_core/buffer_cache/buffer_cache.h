@@ -583,12 +583,24 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             land(nullptr);
         } else {
             auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
+            runtime.PreCopyBarrier();
+            boost::container::small_vector<BufferCopy, 16> batch;
+            BufferId batch_id{};
             for (Download& download : staged) {
                 download.copy.dst_offset += staging.offset;
                 Buffer& buffer = slot_buffers[download.buffer_id];
                 buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-                runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
+                if (!batch.empty() && download.buffer_id != batch_id) {
+                    runtime.CopyBuffer(staging.buffer, slot_buffers[batch_id], batch, false);
+                    batch.clear();
+                }
+                batch_id = download.buffer_id;
+                batch.push_back(download.copy);
             }
+            if (!batch.empty()) {
+                runtime.CopyBuffer(staging.buffer, slot_buffers[batch_id], batch, false);
+            }
+            runtime.PostDownloadBarrier();
             if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
             } else {
@@ -809,19 +821,31 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
         }
         if (!copies.empty()) {
             auto staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+            runtime.PreCopyBarrier();
+            boost::container::small_vector<BufferCopy, 16> batch;
+            BufferId batch_id{};
             for (Copy& entry : copies) {
                 Buffer& buffer = slot_buffers[entry.buffer_id];
                 entry.copy.dst_offset += staging.offset;
                 buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
                 // Mapped buffers too: the GPU thread's later work may write them before the copy
                 // is read.
-                runtime.CopyBuffer(staging.buffer, buffer, std::span{&entry.copy, 1}, true);
+                if (!batch.empty() && entry.buffer_id != batch_id) {
+                    runtime.CopyBuffer(staging.buffer, slot_buffers[batch_id], batch, false);
+                    batch.clear();
+                }
+                batch_id = entry.buffer_id;
+                batch.push_back(entry.copy);
                 download.copies.push_back(BufferCopy{
                     .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
                     .dst_offset = entry.copy.dst_offset,
                     .size = entry.copy.size,
                 });
             }
+            if (!batch.empty()) {
+                runtime.CopyBuffer(staging.buffer, slot_buffers[batch_id], batch, false);
+            }
+            runtime.PostDownloadBarrier();
             download.staging = staging;
         }
         if constexpr (HAS_READ_TRACE) {
@@ -835,11 +859,19 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
             // The same bytes again, from the same point of the GPU's work: what a synchronous
             // flush would have written.
             check->staging = runtime.DownloadStagingBuffer(check_size, true);
+            runtime.PreCopyBarrier();
+            boost::container::small_vector<BufferCopy, 16> batch;
+            BufferId batch_id{};
             for (Copy& entry : check_copies) {
                 Buffer& buffer = slot_buffers[entry.buffer_id];
                 entry.copy.dst_offset += check->staging.offset;
                 buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
-                runtime.CopyBuffer(check->staging.buffer, buffer, std::span{&entry.copy, 1}, true);
+                if (!batch.empty() && entry.buffer_id != batch_id) {
+                    runtime.CopyBuffer(check->staging.buffer, slot_buffers[batch_id], batch, false);
+                    batch.clear();
+                }
+                batch_id = entry.buffer_id;
+                batch.push_back(entry.copy);
                 check->copies.push_back(BufferCopy{
                     .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
                     .dst_offset = entry.copy.dst_offset,
@@ -849,6 +881,10 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
                     check->own.Add(buffer.CpuAddr() + entry.copy.src_offset, entry.copy.size);
                 }
             }
+            if (!batch.empty()) {
+                runtime.CopyBuffer(check->staging.buffer, slot_buffers[batch_id], batch, false);
+            }
+            runtime.PostDownloadBarrier();
             if (!check->kept.Empty()) {
                 check->landed_bytes.resize(check_size);
             }

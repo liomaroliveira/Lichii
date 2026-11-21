@@ -795,6 +795,24 @@ void BufferCacheRuntime::PostCopyBarrier() {
     });
 }
 
+void BufferCacheRuntime::PostDownloadBarrier() {
+    static constexpr VkMemoryBarrier HOST_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        // Execution-only WAR barrier so later GPU writes to src_buffer wait for CopyBuffer read
+        // without invalidating L1/L2 shader caches, plus host read visibility for staging.
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, {}, {}, {});
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_BARRIER);
+    });
+}
+
 void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value) {
     if (dest_buffer == VK_NULL_HANDLE) {
         return;

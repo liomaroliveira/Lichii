@@ -210,6 +210,8 @@ public:
 
     void PostCopyBarrier();
 
+    void PostDownloadBarrier();
+
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
