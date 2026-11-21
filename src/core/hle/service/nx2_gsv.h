@@ -810,6 +810,10 @@ private:
             rb.Push(ResultSuccess);
             return;
         }
+        // Ensure GPU (both Stage A and GPUBackB in H2 architecture) has completed all
+        // pending commands referencing the region before unmapping physical pages.
+        system.GPU().WaitForIdle();
+
         const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
         std::vector<GpuOnlyRegion> freed;
         SCOPE_EXIT {

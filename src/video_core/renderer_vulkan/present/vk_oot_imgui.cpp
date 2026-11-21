@@ -348,29 +348,6 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         });
     } else {
         ImGui::SetCurrentContext(ctx);
-        if (!fonts_from_romfs_ && !Common::OotMenu::Bridge::Instance().CopyRomFsBodyFont().empty() &&
-            !Common::OotMenu::Bridge::Instance().CopyRomFsStrongFont().empty() &&
-            !Common::OotMenu::Bridge::Instance().CopyRomFsHeadingFont().empty()) {
-            // Destroy old ImGui font textures safely at idle before rebuilding atlas with RomFS fonts
-            (void)device.GetLogical().WaitIdle();
-            for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
-                if (tex != game_icon_.get()) {
-                    continue;
-                }
-                if (tex->TexID != ImTextureID_Invalid) {
-                    auto* gpu_tex = static_cast<GpuTex*>(tex->BackendUserData);
-                    if (gpu_tex && gpu_tex->ds != VK_NULL_HANDLE && backend_ready_) {
-                        ImGui_ImplVulkan_RemoveTexture(gpu_tex->ds);
-                        gpu_tex->ds = VK_NULL_HANDLE;
-                    }
-                    tex->SetTexID(ImTextureID_Invalid);
-                    tex->SetStatus(ImTextureStatus_Destroyed);
-                    tex->BackendUserData = nullptr;
-                }
-            }
-            live_textures_.clear();
-            BuildFontAtlas();
-        }
     }
 
     if (!render_pass_ || render_pass_format_ != swapchain_format) {
