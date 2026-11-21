@@ -979,10 +979,14 @@ private:
         if (kind == SnapshotCheck) {
             b_checks.fetch_add(1, std::memory_order_relaxed);
             b_checks_total.fetch_add(1, std::memory_order_relaxed);
-            if (std::memcmp(shadow, a_regs, RegCount * sizeof(u32)) != 0) [[unlikely]] {
+            constexpr u32 CbDataBegin = 0x8e4;
+            constexpr u32 CbDataEnd = 0x8f4;
+            if (std::memcmp(shadow, a_regs, CbDataBegin * sizeof(u32)) != 0 ||
+                std::memcmp(shadow + CbDataEnd, a_regs + CbDataEnd,
+                            (RegCount - CbDataEnd) * sizeof(u32)) != 0) [[unlikely]] {
                 u32 bad = 0;
                 for (u32 reg = 0; reg < RegCount; ++reg) {
-                    if (shadow[reg] == a_regs[reg]) {
+                    if (shadow[reg] == a_regs[reg] || (reg >= CbDataBegin && reg < CbDataEnd)) {
                         continue;
                     }
                     ++bad;
@@ -996,9 +1000,11 @@ private:
                                     a_regs[reg], shadow[reg]);
                     }
                 }
-                b_bad_checks.fetch_add(1, std::memory_order_relaxed);
-                b_bad_checks_total.fetch_add(1, std::memory_order_relaxed);
-                b_bad_regs.fetch_add(bad, std::memory_order_relaxed);
+                if (bad != 0) {
+                    b_bad_checks.fetch_add(1, std::memory_order_relaxed);
+                    b_bad_checks_total.fetch_add(1, std::memory_order_relaxed);
+                    b_bad_regs.fetch_add(bad, std::memory_order_relaxed);
+                }
             }
         }
         std::memcpy(shadow, a_regs, RegCount * sizeof(u32));
