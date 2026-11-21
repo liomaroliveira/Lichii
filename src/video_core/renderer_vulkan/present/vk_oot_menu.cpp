@@ -2263,7 +2263,7 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
     {
         float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
         float x = c.safe;
-        if (c.has_game_icon && room > hh) {
+        if (c.has_game_icon && c.game_icon.GetTexID() != 0 && room > hh) {
             const float side = hh - 14.0f * s;
             const ImVec2 p0{x, (hh - 3.0f * s - side) * 0.5f};
             c.d->AddImageRounded(c.game_icon, p0, ImVec2(p0.x + side, p0.y + side), ImVec2(0, 0),

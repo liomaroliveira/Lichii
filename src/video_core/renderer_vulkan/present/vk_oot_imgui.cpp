@@ -559,10 +559,12 @@ void OotOverlay::SyncGameInfo() {
 }
 
 void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
-    if (!draw_data || !draw_data->Textures) {
+    ImVector<ImTextureData*>* tex_vec =
+        draw_data && draw_data->Textures ? draw_data->Textures : &ImGui::GetPlatformIO().Textures;
+    if (!tex_vec) {
         return;
     }
-    for (ImTextureData* tex : *draw_data->Textures) {
+    for (ImTextureData* tex : *tex_vec) {
         if (tex->Status == ImTextureStatus_OK) {
             continue;
         }
@@ -784,6 +786,7 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     io.DeltaTime = dt;
 
     SyncGameInfo(); // before NewFrame, which gathers the user textures
+    UploadTextures(cmdbuf, nullptr);
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 
@@ -802,8 +805,12 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     const bool nintendo_pad = (opts.pad_layout == static_cast<int>(Common::OotMenu::PadLayout::Nintendo));
     ui_ctx.confirm_dot = nintendo_pad ? 1 : 3;
     ui_ctx.back_dot = nintendo_pad ? 3 : 1;
-    ui_ctx.has_game_icon = game_icon_ != nullptr;
-    if (game_icon_) {
+    const bool icon_ready = game_icon_ != nullptr &&
+                            game_icon_->Status == ImTextureStatus_OK &&
+                            game_icon_->GetTexID() != ImTextureID_Invalid &&
+                            game_icon_->GetTexID() != 0;
+    ui_ctx.has_game_icon = icon_ready;
+    if (icon_ready) {
         ui_ctx.game_icon = game_icon_->GetTexRef();
     }
     ui_ctx.game_title = game_title_.c_str();
