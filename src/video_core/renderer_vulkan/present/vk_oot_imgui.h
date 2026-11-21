@@ -95,6 +95,7 @@ private:
 
     // E47.T12: the running game's icon (user texture uploaded like the font atlas) and labels
     void SyncGameInfo();
+    void UploadGameIcon(const vk::CommandBuffer& cmdbuf);
     std::unique_ptr<ImTextureData> game_icon_;
     u64 game_info_serial_ = 0;
     std::string game_title_;

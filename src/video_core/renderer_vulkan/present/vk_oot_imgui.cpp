@@ -558,13 +558,175 @@ void OotOverlay::SyncGameInfo() {
     }
 }
 
-void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
-    ImVector<ImTextureData*>* tex_vec =
-        draw_data && draw_data->Textures ? draw_data->Textures : &ImGui::GetPlatformIO().Textures;
-    if (!tex_vec) {
+void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
+    if (!game_icon_ || game_icon_->Status == ImTextureStatus_OK) {
         return;
     }
-    for (ImTextureData* tex : *tex_vec) {
+    const bool creating = (game_icon_->Status == ImTextureStatus_WantCreate);
+    if (creating) {
+        auto gpu_tex = std::make_unique<GpuTex>();
+        gpu_tex->image = memory_allocator.CreateImage({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .extent =
+                {
+                    .width = static_cast<u32>(game_icon_->Width),
+                    .height = static_cast<u32>(game_icon_->Height),
+                    .depth = 1,
+                },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        gpu_tex->view = device.GetLogical().CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *gpu_tex->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .components =
+                {
+                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+                },
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        });
+        gpu_tex->ds = ImGui_ImplVulkan_AddTexture(*gpu_tex->view,
+                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        game_icon_->SetTexID(reinterpret_cast<ImTextureID>(gpu_tex->ds));
+        game_icon_->BackendUserData = gpu_tex.get();
+        live_textures_.push_back(std::move(gpu_tex));
+    }
+
+    if (game_icon_->Status == ImTextureStatus_WantCreate ||
+        game_icon_->Status == ImTextureStatus_WantUpdates) {
+        auto* gpu_tex = static_cast<GpuTex*>(game_icon_->BackendUserData);
+        if (!gpu_tex) {
+            return;
+        }
+        const int uw = game_icon_->Width;
+        const int uh = game_icon_->Height;
+        const std::size_t pitch =
+            static_cast<std::size_t>(uw) * static_cast<std::size_t>(game_icon_->BytesPerPixel);
+        const VkDeviceSize upload_size = static_cast<VkDeviceSize>(uh) * pitch;
+
+        auto upload_buf = memory_allocator.CreateBuffer(
+            {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = upload_size,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            },
+            MemoryUsage::Upload);
+        auto mapped = upload_buf.Mapped();
+        std::memcpy(mapped.data(), game_icon_->GetPixels(), upload_size);
+        upload_buf.Flush();
+
+        const VkImageMemoryBarrier to_dst{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = creating ? VkAccessFlags{0} : VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = creating ? VK_IMAGE_LAYOUT_UNDEFINED
+                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = *gpu_tex->image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_dst);
+
+        const std::array<VkBufferImageCopy, 1> region{{
+            {
+                .bufferOffset = 0,
+                .bufferRowLength = static_cast<u32>(uw),
+                .bufferImageHeight = static_cast<u32>(uh),
+                .imageSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = 0,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .imageOffset = {.x = 0, .y = 0, .z = 0},
+                .imageExtent =
+                    {
+                        .width = static_cast<u32>(uw),
+                        .height = static_cast<u32>(uh),
+                        .depth = 1,
+                    },
+            },
+        }};
+        cmdbuf.CopyBufferToImage(*upload_buf, *gpu_tex->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+        const VkImageMemoryBarrier to_read{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = *gpu_tex->image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, to_read);
+
+        game_icon_->SetStatus(ImTextureStatus_OK);
+        retired_uploads_.push_back({.buffer = std::move(upload_buf), .serial = present_serial_});
+    }
+}
+
+void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
+    if (!draw_data || !draw_data->Textures) {
+        return;
+    }
+    for (ImTextureData* tex : *draw_data->Textures) {
+        if (tex != game_icon_.get()) {
+            continue; // Font atlas and backend textures are handled by ImGui_ImplVulkan
+        }
         if (tex->Status == ImTextureStatus_OK) {
             continue;
         }
@@ -584,170 +746,7 @@ void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* dra
             tex->BackendUserData = nullptr;
             continue;
         }
-
-        const bool creating = (tex->Status == ImTextureStatus_WantCreate);
-        if (creating) {
-            auto gpu_tex = std::make_unique<GpuTex>();
-            gpu_tex->image = memory_allocator.CreateImage({
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .imageType = VK_IMAGE_TYPE_2D,
-                .format = VK_FORMAT_R8G8B8A8_UNORM,
-                .extent =
-                    {
-                        .width = static_cast<u32>(tex->Width),
-                        .height = static_cast<u32>(tex->Height),
-                        .depth = 1,
-                    },
-                .mipLevels = 1,
-                .arrayLayers = 1,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            });
-            gpu_tex->view = device.GetLogical().CreateImageView({
-                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .image = *gpu_tex->image,
-                .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                .format = VK_FORMAT_R8G8B8A8_UNORM,
-                .components =
-                    {
-                        .r = VK_COMPONENT_SWIZZLE_IDENTITY,
-                        .g = VK_COMPONENT_SWIZZLE_IDENTITY,
-                        .b = VK_COMPONENT_SWIZZLE_IDENTITY,
-                        .a = VK_COMPONENT_SWIZZLE_IDENTITY,
-                    },
-                .subresourceRange =
-                    {
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .baseMipLevel = 0,
-                        .levelCount = 1,
-                        .baseArrayLayer = 0,
-                        .layerCount = 1,
-                    },
-            });
-            gpu_tex->ds = ImGui_ImplVulkan_AddTexture(*gpu_tex->view,
-                                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            tex->SetTexID(reinterpret_cast<ImTextureID>(gpu_tex->ds));
-            tex->BackendUserData = gpu_tex.get();
-            live_textures_.push_back(std::move(gpu_tex));
-        }
-
-        if (tex->Status == ImTextureStatus_WantCreate || tex->Status == ImTextureStatus_WantUpdates) {
-            auto* gpu_tex = static_cast<GpuTex*>(tex->BackendUserData);
-            if (!gpu_tex) {
-                continue;
-            }
-            const int ux = creating ? 0 : static_cast<int>(tex->UpdateRect.x);
-            const int uy = creating ? 0 : static_cast<int>(tex->UpdateRect.y);
-            const int uw = creating ? tex->Width : static_cast<int>(tex->UpdateRect.w);
-            const int uh = creating ? tex->Height : static_cast<int>(tex->UpdateRect.h);
-            const std::size_t pitch =
-                static_cast<std::size_t>(uw) * static_cast<std::size_t>(tex->BytesPerPixel);
-            const VkDeviceSize upload_size = static_cast<VkDeviceSize>(uh) * pitch;
-
-            auto upload_buf = memory_allocator.CreateBuffer(
-                {
-                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .size = upload_size,
-                    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                    .queueFamilyIndexCount = 0,
-                    .pQueueFamilyIndices = nullptr,
-                },
-                MemoryUsage::Upload);
-            auto mapped = upload_buf.Mapped();
-            for (int y = 0; y < uh; ++y) {
-                std::memcpy(mapped.data() + static_cast<std::size_t>(y) * pitch,
-                            tex->GetPixelsAt(ux, uy + y), pitch);
-            }
-            upload_buf.Flush();
-
-            const VkImageMemoryBarrier to_dst{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = creating ? VkAccessFlags{0} : VK_ACCESS_SHADER_READ_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .oldLayout = creating ? VK_IMAGE_LAYOUT_UNDEFINED
-                                      : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = *gpu_tex->image,
-                .subresourceRange =
-                    {
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .baseMipLevel = 0,
-                        .levelCount = 1,
-                        .baseArrayLayer = 0,
-                        .layerCount = 1,
-                    },
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_dst);
-
-            const std::array<VkBufferImageCopy, 1> region{{
-                {
-                    .bufferOffset = 0,
-                    .bufferRowLength = static_cast<u32>(uw),
-                    .bufferImageHeight = static_cast<u32>(uh),
-                    .imageSubresource =
-                        {
-                            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .mipLevel = 0,
-                            .baseArrayLayer = 0,
-                            .layerCount = 1,
-                        },
-                    .imageOffset = {.x = ux, .y = uy, .z = 0},
-                    .imageExtent =
-                        {
-                            .width = static_cast<u32>(uw),
-                            .height = static_cast<u32>(uh),
-                            .depth = 1,
-                        },
-                },
-            }};
-            cmdbuf.CopyBufferToImage(*upload_buf, *gpu_tex->image,
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-
-            const VkImageMemoryBarrier to_read{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = *gpu_tex->image,
-                .subresourceRange =
-                    {
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .baseMipLevel = 0,
-                        .levelCount = 1,
-                        .baseArrayLayer = 0,
-                        .layerCount = 1,
-                    },
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, to_read);
-
-            tex->SetStatus(ImTextureStatus_OK);
-            retired_uploads_.push_back({.buffer = std::move(upload_buf), .serial = present_serial_});
-        }
     }
-    // Disable ImGui's synchronous Upload/Destroy fallback inside RenderDrawData since we uploaded
-    // onto our own asynchronous present command buffer.
-    draw_data->Textures = nullptr;
 }
 
 void OotOverlay::Idle() {
@@ -786,7 +785,7 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     io.DeltaTime = dt;
 
     SyncGameInfo(); // before NewFrame, which gathers the user textures
-    UploadTextures(cmdbuf, nullptr);
+    UploadGameIcon(cmdbuf);
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 
