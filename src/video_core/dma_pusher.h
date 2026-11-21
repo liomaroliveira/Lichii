@@ -145,6 +145,8 @@ struct CommandWordsAllocator {
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
+    CommandList(std::size_t size, boost::container::default_init_t)
+        : command_lists(size, boost::container::default_init) {}
     explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
