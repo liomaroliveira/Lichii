@@ -866,7 +866,6 @@ private:
     H2SchedulerMirror h2_mirror{};
     u32 h2_frame_draws{0};
     std::chrono::steady_clock::time_point h2_last_frame_time{};
-    std::atomic<u32> pending_h2_query_fences{0};
     std::atomic<bool> h2_has_deferred_invals{false};
     std::mutex h2_inval_mutex;
     std::vector<std::pair<DAddr, std::size_t>> h2_deferred_tex_invals;

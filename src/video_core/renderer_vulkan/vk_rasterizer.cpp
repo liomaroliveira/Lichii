@@ -4365,7 +4365,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::VtgPrimitivesOut ||
         type == VideoCommon::QueryType::StreamingPrimitivesSucceeded ||
         type == VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded;
-    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_tfb_query) [[unlikely]] {
+    if (VideoCommon::BackSplit::UseH2AsyncQueue() && !is_fence && !is_tfb_query) [[unlikely]] {
         // Reports and semaphore releases reach guest memory the CPU may wait on.
         VideoCommon::Nx2FastDraw::NoteSync();
         if (VideoCommon::Nx2DrainCheck::g_enabled && type == VideoCommon::QueryType::Payload)
@@ -4378,7 +4378,6 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         const bool has_timestamp = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
         struct QueryArgs {
             QueryCache* cache;
-            std::atomic<u32>* pending_fences;
             GPUVAddr gpu_addr;
             u64 back_entry;
             VideoCommon::QueryType type;
@@ -4386,11 +4385,9 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             u32 payload;
             u32 subreport;
             u8 has_back_entry;
-            u8 is_fence;
         };
         const QueryArgs args{
             .cache = &query_cache,
-            .pending_fences = &pending_h2_query_fences,
             .gpu_addr = gpu_addr,
             .back_entry = back_entry.value_or(0),
             .type = type,
@@ -4398,20 +4395,11 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             .payload = payload,
             .subreport = subreport,
             .has_back_entry = static_cast<u8>(back_entry.has_value() ? 1 : 0),
-            .is_fence = static_cast<u8>(is_fence ? 1 : 0),
         };
-        if (is_fence) {
-            pending_h2_query_fences.fetch_add(1, std::memory_order_release);
-        }
         VideoCommon::BackSplit::EmitTask(
             [](const u64* task_payload) {
                 QueryArgs a;
                 std::memcpy(&a, task_payload, sizeof(a));
-                SCOPE_EXIT {
-                    if (a.is_fence != 0) {
-                        a.pending_fences->fetch_sub(1, std::memory_order_release);
-                    }
-                };
                 const std::optional<u64> entry =
                     a.has_back_entry != 0 ? std::optional<u64>{a.back_entry} : std::nullopt;
                 a.cache->CounterReport(a.gpu_addr, a.type, a.flags, a.payload, a.subreport,
@@ -5048,9 +5036,7 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
     // The ~81 % of fences that are skipped (no flushes, no pending work, skipped_fences < 64)
     // run func() inline and need no drain; draining them was the primary Fence bottleneck.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence,
-        fence_manager.NeedH2DrainForFence() ||
-            pending_h2_query_fences.load(std::memory_order_acquire) != 0};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalFence(std::move(func));
 }
@@ -5069,9 +5055,7 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
     // SignalSyncPoint -> SignalFence with a syncpoint increment callback: apply the same
     // drain guard so the ~81 % empty-fence fast-path avoids the drain too.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence,
-        fence_manager.NeedH2DrainForFence() ||
-            pending_h2_query_fences.load(std::memory_order_acquire) != 0};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalSyncPoint(value);
 }
@@ -5079,17 +5063,14 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
 void RasterizerVulkan::SignalReference() {
     // SignalReference -> SignalFence with an empty callback: same drain guard.
     const VideoCommon::BackSplit::H2DrainScope h2_drain{
-        VideoCommon::BackSplit::H2DrainReason::Fence,
-        fence_manager.NeedH2DrainForFence() ||
-            pending_h2_query_fences.load(std::memory_order_acquire) != 0};
+        VideoCommon::BackSplit::H2DrainReason::Fence, fence_manager.NeedH2DrainForFence()};
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
     // In async-check mode (Vulkan), WaitPendingFences(false) is a no-op; skip the drain.
-    if (!fence_manager.NeedH2DrainForReleaseFences(force) &&
-        pending_h2_query_fences.load(std::memory_order_acquire) == 0) {
+    if (!fence_manager.NeedH2DrainForReleaseFences(force)) {
         fence_manager.WaitPendingFences(force);
         return;
     }
