@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <atomic>
+#include <fstream>
 #include <memory>
 #include <new>
 #include <utility>
@@ -13,6 +14,7 @@
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
@@ -134,9 +136,50 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
 namespace {
 
-/// E47.T12: the in-game menu banner shows the running game's icon, name and ID, read from its
-/// control data (NACP + icon JPEG, with updates applied). Any game, not only Ocarina of Time.
-void PublishGameInfoToMenu(System& system, u64 program_id, std::string fallback_title) {
+/// E47.T12 / E61.T1: the in-game menu banner shows the running game's icon, name and ID, read
+/// agnostically from custom user artwork/names (<EdenDir>/artwork/<ID>.png, names/<ID>.txt),
+/// the active AppLoader (Switch 2 .nup including Edit NUP Metadata, .nx, .nsp, .xci, .nro), or
+/// PatchManager control data (NACP + icon JPEG, with updates applied).
+std::vector<u8> ReadBinaryFileBounded(const std::filesystem::path& path, std::size_t max_bytes) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+        return {};
+    }
+    const auto file_size = std::filesystem::file_size(path, ec);
+    if (ec || file_size == 0 || file_size > max_bytes) {
+        return {};
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::vector<u8> buf(static_cast<std::size_t>(file_size));
+    in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+    if (!in || static_cast<std::size_t>(in.gcount()) != buf.size()) {
+        return {};
+    }
+    return buf;
+}
+
+std::string ReadCustomTitleBounded(u64 program_id) {
+    constexpr std::size_t kMaxCustomTitleBytes = 4096;
+    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "names" /
+                      fmt::format("{:016X}.txt", program_id);
+    const auto raw = ReadBinaryFileBounded(path, kMaxCustomTitleBytes);
+    if (raw.empty()) {
+        return {};
+    }
+    std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+void PublishGameInfoToMenu(System& system, u64 program_id, std::string fallback_title,
+                           Loader::AppLoader* app_loader = nullptr) {
     if (program_id == 0) {
         return;
     }
@@ -146,32 +189,63 @@ void PublishGameInfoToMenu(System& system, u64 program_id, std::string fallback_
                                    system.GetContentProvider());
     const auto metadata = pm.GetControlMetadata();
     if (metadata.first) {
-        info.title = metadata.first->GetApplicationName();
         info.version = metadata.first->GetVersionString();
     }
-    if (info.title.empty()) {
+
+    // Title priority: (1) custom user title -> (2) loader title (preserves Edit NUP Metadata) -> (3) NACP
+    info.title = ReadCustomTitleBounded(program_id);
+    if (info.title.empty() && !fallback_title.empty()) {
         info.title = std::move(fallback_title);
     }
-    if (metadata.second) {
+    if (info.title.empty() && metadata.first) {
+        info.title = metadata.first->GetApplicationName();
+    }
+
+    // Icon priority: (1) custom artwork PNG -> (2) AppLoader::ReadIcon (.nup/.nx/.nsp/.xci/.nro) -> (3) Control NCA
+    constexpr std::size_t kMaxArtworkBytes = 16ULL * 1024ULL * 1024ULL;
+    const auto artwork_path = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "artwork" /
+                              fmt::format("{:016X}.png", program_id);
+    std::vector<u8> raw_icon = ReadBinaryFileBounded(artwork_path, kMaxArtworkBytes);
+    const char* icon_source = !raw_icon.empty() ? "artwork" : "none";
+
+    if (raw_icon.empty() && app_loader != nullptr) {
+        std::vector<u8> loader_icon;
+        if (app_loader->ReadIcon(loader_icon) == Loader::ResultStatus::Success &&
+            !loader_icon.empty() && loader_icon.size() <= kMaxArtworkBytes) {
+            raw_icon = std::move(loader_icon);
+            icon_source = "loader";
+        }
+    }
+    if (raw_icon.empty() && metadata.second) {
+        auto control_icon = metadata.second->ReadAllBytes();
+        if (!control_icon.empty() && control_icon.size() <= kMaxArtworkBytes) {
+            raw_icon = std::move(control_icon);
+            icon_source = "control";
+        }
+    }
+
+    const std::size_t raw_bytes = raw_icon.size();
+    if (!raw_icon.empty()) {
         constexpr int kIconSide = 128;
-        std::vector<u8> jpeg = metadata.second->ReadAllBytes();
+        constexpr int kMaxDim = 4096;
         int w = 0, h = 0, channels = 0;
-        u8* pixels = jpeg.empty() ? nullptr
-                                  : stbi_load_from_memory(jpeg.data(), static_cast<int>(jpeg.size()),
-                                                          &w, &h, &channels, STBI_rgb_alpha);
+        u8* pixels = stbi_load_from_memory(raw_icon.data(), static_cast<int>(raw_icon.size()),
+                                           &w, &h, &channels, STBI_rgb_alpha);
         if (pixels) {
-            info.icon_rgba.resize(static_cast<std::size_t>(kIconSide) * kIconSide * 4);
-            if (stbir_resize_uint8_srgb(pixels, w, h, 0, info.icon_rgba.data(), kIconSide,
-                                        kIconSide, 0, 4, 3, 0)) {
-                info.icon_width = info.icon_height = kIconSide;
-            } else {
-                info.icon_rgba.clear();
+            if (w > 0 && h > 0 && w <= kMaxDim && h <= kMaxDim) {
+                info.icon_rgba.resize(static_cast<std::size_t>(kIconSide) * kIconSide * 4);
+                if (stbir_resize_uint8_srgb(pixels, w, h, 0, info.icon_rgba.data(), kIconSide,
+                                            kIconSide, 0, 4, 3, 0)) {
+                    info.icon_width = info.icon_height = kIconSide;
+                } else {
+                    info.icon_rgba.clear();
+                }
             }
             stbi_image_free(pixels);
         }
     }
-    LOG_INFO(Core, "In-game menu: {} ({:016X}) {} icon {}x{}", info.title, program_id,
-             info.version, info.icon_width, info.icon_height);
+    LOG_INFO(Core, "In-game menu: {} ({:016X}) {} icon {}x{} (source={}, bytes={})", info.title,
+             program_id, info.version, info.icon_width, info.icon_height, icon_source, raw_bytes);
     Common::OotMenu::Bridge::Instance().SetGameInfo(std::move(info));
 }
 
@@ -626,7 +700,8 @@ struct System::Impl {
         {
             std::string loader_title;
             app_loader->ReadTitle(loader_title);
-            PublishGameInfoToMenu(system, params.program_id, std::move(loader_title));
+            PublishGameInfoToMenu(system, params.program_id, std::move(loader_title),
+                                  app_loader.get());
         }
 
         if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {
@@ -1303,8 +1378,18 @@ void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& cal
 void System::NotifyApplicationChanged(u64 program_id) {
     //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
 
-    // Console mode (qlaunch) starts games here instead of through Load (E47.T12).
-    PublishGameInfoToMenu(*this, program_id, {});
+    // Console mode (qlaunch) starts games here instead of through Load (E47.T12 / E61.T1).
+    Loader::AppLoader* matching_loader = nullptr;
+    std::string loader_title;
+    if (impl->app_loader) {
+        u64 loader_id = 0;
+        if (impl->app_loader->ReadProgramId(loader_id) == Loader::ResultStatus::Success &&
+            loader_id == program_id) {
+            matching_loader = impl->app_loader.get();
+            matching_loader->ReadTitle(loader_title);
+        }
+    }
+    PublishGameInfoToMenu(*this, program_id, std::move(loader_title), matching_loader);
     if (impl->application_changed_callback) {
         impl->application_changed_callback(program_id);
     }
