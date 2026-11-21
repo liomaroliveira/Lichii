@@ -78,7 +78,11 @@ constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 
 constexpr size_t StepRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46900;
-constexpr size_t StepStateSize = 0x1C0;
+constexpr size_t AmbientRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46B60;
+constexpr size_t AmbientRoutineSize = 60;
+constexpr size_t UnlockStateSize = 0xA8;
+constexpr size_t StepStateOffset = sizeof(Loader::NSOHeader) + 0x4E9EE00;
+constexpr size_t StepStateSize = 0x110;
 constexpr size_t HudHookOffset = sizeof(Loader::NSOHeader) + 0xA68300;
 constexpr u32 HudOriginalInstruction = 0x1E38000C;
 constexpr u32 HudHookInstruction = 0x14C77980;
@@ -90,7 +94,45 @@ constexpr u32 HitstopOriginalInstruction = 0x5EA1B900;
 constexpr u32 HitstopHookInstruction = 0x1433CDBA;
 constexpr size_t AmbientHookOffset = sizeof(Loader::NSOHeader) + 0x53F914;
 constexpr u32 AmbientOriginalInstruction = 0x1100077A;
-constexpr u32 AmbientHookInstruction = 0x14DC1C3B;
+constexpr u32 AmbientHookInstruction = 0x14DC1C93;
+
+constexpr size_t TurnSpeedHookOffset = sizeof(Loader::NSOHeader) + 0x261EB18;
+constexpr u32 TurnSpeedOriginalInstruction = 0x1E210801;
+constexpr u32 TurnSpeedHookInstruction = 0x1458A021;
+// The second instruction the routine replaces; the hook guards it and leaves it in place.
+constexpr u32 TurnSpeedSecondInstruction = 0x1E280800;
+constexpr size_t TurnSpeedRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46B9C;
+constexpr size_t TurnSpeedRoutineSize = 40;
+constexpr size_t MovieFramesHookOffset = sizeof(Loader::NSOHeader) + 0x3B5C7C8;
+constexpr u32 MovieFramesOriginalInstruction = 0x11000508; // add w8, w8, #1
+constexpr u32 MovieFramesHookInstruction = 0x1403A8FF;     // b main+0x3C46BC4
+constexpr size_t MovieFramesRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46BC4;
+constexpr size_t MovieFramesRoutineSize = 56;
+constexpr u32 ScarecrowCutOriginalInstruction = 0x1E390008; // fcvtzu w8, s0
+constexpr size_t ScarecrowRecordHookOffset = sizeof(Loader::NSOHeader) + 0x3296B08;
+constexpr u32 ScarecrowRecordHookInstruction = 0x1426BFEA; // b main+0x3C46AB0
+constexpr size_t ScarecrowRecordRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46AB0;
+constexpr size_t ScarecrowLastHookOffset = sizeof(Loader::NSOHeader) + 0x32926C8;
+constexpr u32 ScarecrowLastHookInstruction = 0x1426D104; // b main+0x3C46AD8
+constexpr size_t ScarecrowLastRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46AD8;
+constexpr size_t ScarecrowRoutineSize = 40;
+struct ClothDtSite {
+    size_t offset;
+    u32 original;
+    u32 hook;
+};
+// The cloth time step's four 1/60 loads, each a call to the s0 or s2 routine.
+constexpr std::array<ClothDtSite, 4> ClothDtSites{{
+    {sizeof(Loader::NSOHeader) + 0x14632C, 0xBD466D00, 0x94EC01F5},  // ldr s0 -> bl 0x3C46B00
+    {sizeof(Loader::NSOHeader) + 0x2AB804, 0x1E270100, 0x94E66CBF},  // fmov s0, w8 -> bl 0x3C46B00
+    {sizeof(Loader::NSOHeader) + 0x2C207A4, 0xBD466D00, 0x944098D7}, // ldr s0 -> bl 0x3C46B00
+    {sizeof(Loader::NSOHeader) + 0x2C2208C, 0xBD466D02, 0x944092A9}, // ldr s2 -> bl 0x3C46B30
+}};
+constexpr size_t ClothDtRoutineS0Offset = sizeof(Loader::NSOHeader) + 0x3C46B00;
+constexpr size_t ClothDtRoutineS2Offset = sizeof(Loader::NSOHeader) + 0x3C46B30;
+constexpr size_t ClothDtRoutineSize = 48;
+constexpr std::string_view ClothDtRoutineHead =
+    "D0810090104A44F9100240F9111A40B91011915210B1A772310600513F02106B3132901A31060011";
 
 constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirectories{{
     {Common::FS::EdenPath::NANDDir, "nand"},
@@ -280,7 +322,7 @@ constexpr std::array<std::pair<size_t, u32>, 3> GroundVelocityBranches{{
 
 std::vector<u8> MakeDynamicMain() {
     auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
-    nso.resize(DynamicStateOffset + StepStateSize);
+    nso.resize(DynamicStateOffset + UnlockStateSize);
     Loader::NSOHeader header;
     std::memcpy(&header, nso.data(), sizeof(header));
     header.segments[0].size = 63201744;
@@ -304,6 +346,16 @@ std::vector<u8> MakeDynamicMain() {
     std::copy(hitstop_original.begin(), hitstop_original.end(), nso.begin() + HitstopHookOffset);
     for (const auto& [offset, original] : GroundVelocityBranches) {
         std::memcpy(nso.data() + offset, &original, sizeof(original));
+    }
+    std::memcpy(nso.data() + TurnSpeedHookOffset, &TurnSpeedOriginalInstruction, sizeof(u32));
+    std::memcpy(nso.data() + TurnSpeedHookOffset + 4, &TurnSpeedSecondInstruction, sizeof(u32));
+    std::memcpy(nso.data() + MovieFramesHookOffset, &MovieFramesOriginalInstruction, sizeof(u32));
+    std::memcpy(nso.data() + ScarecrowRecordHookOffset, &ScarecrowCutOriginalInstruction,
+                sizeof(u32));
+    std::memcpy(nso.data() + ScarecrowLastHookOffset, &ScarecrowCutOriginalInstruction,
+                sizeof(u32));
+    for (const auto& site : ClothDtSites) {
+        std::memcpy(nso.data() + site.offset, &site.original, sizeof(u32));
     }
     std::memcpy(nso.data() + WaterHookOffset, &WaterOriginalInstruction,
                 sizeof(WaterOriginalInstruction));
@@ -433,13 +485,14 @@ TEST_CASE("Built-in FPS Unlock applies all step counters", "[patch_manager]") {
             "ED3BBDA9EF4301A9FE1300F90D6302910041201E07000094E9030D2AFE1340F9EF4341A9"
             "ED3BC3A80A9B40B94632CC17");
     REQUIRE(Common::HexToString(std::span{patched}.subspan(StepRoutineOffset + 128, 128)) ==
-            "E007BFADCE9200B0CE013B910F028052D00140F91F020DEB40020054700100B4CE410091"
+            "E007BFADCE920090CE4138910F028052D00140F91F020DEB40020054700100B4CE410091"
             "EF05007141FFFF54CE4104D1D00140B90F060011EF0D0012CF0100B9CE410091CE11108B"
             "CD0100F9DF0900B90D00381EBF050071ADA59F1A07000014C10940BD0028211E01C0251E"
             "0038211EC00900BD2D00381EE007C1ACC0035FD6");
-    REQUIRE(Common::HexToString(std::span{patched}.subspan(StepRoutineOffset + 256, 60)) ==
-            "ED3BBDA9EF4301A9FE1300F98D0B018BCE810090CE4944F9CE0140F9C01140BDD8FFFF97"
-            "7A030D0B001840BDFE1340F9EF4341A9ED3BC3A8B8E32317");
+    REQUIRE(Common::HexToString(std::span{patched}.subspan(AmbientRoutineOffset,
+                                                           AmbientRoutineSize)) ==
+            "ED3BBDA9EF4301A9FE1300F98D0B018BCE810090CE4944F9CE0140F9C01140BD80FFFF97"
+            "7A030D0B001840BDFE1340F9EF4341A9ED3BC3A860E32317");
     // The remaining instructions in the 44-byte hitstop record are guarded but unchanged.
     REQUIRE(std::equal(nso.begin() + HitstopHookOffset + sizeof(u32),
                        nso.begin() + HitstopHookOffset + 44,
@@ -459,7 +512,10 @@ TEST_CASE("Built-in Dynamic FPS leaves all step counters untouched", "[patch_man
     REQUIRE(std::equal(nso.begin() + HitstopHookOffset, nso.begin() + HitstopHookOffset + 44,
                        patched.begin() + HitstopHookOffset));
     REQUIRE(std::all_of(patched.begin() + StepRoutineOffset,
-                        patched.begin() + StepRoutineOffset + 0x13C,
+                        patched.begin() + StepRoutineOffset + 0x100,
+                        [](u8 byte) { return byte == 0; }));
+    REQUIRE(std::all_of(patched.begin() + AmbientRoutineOffset,
+                        patched.begin() + AmbientRoutineOffset + AmbientRoutineSize,
                         [](u8 byte) { return byte == 0; }));
 }
 
@@ -487,22 +543,22 @@ TEST_CASE("Built-in FPS Unlock validates all step records before writing", "[pat
         nso[StepRoutineOffset + 79] = 1;
     }
     SECTION("Nonzero ambient cave") {
-        nso[StepRoutineOffset + 0x13B] = 1;
+        nso[AmbientRoutineOffset + AmbientRoutineSize - 1] = 1;
     }
     SECTION("Nonzero helper cave") {
         nso[StepRoutineOffset + 239] = 1;
     }
     SECTION("Nonzero step state") {
-        nso[DynamicStateOffset + StepStateSize - 1] = 1;
+        nso[StepStateOffset + StepStateSize - 1] = 1;
     }
-    SECTION("Truncated step state") {
-        nso.resize(DynamicStateOffset + StepStateSize - 1);
+    SECTION("Truncated sound state") {
+        nso.resize(DynamicStateOffset + UnlockStateSize - 1);
     }
     SECTION("Step state outside BSS") {
         Loader::NSOHeader header;
         std::memcpy(&header, nso.data(), sizeof(header));
         header.segments[2].bss_size =
-            0x4E9FE00 + StepStateSize - 1 - header.segments[2].location - header.segments[2].size;
+            0x4E9EE00 + StepStateSize - 1 - header.segments[2].location - header.segments[2].size;
         std::memcpy(nso.data(), &header, sizeof(header));
     }
     REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
@@ -530,7 +586,7 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
         offset = StepRoutineOffset + 80;
     }
     SECTION("Ambient stub") {
-        offset = StepRoutineOffset + 256;
+        offset = AmbientRoutineOffset;
     }
     SECTION("Skipped hitstop instruction") {
         offset = HitstopHookOffset + 40;
@@ -539,7 +595,7 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
         offset = StepRoutineOffset + 128;
     }
     SECTION("Step state") {
-        offset = DynamicStateOffset + StepStateSize - sizeof(u32);
+        offset = StepStateOffset + StepStateSize - sizeof(u32);
     }
     constexpr u32 mod_word = 0x11223344;
     PatchManagerTestContext context{mod_word, offset};
@@ -692,6 +748,145 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
     }
     PatchManagerTestContext context{mod_word, offset};
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    const auto nso = MakeDynamicMain();
+    auto expected = nso;
+    std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Built-in FPS Unlock validates the turn speed records before writing", "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong turn speed original") {
+        nso[TurnSpeedHookOffset] ^= 1;
+    }
+    SECTION("Wrong second turn speed instruction") {
+        nso[TurnSpeedHookOffset + 4] ^= 1;
+    }
+    SECTION("Nonzero turn speed cave") {
+        nso[TurnSpeedRoutineOffset + TurnSpeedRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes the turn speed fix",
+          "[patch_manager]") {
+    size_t offset = TurnSpeedHookOffset;
+    SECTION("User turn speed hook takes precedence") {}
+    SECTION("User second turn speed instruction takes precedence") {
+        offset = TurnSpeedHookOffset + 4;
+    }
+    SECTION("User turn speed routine takes precedence") {
+        offset = TurnSpeedRoutineOffset;
+    }
+    constexpr u32 mod_word = 0x11223344;
+    PatchManagerTestContext context{mod_word, offset};
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    const auto nso = MakeDynamicMain();
+    auto expected = nso;
+    std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Built-in FPS Unlock validates the movie frame count records before writing",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong movie frame count original") {
+        nso[MovieFramesHookOffset] ^= 1;
+    }
+    SECTION("Nonzero movie frame count cave") {
+        nso[MovieFramesRoutineOffset + MovieFramesRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes the movie frame "
+          "count",
+          "[patch_manager]") {
+    size_t offset = MovieFramesHookOffset;
+    SECTION("User movie frame count hook takes precedence") {}
+    SECTION("User movie frame count routine takes precedence") {
+        offset = MovieFramesRoutineOffset;
+    }
+    constexpr u32 mod_word = 0x11223344;
+    PatchManagerTestContext context{mod_word, offset};
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    const auto nso = MakeDynamicMain();
+    auto expected = nso;
+    std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Built-in FPS Unlock validates the Scarecrow's Song records before writing",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong recording original") {
+        nso[ScarecrowRecordHookOffset] ^= 1;
+    }
+    SECTION("Wrong last note original") {
+        nso[ScarecrowLastHookOffset] ^= 1;
+    }
+    SECTION("Nonzero recording cave") {
+        nso[ScarecrowRecordRoutineOffset + ScarecrowRoutineSize - 1] = 1;
+    }
+    SECTION("Nonzero last note cave") {
+        nso[ScarecrowLastRoutineOffset + ScarecrowRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock validates the cloth time step records before writing",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong ldr s0 original") {
+        nso[ClothDtSites[0].offset] ^= 1;
+    }
+    SECTION("Wrong fmov original") {
+        nso[ClothDtSites[1].offset] ^= 1;
+    }
+    SECTION("Wrong ldr s2 original") {
+        nso[ClothDtSites[3].offset] ^= 1;
+    }
+    SECTION("Nonzero s0 cave") {
+        nso[ClothDtRoutineS0Offset + ClothDtRoutineSize - 1] = 1;
+    }
+    SECTION("Nonzero s2 cave") {
+        nso[ClothDtRoutineS2Offset + ClothDtRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes the Scarecrow's "
+          "Song fix",
+          "[patch_manager]") {
+    size_t offset = ScarecrowRecordHookOffset;
+    SECTION("User recording hook takes precedence") {}
+    SECTION("User last note hook takes precedence") {
+        offset = ScarecrowLastHookOffset;
+    }
+    SECTION("User recording routine takes precedence") {
+        offset = ScarecrowRecordRoutineOffset;
+    }
+    SECTION("User last note routine takes precedence") {
+        offset = ScarecrowLastRoutineOffset;
+    }
+    constexpr u32 mod_word = 0x11223344;
+    PatchManagerTestContext context{mod_word, offset};
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps}};
     const auto nso = MakeDynamicMain();
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
