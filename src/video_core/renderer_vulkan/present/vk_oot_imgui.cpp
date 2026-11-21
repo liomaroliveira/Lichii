@@ -304,6 +304,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         return false;
     }
 
+    try {
     if (!ctx) {
         ctx = ImGui::CreateContext();
         if (!ctx) {
@@ -432,7 +433,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         init_info.QueueFamily = device.GetGraphicsFamily();
         init_info.Queue = *device.GetGraphicsQueue();
         init_info.DescriptorPool = *descriptor_pool_;
-        init_info.DescriptorPoolSize = 128;
+        init_info.DescriptorPoolSize = 0;
         init_info.MinImageCount = swap_count;
         // Keep >= 8 ring slots so in-flight frames never overwrite vertex/index buffers
         init_info.ImageCount = std::max<u32>(8U, swap_count);
@@ -509,6 +510,17 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         fb_extent_ = extent;
     }
     return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "OotOverlay: EnsureInitialized exception (disabling overlay): {}",
+                  e.what());
+        failed_ = true;
+        return false;
+    } catch (...) {
+        LOG_ERROR(Render_Vulkan,
+                  "OotOverlay: EnsureInitialized unknown exception (disabling overlay)");
+        failed_ = true;
+        return false;
+    }
 }
 
 void OotOverlay::SyncGameInfo() {
@@ -518,11 +530,19 @@ void OotOverlay::SyncGameInfo() {
         return;
     }
     game_info_serial_ = serial;
+    icon_failed_ = false;
     const auto info = bridge.GetGameInfo();
     game_title_ = info.title;
     game_id_ = info.program_id ? fmt::format("{:016X}", info.program_id) : std::string{};
-    if (info.icon_rgba.empty()) {
+    if (info.icon_rgba.empty() || info.icon_width <= 0 || info.icon_height <= 0) {
         return; // keep the last icon rather than churn textures; a new game brings its own
+    }
+    const std::size_t expected_bytes =
+        static_cast<std::size_t>(info.icon_width) * static_cast<std::size_t>(info.icon_height) * 4;
+    if (info.icon_rgba.size() != expected_bytes) {
+        LOG_ERROR(Render_Vulkan, "OotOverlay: ignoring malformed icon payload ({} bytes for {}x{})",
+                  info.icon_rgba.size(), info.icon_width, info.icon_height);
+        return;
     }
     if (game_icon_ && (game_icon_->Width != info.icon_width ||
                        game_icon_->Height != info.icon_height)) {
@@ -533,6 +553,10 @@ void OotOverlay::SyncGameInfo() {
         game_icon_->Create(ImTextureFormat_RGBA32, info.icon_width, info.icon_height);
         ImGui::RegisterUserTexture(game_icon_.get());
     }
+    if (!game_icon_->GetPixels()) {
+        icon_failed_ = true;
+        return;
+    }
     std::memcpy(game_icon_->GetPixels(), info.icon_rgba.data(), info.icon_rgba.size());
     if (game_icon_->Status == ImTextureStatus_OK) {
         game_icon_->UpdateRect = {0, 0, static_cast<unsigned short>(info.icon_width),
@@ -542,9 +566,11 @@ void OotOverlay::SyncGameInfo() {
 }
 
 void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
-    if (!game_icon_ || game_icon_->Status == ImTextureStatus_OK) {
+    if (icon_failed_ || !game_icon_ || game_icon_->Status == ImTextureStatus_OK ||
+        game_icon_->Width <= 0 || game_icon_->Height <= 0 || !game_icon_->GetPixels()) {
         return;
     }
+    try {
     const bool creating = (game_icon_->Status == ImTextureStatus_WantCreate);
     if (creating) {
         auto gpu_tex = std::make_unique<GpuTex>();
@@ -597,6 +623,7 @@ void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
                                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         if (gpu_tex->ds == VK_NULL_HANDLE) {
             LOG_ERROR(Render_Vulkan, "OotOverlay: failed to allocate descriptor set for game icon");
+            icon_failed_ = true;
             game_icon_->SetTexID(ImTextureID_Invalid);
             return;
         }
@@ -653,7 +680,8 @@ void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
                     .layerCount = 1,
                 },
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        cmdbuf.PipelineBarrier(creating ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_dst);
 
         const std::array<VkBufferImageCopy, 1> region{{
@@ -705,6 +733,22 @@ void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
         game_icon_->SetStatus(ImTextureStatus_OK);
         retired_uploads_.push_back({.buffer = std::move(upload_buf), .serial = present_serial_});
     }
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan,
+                  "OotOverlay: UploadGameIcon exception (disabling icon only, menu stays open): {}",
+                  e.what());
+        icon_failed_ = true;
+        if (game_icon_) {
+            game_icon_->SetTexID(ImTextureID_Invalid);
+        }
+    } catch (...) {
+        LOG_ERROR(Render_Vulkan,
+                  "OotOverlay: UploadGameIcon unknown exception (disabling icon only)");
+        icon_failed_ = true;
+        if (game_icon_) {
+            game_icon_->SetTexID(ImTextureID_Invalid);
+        }
+    }
 }
 
 void OotOverlay::UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data) {
@@ -748,12 +792,17 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
                         VkExtent2D extent, VkFormat swapchain_format, bool is_hdr,
                         const std::function<void(OotUi::Ctx&)>& draw_fn) {
     ++present_serial_;
+    if (failed_ || swapchain_image == VK_NULL_HANDLE || extent.width == 0 || extent.height == 0 ||
+        !draw_fn) {
+        return;
+    }
     if (!EnsureInitialized(swapchain_format, extent)) {
         return;
     }
-    if (image_index >= framebuffers_.size()) {
+    if (image_index >= framebuffers_.size() || !*framebuffers_[image_index] || !*render_pass_) {
         return;
     }
+    try {
     CleanupRetired(false);
 
     const auto now = std::chrono::steady_clock::now();
@@ -792,7 +841,7 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
     const bool nintendo_pad = (opts.pad_layout == static_cast<int>(Common::OotMenu::PadLayout::Nintendo));
     ui_ctx.confirm_dot = nintendo_pad ? 1 : 3;
     ui_ctx.back_dot = nintendo_pad ? 3 : 1;
-    const bool icon_ready = game_icon_ != nullptr &&
+    const bool icon_ready = !icon_failed_ && game_icon_ != nullptr &&
                             game_icon_->Status == ImTextureStatus_OK &&
                             game_icon_->GetTexID() != ImTextureID_Invalid &&
                             game_icon_->GetTexID() != 0;
@@ -862,6 +911,16 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT);
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan,
+                  "OotOverlay: Record exception (disabling overlay, keeping game alive): {}",
+                  e.what());
+        failed_ = true;
+    } catch (...) {
+        LOG_ERROR(Render_Vulkan,
+                  "OotOverlay: Record unknown exception (disabling overlay, keeping game alive)");
+        failed_ = true;
+    }
 }
 
 } // namespace Vulkan
