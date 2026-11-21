@@ -190,15 +190,15 @@ void OotOverlay::Shutdown() {
         }
     }
     live_textures_.clear();
-    // E47: the atlas textures carry our GpuTex in BackendUserData (uploaded here, not by the
-    // backend). ImGui_ImplVulkan_Shutdown would read it as an ImGui_ImplVulkan_Texture and destroy
-    // garbage handles (SIGSEGV in RADV on every exit since pack-ab), so detach them first, as the
-    // RomFS font rebuild above already does.
+    // E47: detach the user icon texture from ImGui before ImGui_ImplVulkan_Shutdown,
+    // while leaving ImGui font atlas textures for ImGui_ImplVulkan to cleanly destroy.
     if (ctx) {
         for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
-            tex->SetTexID(ImTextureID_Invalid);
-            tex->BackendUserData = nullptr;
-            tex->SetStatus(ImTextureStatus_Destroyed);
+            if (tex == game_icon_.get()) {
+                tex->SetTexID(ImTextureID_Invalid);
+                tex->BackendUserData = nullptr;
+                tex->SetStatus(ImTextureStatus_Destroyed);
+            }
         }
     }
     framebuffers_.clear();
@@ -333,14 +333,16 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
             }
         }
 
-        const std::array<VkDescriptorPoolSize, 1> pool_sizes{{
-            {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 64},
+        const std::array<VkDescriptorPoolSize, 3> pool_sizes{{
+            {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 128},
+            {.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = 128},
+            {.type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 32},
         }};
         descriptor_pool_ = device.GetLogical().CreateDescriptorPool({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = nullptr,
             .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 64,
+            .maxSets = 256,
             .poolSizeCount = static_cast<u32>(pool_sizes.size()),
             .pPoolSizes = pool_sizes.data(),
         });
@@ -352,6 +354,9 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
             // Destroy old ImGui font textures safely at idle before rebuilding atlas with RomFS fonts
             (void)device.GetLogical().WaitIdle();
             for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
+                if (tex != game_icon_.get()) {
+                    continue;
+                }
                 if (tex->TexID != ImTextureID_Invalid) {
                     auto* gpu_tex = static_cast<GpuTex*>(tex->BackendUserData);
                     if (gpu_tex && gpu_tex->ds != VK_NULL_HANDLE && backend_ready_) {
@@ -450,6 +455,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         init_info.QueueFamily = device.GetGraphicsFamily();
         init_info.Queue = *device.GetGraphicsQueue();
         init_info.DescriptorPool = *descriptor_pool_;
+        init_info.DescriptorPoolSize = 128;
         init_info.MinImageCount = swap_count;
         // Keep >= 8 ring slots so in-flight frames never overwrite vertex/index buffers
         init_info.ImageCount = std::max<u32>(8U, swap_count);
@@ -612,6 +618,11 @@ void OotOverlay::UploadGameIcon(const vk::CommandBuffer& cmdbuf) {
         });
         gpu_tex->ds = ImGui_ImplVulkan_AddTexture(*gpu_tex->view,
                                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (gpu_tex->ds == VK_NULL_HANDLE) {
+            LOG_ERROR(Render_Vulkan, "OotOverlay: failed to allocate descriptor set for game icon");
+            game_icon_->SetTexID(ImTextureID_Invalid);
+            return;
+        }
         game_icon_->SetTexID(reinterpret_cast<ImTextureID>(gpu_tex->ds));
         game_icon_->BackendUserData = gpu_tex.get();
         live_textures_.push_back(std::move(gpu_tex));

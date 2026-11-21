@@ -2263,7 +2263,7 @@ void OotMenuController::DrawFullMenu(Ctx& c, Bridge& bridge) {
     {
         float room = (c.w - total) * 0.5f - 54.0f * s - c.safe;
         float x = c.safe;
-        if (c.has_game_icon && c.game_icon.GetTexID() != 0 && room > hh) {
+        if (c.has_game_icon && c.game_icon.GetTexID() != 0 && c.game_icon.GetTexID() != ImTextureID_Invalid && room > hh) {
             const float side = hh - 14.0f * s;
             const ImVec2 p0{x, (hh - 3.0f * s - side) * 0.5f};
             c.d->AddImageRounded(c.game_icon, p0, ImVec2(p0.x + side, p0.y + side), ImVec2(0, 0),
@@ -2944,7 +2944,7 @@ void OotMenuController::TickAndDraw(Ctx& c) {
             for (int i = vtx0; i < c.d->VtxBuffer.Size; ++i) {
                 c.d->VtxBuffer[i].pos.x += menu_ox_;
             }
-            for (int i = std::max(0, cmd0 - 1); i < c.d->CmdBuffer.Size; ++i) {
+            for (int i = cmd0; i < c.d->CmdBuffer.Size; ++i) {
                 ImVec4& rect = c.d->CmdBuffer[i].ClipRect;
                 if (rect.x <= 0.0f && rect.z >= c.w) {
                     continue;
