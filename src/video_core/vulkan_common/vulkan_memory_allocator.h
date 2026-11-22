@@ -118,12 +118,6 @@ namespace Vulkan {
         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
 
         /// Device memory to bind to part of a sparse resource. Null when there is none left.
-        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
-        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
-                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
-                                        VmaAllocation& allocation,
-                                        VmaAllocationInfo& alloc_info) const;
-
         VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                            VkDeviceMemory &memory, VkDeviceSize &offset) const;
 
@@ -176,6 +170,11 @@ namespace Vulkan {
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                vk::Image &image) const;
 
+        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
+        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
+                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
+                                        VmaAllocation& allocation,
+                                        VmaAllocationInfo& alloc_info) const;
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.

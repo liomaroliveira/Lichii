@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 // TODO: find out which don't require stable iters
@@ -512,6 +513,7 @@ private:
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
     void RefreshContents(Image& image, ImageId image_id);
+    void NoteHostOutOfMemory(std::string_view operation, const ImageBase& image);
 
     /// Upload data from guest to an image
     template <typename StagingBuffer>
@@ -778,6 +780,9 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    u64 host_oom_retry_frame{};
+    u64 host_oom_failures{};
+    std::chrono::steady_clock::time_point host_oom_log_time{};
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;

@@ -213,6 +213,7 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/mesh_vertex_input.h
     renderer_vulkan/nx2_list_slots.cpp
     renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
@@ -232,6 +233,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_buffer_cache_base.cpp
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
+    renderer_vulkan/vk_texel_buffer_range.h
     renderer_vulkan/vk_command_pool.cpp
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
@@ -240,6 +242,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_fsr4_upscaler.cpp
     renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/device_buffer_pool.h
     vulkan_common/ffx_files.h
     vulkan_common/ffx_runtime.cpp
     vulkan_common/ffx_runtime.h

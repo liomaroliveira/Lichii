@@ -34,6 +34,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/bounded_store.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_vertex_input.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -302,6 +303,12 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// Native mesh draws' vertex input, lent by the first key of each pipeline
+    MeshVertexInputs<GraphicsPipelineCacheKey> mesh_vertex_inputs;
+    /// mesh_vertex_inputs holds the mesh pipelines the boot load built
+    bool mesh_vertex_inputs_seeded{};
+    /// graphics_key holds vertex input another key lent it instead of the registers'
+    bool vertex_input_lent{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

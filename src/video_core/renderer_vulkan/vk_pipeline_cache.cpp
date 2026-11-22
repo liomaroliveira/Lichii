@@ -71,6 +71,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_cache_v2.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache_file.h"
@@ -1068,7 +1069,26 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         current_pipeline = nullptr;
         return nullptr;
     }
+    const bool mesh_draw =
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
+    if (vertex_input_lent && !mesh_draw) {
+        // Refresh keeps the key's vertex input until the registers change it.
+        vertex_input_lent = false;
+        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+    }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (mesh_draw) {
+        // Before the transitions, which hold the lender's key
+        if (!mesh_vertex_inputs_seeded) {
+            mesh_vertex_inputs_seeded = true;
+            for (const auto& [key, pipeline] : graphics_cache) {
+                if (pipeline && pipeline->IsMeshPipeline()) {
+                    mesh_vertex_inputs.Add(key);
+                }
+            }
+        }
+        vertex_input_lent |= mesh_vertex_inputs.Lend(graphics_key);
+    }
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};

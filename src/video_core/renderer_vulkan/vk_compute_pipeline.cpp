@@ -693,6 +693,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         buffer_cache.any_buffer_uploaded = false;
     }
 
+    if (guest_descriptor_queue.HasRejectedTexelBuffer()) {
+        return ConfigureResult::Failed;
+    }
+
     RescalingPushConstant rescaling;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
@@ -1036,6 +1040,10 @@ bool ComputePipeline::ExecuteSideB(const H2ComputePacketBase& pkt,
 
     if (!image_entries.empty()) {
         guest_descriptor_queue.AddEntries(image_entries);
+    }
+
+    if (guest_descriptor_queue.HasRejectedTexelBuffer()) {
+        return false;
     }
 
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {

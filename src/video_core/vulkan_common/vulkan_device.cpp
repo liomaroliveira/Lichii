@@ -1064,7 +1064,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::DeviceBuffers ? device_buffer_pool_block_size
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -1193,7 +1194,31 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
+namespace {
+// The first thread to report a lost or unresponsive device ends the process; the others park.
+void ClaimDeviceReport() {
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
+}
+} // Anonymous namespace
+
+void Device::ReportUnresponsive() const {
+    ClaimDeviceReport();
+    LOG_CRITICAL(Render_Vulkan,
+                 "Closing Lichii: the GPU stopped making progress (EDEN_NX2_GPU_WATCHDOG)");
+    Common::Log::Flush();
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+#endif
+    std::_Exit(EXIT_FAILURE);
+}
+
 void Device::ReportLoss() const {
+    ClaimDeviceReport();
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     ReportDeviceFault();
 
@@ -1339,6 +1364,20 @@ bool Device::IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags want
     }
     const auto supported_usage = GetFormatFeatures(it->second, format_type);
     return (supported_usage & wanted_usage) == wanted_usage;
+}
+
+VkDeviceSize Device::GetTexelBufferOffsetAlignment(VkDeviceSize texel_alignment) const {
+    const auto& limits = properties.texel_buffer_alignment;
+    if (limits.sType == 0) {
+        return properties.properties.limits.minTexelBufferOffsetAlignment;
+    }
+    const auto effective = [texel_alignment](VkDeviceSize alignment, VkBool32 single_texel) {
+        return single_texel ? (std::min)(alignment, texel_alignment) : alignment;
+    };
+    return (std::max)(effective(limits.uniformTexelBufferOffsetAlignmentBytes,
+                                limits.uniformTexelBufferOffsetSingleTexelAlignment),
+                      effective(limits.storageTexelBufferOffsetAlignmentBytes,
+                                limits.storageTexelBufferOffsetSingleTexelAlignment));
 }
 
 std::string Device::GetDriverName() const {
@@ -1649,6 +1688,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
         SetNext(next, properties.subgroup_size_control);
+    }
+    if (instance_version >= VK_API_VERSION_1_3 ||
+        features.texel_buffer_alignment.texelBufferAlignment) {
+        properties.texel_buffer_alignment.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES;
+        SetNext(next, properties.texel_buffer_alignment);
     }
     if (extensions.transform_feedback) {
         properties.transform_feedback.sType =
@@ -2348,6 +2393,17 @@ void Device::CollectPhysicalMemoryInfo() {
         device_access_memory += heap_size;
     }
     main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
+    if ((mem_properties.memoryHeaps[main_heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+        const u64 main_heap_budget = limit(budget.heapBudget[main_heap]);
+        device_buffer_pool_block_size = SelectDeviceBufferPoolBlockSize(
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            main_heap_size, main_heap_budget);
+        if (device_buffer_pool_block_size != SeparatePoolBlockSize) {
+            LOG_INFO(Render_Vulkan, "Device buffer pool: {} MiB blocks (heap {} MiB, budget {} MiB)",
+                     device_buffer_pool_block_size >> 20, main_heap_size >> 20,
+                     main_heap_budget >> 20);
+        }
+    }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;

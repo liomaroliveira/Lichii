@@ -249,6 +249,8 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    LOG_INFO(Frontend, "Removing the {} transferable shader cache of {:016x}",
+             target == GameListRemoveTarget::GlShaderCache ? "OpenGL" : "Vulkan", program_id);
     using VideoCommon::PipelineCacheClear;
     const auto result = [&] {
         switch (target) {
@@ -299,6 +301,7 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
 void RemoveVulkanDriverPipelineCache(u64 program_id) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    LOG_INFO(Frontend, "Removing the Vulkan driver pipeline cache of {:016x}", program_id);
     // Shader cache v2's driver blobs
     const auto binaries_file =
         shader_cache_folder_path / VideoCommon::ShaderCacheV2::DriverFileName;
@@ -328,6 +331,8 @@ void RemoveAllTransferableShaderCaches(u64 program_id) {
                                     tr("A shader cache for this title does not exist."));
         return;
     }
+    LOG_INFO(Frontend, "Removing every shader cache of {:016x}: {}", program_id,
+             Common::FS::PathToUTF8String(program_shader_cache_dir));
     if (Common::FS::RemoveDirRecursively(program_shader_cache_dir)) {
         QtCommon::Frontend::Information(tr("Successfully Removed"),
                                         tr("Successfully removed the transferable shader caches."));

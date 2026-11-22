@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/device_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -75,6 +76,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, TexelBufferAlignment, TEXEL_BUFFER_ALIGNMENT, texel_buffer_alignment)             \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
@@ -261,6 +263,10 @@ public:
     /// Reports a device loss.
     void ReportLoss() const;
 
+    /// Ends the process when submitted GPU work stopped making progress without the driver
+    /// reporting a loss (EDEN_NX2_GPU_WATCHDOG). Makes no Vulkan calls.
+    [[noreturn]] void ReportUnresponsive() const;
+
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
 
@@ -286,7 +292,11 @@ public:
         SparsePages,
         DeviceBuffers,
     };
-    static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize SeparatePoolBlockSize = DefaultSeparatePoolBlockSize;
+
+    VkDeviceSize GetDeviceBufferPoolBlockSize() const noexcept {
+        return device_buffer_pool_block_size;
+    }
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -432,6 +442,12 @@ public:
         return properties.properties.limits.maxStorageBufferRange;
     }
 
+    u32 GetMaxTexelBufferElements() const {
+        return properties.properties.limits.maxTexelBufferElements;
+    }
+
+    VkDeviceSize GetTexelBufferOffsetAlignment(VkDeviceSize texel_alignment) const;
+
     std::array<u32, 3> GetMaxComputeWorkGroupCount() const {
         const auto& count = properties.properties.limits.maxComputeWorkGroupCount;
         return {count[0], count[1], count[2]};
@@ -448,6 +464,7 @@ public:
     FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
     FN_MAX_LIMIT_ELEM(PerStageResources) \
     FN_MAX_LIMIT_ELEM(PerStageDescriptorSamplers) \
+    FN_MAX_LIMIT_ELEM(SamplerAllocationCount) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffersDynamic) \
@@ -1387,6 +1404,7 @@ private:
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
+        VkPhysicalDeviceTexelBufferAlignmentProperties texel_buffer_alignment{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary{};
@@ -1454,6 +1472,7 @@ private:
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
     u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
+    VkDeviceSize device_buffer_pool_block_size{SeparatePoolBlockSize};
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

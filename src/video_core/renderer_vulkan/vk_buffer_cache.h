@@ -43,7 +43,7 @@ public:
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
                     bool sparse_compatible_);
 
-    [[nodiscard]] VkBufferView View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format);
+    [[nodiscard]] VkBufferView View(VkDeviceSize offset, VkDeviceSize size, VkFormat format);
 
     [[nodiscard]] VkBuffer Handle() const noexcept {
         return *buffer;
@@ -88,9 +88,9 @@ public:
 
 private:
     struct BufferView {
-        u32 offset;
-        u32 size;
-        VideoCore::Surface::PixelFormat format;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        VkFormat format;
         vk::BufferView handle;
     };
 
@@ -334,16 +334,7 @@ public:
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
-                           VideoCore::Surface::PixelFormat format) {
-        // An unmapped texture buffer has no format; its view is the null buffer's anyway.
-        if (format == VideoCore::Surface::PixelFormat::Invalid) {
-            format = VideoCore::Surface::PixelFormat::R8_UNORM;
-        }
-        NoteCheckUse(buffer.Handle(), offset, size, UploadReorderCheck::Source::Texel);
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
-                                              TexelBufferFormat(format));
-    }
+                           VideoCore::Surface::PixelFormat format);
 
     bool ShouldLimitDynamicStorageBuffers() const {
         return limit_dynamic_storage_buffers;
@@ -371,14 +362,13 @@ private:
         }
     }
 
-    VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
-
     /// TEST (EDEN_NX2_GPU_COST): counts an upload by where it ran and why.
     void TraceUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies,
                      bool reordered);
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
+    VkDeviceSize NullBufferSize() const;
 
     const Device& device;
     MemoryAllocator& memory_allocator;

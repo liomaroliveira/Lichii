@@ -87,6 +87,8 @@ add_executable(tests
     video_core/native_pending_policy.cpp
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
+    video_core/descriptor_table.cpp
+    video_core/device_buffer_pool.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
     video_core/stale_targets.cpp
@@ -110,6 +112,7 @@ add_executable(tests
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
+    video_core/mesh_vertex_input.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
@@ -221,6 +224,7 @@ add_executable(tests
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
+    video_core/vk_texel_buffer_range.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp

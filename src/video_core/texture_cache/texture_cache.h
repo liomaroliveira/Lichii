@@ -6,11 +6,13 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <new>
 #include <vector>
 #include <tuple>
 #include <optional>
@@ -148,6 +150,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
+    host_oom_retry_frame = 0;
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -203,7 +206,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             MarkStaleTransfer(image);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            try {
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+            } catch (const std::bad_alloc&) {
+                NoteHostOutOfMemory("write back", image);
+                return false;
+            }
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
@@ -1126,8 +1135,8 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
         const auto [view_index, sampler_index] = Tegra::Texture::TexturePair(reads[i].raw, via_header_index);
         const u32 tic_index =
             Tegra::Texture::TextureHeaderIndex(view_index, image_table.current_limit, native_tiling);
-        if (!views[i].id || !samplers[i] || tic_index > image_table.current_limit ||
-            sampler_index > sampler_table.current_limit) {
+        if (!views[i].id || !samplers[i] || !image_table.ContainsIndex(tic_index) ||
+            !sampler_table.ContainsIndex(sampler_index)) {
             return;
         }
         const GPUVAddr tic_address = image_table.current_gpu_addr + tic_index * sizeof(TICEntry);
@@ -1270,13 +1279,13 @@ bool TextureCache<P>::SamplesRenderTarget(std::span<const ImageViewInOut> views)
 
 template <class P>
 typename P::Sampler* TextureCache<P>::GetSampler(u32 index, bool compute) {
-    return &slot_samplers[GetSamplerId(index, compute)];
+    return &GetSampler(GetSamplerId(index, compute));
 }
 
 template <class P>
 SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_sampler_table : channel_state->graphics_sampler_table;
-    if (index > table.current_limit) {
+    if (!table.ContainsIndex(index)) {
         LOG_TRACE(HW_GPU, "Invalid sampler index={}", index);
         return NULL_SAMPLER_ID;
     }
@@ -1291,12 +1300,19 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
 
 template <class P>
 const typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) const noexcept {
+    if (!slot_samplers.contains(id)) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_ERROR(HW_GPU, "Invalid sampler id {:#x}, using the null sampler", id.index);
+        }
+        return slot_samplers[NULL_SAMPLER_ID];
+    }
     return slot_samplers[id];
 }
 
 template <class P>
 typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) noexcept {
-    return slot_samplers[id];
+    return const_cast<Sampler&>(std::as_const(*this).GetSampler(id));
 }
 
 template <class P>
@@ -1520,7 +1536,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
                                                gpu_memory->UsesNativeTiling());
-    if (index > table.current_limit) {
+    if (!table.ContainsIndex(index)) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
     }
@@ -2497,9 +2513,31 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
 }
 
 template <class P>
+void TextureCache<P>::NoteHostOutOfMemory(std::string_view operation, const ImageBase& image) {
+    swizzle_data_buffer.release();
+    unswizzle_data_buffer.release();
+    host_oom_retry_frame = frame_tick + 60;
+    ++host_oom_failures;
+    const auto now = std::chrono::steady_clock::now();
+    if (host_oom_log_time == std::chrono::steady_clock::time_point{} ||
+        now - host_oom_log_time >= std::chrono::seconds{10}) {
+        LOG_ERROR(HW_GPU,
+                  "No host memory to {} image {:#x} ({} MiB); kept for a later try ({} failures "
+                  "since the last log)",
+                  operation, image.gpu_addr, image.guest_size_bytes >> 20, host_oom_failures);
+        host_oom_failures = 0;
+        host_oom_log_time = now;
+    }
+}
+
+template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
+        return;
+    }
+    if (frame_tick < host_oom_retry_frame && image.guest_size_bytes >= 64_MiB) {
+        runtime.TransitionImageLayout(image);
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
@@ -2593,14 +2631,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncUnswizzle(image, image_id);
         return;
     }
+    if (!UploadInChunks(image)) {
+        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+        try {
+            UploadImageContents(image, staging);
+        } catch (const std::bad_alloc&) {
+            image.flags |= ImageFlagBits::CpuModified;
+            if (False(image.flags & ImageFlagBits::Sparse) ||
+                True(image.flags & ImageFlagBits::Registered)) {
+                UntrackImage(image, image_id);
+            }
+            NoteHostOutOfMemory("upload", image);
+            runtime.TransitionImageLayout(image);
+            return;
+        }
+        runtime.InsertUploadMemoryBarrier();
+    }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
-    if (!UploadInChunks(image)) {
-        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-        UploadImageContents(image, staging);
-        runtime.InsertUploadMemoryBarrier();
-    }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
     // streams several GB of textures through it).
@@ -2913,8 +2962,14 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
 
-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
-        *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    std::span<const u8> swizzle_data;
+    if (const u8* direct = gpu_memory->GetSpan(gpu_addr, image.guest_size_bytes)) {
+        swizzle_data = {direct, image.guest_size_bytes};
+    } else {
+        swizzle_data_buffer.resize_destructive(image.guest_size_bytes);
+        gpu_memory->ReadBlockUnsafe(gpu_addr, swizzle_data_buffer.data(), image.guest_size_bytes);
+        swizzle_data = {swizzle_data_buffer.data(), swizzle_data_buffer.size()};
+    }
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
@@ -4231,8 +4286,16 @@ void TextureCache<P>::ForEachSparseSegment(ImageBase& image, Func&& func) {
     constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
     const auto segments = gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes);
     for (const auto& [gpu_addr, size] : segments) {
-        std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!cpu_addr) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(HW_GPU,
+                            "Skipping sparse texture segment {:#x}+{:#x}: no device address",
+                            gpu_addr, size);
+            }
+            continue;
+        }
         if constexpr (RETURNS_BOOL) {
             if (func(gpu_addr, *cpu_addr, size)) {
                 break;

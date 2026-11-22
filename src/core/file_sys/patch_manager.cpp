@@ -53,6 +53,27 @@ struct BuiltinPatchRecord {
     bool executable_padding = false;
 };
 
+// A hook at an instruction known only by its function: `pattern` must occur once, word-aligned,
+// in [function_offset, function_offset + function_size); its first instruction becomes a branch to
+// `cave`, whose last word becomes the branch back to the next one. A hook whose site is not found
+// is left out while the rest of its patch applies: the game keeps its own code there and the cave
+// is never reached.
+struct BuiltinPatchHook {
+    std::string_view name;
+    size_t function_offset;
+    size_t function_size;
+    std::span<const u8> pattern;
+    size_t cave_offset;
+    std::span<const u8> cave;
+};
+
+struct InstalledBuiltinHook {
+    std::string_view patch;
+    u64 site;
+    u64 cave;
+    size_t cave_size;
+};
+
 struct BuiltinPatchState {
     size_t offset = 0;
     size_t size = 0;
@@ -66,6 +87,7 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     // Zero-initialized BSS ranges the routines keep their state in.
     std::span<const BuiltinPatchState> states{};
+    std::span<const BuiltinPatchHook> hooks{};
     // Another built-in this one contains; it is skipped once this one is applied.
     std::string_view replaces{};
     std::string_view requires_patch{};
@@ -406,6 +428,38 @@ constexpr std::array EPONA_JUMP_RECORDS{
     BuiltinPatchRecord{EPONA_JUMP_CAVE_OFFSET, EPONA_JUMP_ROUTINE, {}, true},
 };
 
+// The physics world's solver steps (port of Hookshot's fix by hckrman101, Z-TOON/Hookshot
+// 8fcc8c22b9, GPL-3.0): each update the game sets them to (int)(step * the steps of a 60 fps
+// frame + 0.001), stored at the solver's +0x2C8 (main+0x38AEB80 and main+0x38AFC10, the same code
+// in both). Below a step of 1 that is cut short, and it is 0 above 480 fps with 8 steps a frame:
+// Link slides off moving platforms, and Hookshot saw a null read in the collision code at 640-700
+// fps in the quick menu, which may be the crash after the R1 menu at ~580 fps in ZOR-455. The
+// routine rounds the count up while the step is under 1, with 0.1 of leeway for frame-time jitter,
+// and keeps it at least 1 and never below the game's. Each function's site, fcvtzs w1, s0 ;
+// str w1, [x0, #0x2c8], is found by those two instructions, as Hookshot's lifted code has them.
+constexpr size_t SOLVER_STEPS_FUNCTION_SIZE = 0x1090;
+constexpr std::array<u8, 8> SOLVER_STEPS_SITE{0x01, 0x00, 0x38, 0x1E, 0x01, 0xC8, 0x02, 0xB9};
+// fcvtzs w1, s0 ; stp x2, x3, [sp, #-16]! ; stp q2, q3, [sp, #-32]! ; mrs x2, nzcv ;
+// s2 = s0 - 0.001 (the cut float) ; to done unless 0 < s2 < s1 (the steps of a 60 fps frame) and
+// s1 <= 1000 ; w3 = ceil(s2 - 0.1), at least 1 ; w1 = max(w3, w1) ;
+// done: msr nzcv, x2 ; ldp q2, q3, [sp], #32 ; ldp x2, x3, [sp], #16 ; b back
+constexpr std::array<u8, 124> SOLVER_STEPS_ROUTINE{
+    0x01, 0x00, 0x38, 0x1E, 0xE2, 0x0F, 0xBF, 0xA9, 0xE2, 0x0F, 0xBF, 0xAD, 0x02, 0x42, 0x3B, 0xD5,
+    0xE3, 0x4D, 0x82, 0x52, 0x63, 0x50, 0xA7, 0x72, 0x62, 0x00, 0x27, 0x1E, 0x02, 0x38, 0x22, 0x1E,
+    0x48, 0x20, 0x20, 0x1E, 0x4D, 0x02, 0x00, 0x54, 0x28, 0x20, 0x20, 0x1E, 0x0D, 0x02, 0x00, 0x54,
+    0x40, 0x20, 0x21, 0x1E, 0xCA, 0x01, 0x00, 0x54, 0x43, 0x8F, 0xA8, 0x52, 0x63, 0x00, 0x27, 0x1E,
+    0x20, 0x20, 0x23, 0x1E, 0x4C, 0x01, 0x00, 0x54, 0xA3, 0x99, 0x99, 0x52, 0x83, 0xB9, 0xA7, 0x72,
+    0x63, 0x00, 0x27, 0x1E, 0x42, 0x38, 0x23, 0x1E, 0x43, 0x00, 0x28, 0x1E, 0x7F, 0x04, 0x00, 0x71,
+    0x63, 0xA4, 0x9F, 0x1A, 0x7F, 0x00, 0x01, 0x6B, 0x61, 0xC0, 0x81, 0x1A, 0x02, 0x42, 0x1B, 0xD5,
+    0xE2, 0x0F, 0xC1, 0xAC, 0xE2, 0x0F, 0xC1, 0xA8, 0x00, 0x00, 0x00, 0x14,
+};
+constexpr std::array FPS_UNLOCK_HOOKS{
+    BuiltinPatchHook{"solver steps", 0x38AEB80, SOLVER_STEPS_FUNCTION_SIZE, SOLVER_STEPS_SITE,
+                     0x3C46400, SOLVER_STEPS_ROUTINE},
+    BuiltinPatchHook{"solver steps", 0x38AFC10, SOLVER_STEPS_FUNCTION_SIZE, SOLVER_STEPS_SITE,
+                     0x3C46480, SOLVER_STEPS_ROUTINE},
+};
+
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
@@ -618,6 +672,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
         .states = FPS_UNLOCK_STATES,
+        .hooks = FPS_UNLOCK_HOOKS,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
     BuiltinPatch{
@@ -1138,6 +1193,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     const auto disabled = GetDisabledAddons();
     std::vector<std::string_view> replaced;
     std::vector<std::string_view> applied;
+    std::vector<InstalledBuiltinHook> installed_hooks;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
@@ -1263,6 +1319,64 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         for (const auto& record : patch.records) {
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
                         record.bytes.data(), record.bytes.size());
+        }
+        for (const auto& hook : patch.hooks) {
+            const auto& text = header.segments[0];
+            const u64 text_end = u64{text.location} + text.size;
+            const u64 executable_end = (text_end + 0xFFF) & ~u64{0xFFF};
+            const u64 function_end =
+                (std::min<u64>)(hook.function_offset + hook.function_size, text_end);
+            size_t site = 0;
+            size_t found = 0;
+            for (u64 at = hook.function_offset;
+                 at + hook.pattern.size() <= function_end && fits(nso, at, hook.pattern.size());
+                 at += sizeof(u32)) {
+                if (std::equal(hook.pattern.begin(), hook.pattern.end(),
+                               nso.begin() + sizeof(Loader::NSOHeader) + at)) {
+                    site = at;
+                    ++found;
+                }
+            }
+            const size_t cave = sizeof(Loader::NSOHeader) + hook.cave_offset;
+            const auto untouched = [&](size_t offset, size_t size) {
+                return std::equal(nso.begin() + offset, nso.begin() + offset + size,
+                                  out.begin() + offset);
+            };
+            const char* problem = nullptr;
+            if (found != 1) {
+                problem = found == 0 ? "its instruction is not in the function"
+                                     : "its instruction is in the function more than once";
+            } else if (hook.cave_offset < text_end ||
+                       hook.cave_offset + hook.cave.size() > executable_end ||
+                       hook.cave_offset + hook.cave.size() > header.segments[1].location ||
+                       !fits(nso, hook.cave_offset, hook.cave.size()) ||
+                       !fits(out, hook.cave_offset, hook.cave.size()) ||
+                       !std::all_of(nso.begin() + cave, nso.begin() + cave + hook.cave.size(),
+                                    [](u8 byte) { return byte == 0; })) {
+                problem = "its code cave is not executable padding";
+            } else if (!fits(out, site, hook.pattern.size()) ||
+                       !untouched(cave, hook.cave.size()) ||
+                       !untouched(sizeof(Loader::NSOHeader) + site, hook.pattern.size())) {
+                problem = "a user mod already patched it";
+            }
+            if (problem != nullptr) {
+                LOG_WARNING(Loader, "    - \"{}\" leaves out its {} hook in {}+{:#x}: {}",
+                            patch.name, hook.name, name, hook.function_offset, problem);
+                continue;
+            }
+            const auto branch = [](u64 from, u64 to) {
+                const auto words = static_cast<s64>(to - from) >> 2;
+                return static_cast<u32>(0x14000000 | (words & 0x03FFFFFF));
+            };
+            const u64 back = hook.cave_offset + hook.cave.size() - sizeof(u32);
+            const u32 to_cave = branch(site, hook.cave_offset);
+            const u32 to_site = branch(back, site + sizeof(u32));
+            std::memcpy(out.data() + cave, hook.cave.data(), hook.cave.size() - sizeof(u32));
+            std::memcpy(out.data() + sizeof(Loader::NSOHeader) + back, &to_site, sizeof(u32));
+            std::memcpy(out.data() + sizeof(Loader::NSOHeader) + site, &to_cave, sizeof(u32));
+            installed_hooks.push_back({patch.name, site, hook.cave_offset, hook.cave.size()});
+            LOG_INFO(Loader, "    - \"{}\": {} hook at {}+{:#x}", patch.name, hook.name, name,
+                     site);
         }
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
                  patch.records.size(), name);

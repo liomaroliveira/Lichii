@@ -416,15 +416,10 @@ void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     }
 }
 
-bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
                                                  const VmaAllocationCreateInfo& alloc_ci,
                                                  VkBuffer& handle, VmaAllocation& allocation,
                                                  VmaAllocationInfo& alloc_info) const {
-    // The buffer cache's buffers, churned by its collector: in a pool of their own (see
-    // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::SeparatePoolBlockSize / 2) {
-        return false;
-    }
     u32 memory_type{};
     {
         std::scoped_lock lk{buffer_type_mutex};
@@ -445,8 +440,19 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
     VmaAllocationCreateInfo pool_ci = alloc_ci;
     pool_ci.pool = pool;
     pool_ci.memoryTypeBits = 0;
-    return vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
-           VK_SUCCESS;
+    if (vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) != VK_SUCCESS) {
+        return false;
+    }
+    const auto block_size = device.GetDeviceBufferPoolBlockSize();
+    if (block_size == SmallDeviceBufferPoolBlockSize &&
+        !FitsDeviceBufferPool(alloc_info.size, 0, block_size)) {
+        vmaDestroyBuffer(allocator, handle, allocation);
+        handle = {};
+        allocation = {};
+        alloc_info = {};
+        return false;
+    }
+    return true;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
@@ -470,7 +476,9 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
+    if (usage != MemoryUsage::DeviceLocal ||
+        !FitsDeviceBufferPool(ci.size, 0, device.GetDeviceBufferPoolBlockSize()) ||
+        !CreateBufferInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)) {
         VkResult result =
             vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
