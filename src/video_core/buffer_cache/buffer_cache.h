@@ -2216,7 +2216,6 @@ void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& m
 
 template <class P>
 void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta) {
-    storage_keep.active_for_draw = false;
     UniformKeep& keep = uniform_keep;
     const u64 sync_serial = Nx2FastDraw::SyncSerial();
     const u64 host_serial = gpu_memory != nullptr ? gpu_memory->HostPointerSerial() : 0;
@@ -2224,50 +2223,6 @@ void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta) {
                        keep.draw_deletions == buffer_deletions &&
                        keep.sync_serial == sync_serial && keep.host_serial == host_serial &&
                        keep.gpu_memory == gpu_memory;
-    if (SsboKeepEnabled() && storage_keep.valid) {
-        bool ssbo_valid =
-            known && storage_keep.channel == channel_state &&
-            storage_keep.gpu_memory == gpu_memory && gpu_memory != nullptr &&
-            storage_keep.map_serial == gpu_memory->MapSerial() &&
-            storage_keep.deletions == buffer_deletions &&
-            storage_keep.native_turing == maxwell3d->GetNativeMacroEngine().native_turing;
-        for (u32 i = 0; i < storage_keep.num_sources && ssbo_valid; ++i) {
-            const StorageSource& src = storage_keep.sources[i];
-            if (((delta->binds[src.stage] >> src.cbuf_index) & 1U) != 0) {
-                ssbo_valid = false;
-                break;
-            }
-            const GPUVAddr gpu_begin = src.gpu_addr;
-            const GPUVAddr gpu_end = src.gpu_addr + 16;
-            for (u32 w = 0; w < delta->num_writes; ++w) {
-                if (delta->write_begin[w] < gpu_end && gpu_begin < delta->write_end[w]) {
-                    ssbo_valid = false;
-                    break;
-                }
-            }
-            if (!ssbo_valid) {
-                break;
-            }
-            const DAddr dev_begin = src.dev_addr;
-            const DAddr dev_end = src.dev_addr + 16;
-            for (u32 w = 0; w < delta->num_device_writes; ++w) {
-                if (delta->device_begin[w] < dev_end && dev_begin < delta->device_end[w]) {
-                    ssbo_valid = false;
-                    break;
-                }
-            }
-            if (!ssbo_valid) {
-                break;
-            }
-            for (const auto& [write_begin, write_end] : keep.memory_writes) {
-                if (write_begin < dev_end && dev_begin < write_end) {
-                    ssbo_valid = false;
-                    break;
-                }
-            }
-        }
-        storage_keep.valid = ssbo_valid;
-    }
     keep.draw_deletions = buffer_deletions;
     keep.gpu_memory = gpu_memory;
     keep.sync_serial = sync_serial;
@@ -2299,127 +2254,6 @@ void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta) {
     }
     keep.memory_writes.clear();
     keep.memory_writes_lost = false;
-}
-
-template <class P>
-bool BufferCache<P>::TryKeepGraphicsStorageBuffers(const void* pipeline) {
-    if (!SsboKeepEnabled() || !storage_keep.valid || storage_keep.pipeline != pipeline ||
-        storage_keep.channel != channel_state || storage_keep.deletions != buffer_deletions ||
-        storage_keep.native_turing != maxwell3d->GetNativeMacroEngine().native_turing) {
-        return false;
-    }
-    ++storage_keep_stats.kept;
-    if (!SsboKeepVerifyEnabled()) {
-        storage_keep.active_for_draw = true;
-    }
-    return true;
-}
-
-template <class P>
-void BufferCache<P>::BeginCaptureGraphicsStorage(const void* pipeline, bool eligible) {
-    const bool capture = eligible && SsboKeepEnabled();
-    storage_keep.pipeline = pipeline;
-    storage_keep.channel = channel_state;
-    storage_keep.gpu_memory = gpu_memory;
-    storage_keep.map_serial = gpu_memory != nullptr ? gpu_memory->MapSerial() : 0;
-    storage_keep.deletions = buffer_deletions;
-    storage_keep.native_turing = maxwell3d->GetNativeMacroEngine().native_turing;
-    storage_keep.valid = false;
-    storage_keep.active_for_draw = false;
-    storage_keep.has_multi_range = true;
-    storage_keep.capturing = capture;
-    storage_keep.capture_ok = capture;
-    storage_keep.num_sources = 0;
-}
-
-template <class P>
-void BufferCache<P>::EndCaptureGraphicsStorage() noexcept {
-    storage_keep.capturing = false;
-    storage_keep.valid = storage_keep.capture_ok;
-}
-
-template <class P>
-void BufferCache<P>::SnapshotGraphicsStorageBuffers() {
-    if (!storage_verify_snapshot) {
-        storage_verify_snapshot = std::make_unique<GraphicsStorageSnapshot>();
-    }
-    storage_verify_snapshot->enabled = channel_state->enabled_storage_buffers;
-    storage_verify_snapshot->written = channel_state->written_storage_buffers;
-    storage_verify_snapshot->bindings = channel_state->storage_buffers;
-}
-
-template <class P>
-void BufferCache<P>::VerifyGraphicsStorageBuffers(u64 pipeline_hash,
-                                                  const std::array<bool, NUM_STAGES>& stages) {
-    if (!storage_verify_snapshot) {
-        return;
-    }
-    const GraphicsStorageSnapshot& prev = *storage_verify_snapshot;
-    bool mismatch = false;
-    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        if (!stages[stage]) {
-            continue;
-        }
-        const u64 prev_enabled = prev.enabled[stage];
-        const u64 curr_enabled = channel_state->enabled_storage_buffers[stage];
-        const u64 prev_written = prev.written[stage];
-        const u64 curr_written = channel_state->written_storage_buffers[stage];
-        if (prev_enabled != curr_enabled || prev_written != curr_written) {
-            mismatch = true;
-            if (storage_keep_verify_logged < 16) {
-                ++storage_keep_verify_logged;
-                LOG_ERROR(Render_Vulkan,
-                          "SSBO keep verify mismatch: pipeline {:016x} stage {} masks "
-                          "prev=(en:{:#x},wr:{:#x}) curr=(en:{:#x},wr:{:#x})",
-                          pipeline_hash, stage, prev_enabled, prev_written, curr_enabled,
-                          curr_written);
-            }
-            continue;
-        }
-        ForEachEnabledBit(curr_enabled, [&](u32 index) {
-            const Binding& a = prev.bindings[stage][index];
-            const Binding& b = channel_state->storage_buffers[stage][index];
-            if (a.device_addr != b.device_addr || a.size != b.size) {
-                mismatch = true;
-                if (storage_keep_verify_logged < 16) {
-                    ++storage_keep_verify_logged;
-                    LOG_ERROR(Render_Vulkan,
-                              "SSBO keep verify mismatch: pipeline {:016x} stage {} slot {} "
-                              "prev=(addr:{:#x},size:{:#x}) curr=(addr:{:#x},size:{:#x})",
-                              pipeline_hash, stage, index, a.device_addr, a.size, b.device_addr,
-                              b.size);
-                }
-            }
-        });
-    }
-    if (mismatch) {
-        ++storage_keep_stats.verify_mismatches;
-    }
-}
-
-template <class P>
-void BufferCache<P>::ReportStorageKeepStats() {
-    if (!Nx2Profile::Enabled() && !SsboKeepVerifyEnabled()) {
-        return;
-    }
-    StorageKeepStats& stats = storage_keep_stats;
-    if (((stats.kept + stats.full) & 1023) != 0) {
-        return;
-    }
-    const u64 now = Nx2Profile::Now();
-    if (stats.window_start == 0) {
-        stats.window_start = now;
-        return;
-    }
-    if (now - stats.window_start < 10'000'000'000ULL) {
-        return;
-    }
-    LOG_INFO(Render_Vulkan,
-             "SSBO keep in 10 s: kept {}, full {}, sync_skipped {} / {}, "
-             "verify_mismatches {}, sync_verify_mismatches {}",
-             stats.kept, stats.full, stats.syncs_skipped, stats.syncs, stats.verify_mismatches,
-             stats.sync_verify_mismatches);
-    stats = {.window_start = now};
 }
 
 template <class P>
@@ -2463,10 +2297,6 @@ void BufferCache<P>::SetComputeUniformBufferState(u32 mask,
 
 template <class P>
 void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
-    if (!storage_keep.capturing) {
-        storage_keep.valid = false;
-        storage_keep.active_for_draw = false;
-    }
     if (channel_state->enabled_storage_buffers[stage] == 0) {
         return;
     }
@@ -2485,9 +2315,6 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
                                                u32 cbuf_offset, bool is_written,
                                                u32 indirect_offset) {
     if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
-        if (storage_keep.capturing) {
-            storage_keep.capture_ok = false;
-        }
         LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
                   stage, ssbo_index);
         return false;
@@ -2498,9 +2325,6 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             const u32 max_bindings = runtime.GetMaxDynamicStorageBuffers();
             if (channel_state->total_graphics_storage_buffers >= max_bindings) {
-                if (storage_keep.capturing) {
-                    storage_keep.capture_ok = false;
-                }
                 LOG_WARNING(HW_GPU,
                             "Skipping graphics storage buffer {} due to driver limit {}",
                             ssbo_index, max_bindings);
@@ -2518,21 +2342,6 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    if (storage_keep.capturing && storage_keep.capture_ok) {
-        if (indirect_offset != ~0U || storage_keep.num_sources >= 32 ||
-            ((ssbo_addr & (DEVICE_PAGESIZE - 1)) + 16) > DEVICE_PAGESIZE) {
-            storage_keep.capture_ok = false;
-        } else if (const auto dev = gpu_memory->GpuToCpuAddress(ssbo_addr); dev.has_value()) {
-            storage_keep.sources[storage_keep.num_sources++] = StorageSource{
-                .stage = static_cast<u8>(stage),
-                .cbuf_index = static_cast<u8>(cbuf_index),
-                .gpu_addr = ssbo_addr,
-                .dev_addr = *dev,
-            };
-        } else {
-            storage_keep.capture_ok = false;
-        }
-    }
     GPUVAddr holder{};
     if (indirect_offset != ~0U) {
         // The pointer is an entry of a table the constant buffer points to.
@@ -3263,6 +3072,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const Binding& binding = channel_state->uniform_buffers[stage][index];
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
+    Buffer& buffer = slot_buffers[binding.buffer_id];
+    TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
@@ -3270,12 +3081,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const bool native_bank = has_host_buffer &&
                              (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
                              size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
-    const bool ubo_opt = VideoCommon::UboOptEnabled();
-    Buffer* buffer_ptr = nullptr;
-    if (!ubo_opt) {
-        buffer_ptr = &slot_buffers[binding.buffer_id];
-        TouchBuffer(*buffer_ptr, binding.buffer_id);
-    }
     bool verify_kept = false;
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
         // Unnoticed writes would reach a kept bank too: those stream as before.
@@ -3306,30 +3111,18 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         uniform_keep.clean[stage] &= ~(1u << index);
     }
-    if (ubo_opt) {
-        buffer_ptr = &slot_buffers[binding.buffer_id];
-        TouchBuffer(*buffer_ptr, binding.buffer_id);
-    }
-    Buffer& buffer = *buffer_ptr;
-    u32 offset = 0;
-    bool offset_computed = false;
-    bool needs_alignment_stream = false;
-    const auto compute_offset_and_alignment = [&]() {
-        if (offset_computed) {
-            return;
-        }
-        offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
-        offset_computed = true;
-        if constexpr (!IS_OPENGL) {
-            if (has_host_buffer) {
-                const u32 alignment = runtime.GetUniformBufferAlignment();
-                needs_alignment_stream = alignment > 1 && (offset % alignment) != 0;
+    const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+    const bool needs_alignment_stream = [&]() {
+        if constexpr (IS_OPENGL) {
+            return false;
+        } else {
+            if (!has_host_buffer) {
+                return false;
             }
+            const u32 alignment = runtime.GetUniformBufferAlignment();
+            return alignment > 1 && (offset % alignment) != 0;
         }
-    };
-    if (!ubo_opt) {
-        compute_offset_and_alignment();
-    }
+    }();
     // Ocarina of Time is left out (unless EDEN_NX2_PERF_VERIFY=1): a compare of its banks against
     // shadow copies found no page changed behind the tracker, and the uploads cost frame rate.
     constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
@@ -3373,23 +3166,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
-    bool use_fast_buffer = false;
-    if (ubo_opt) {
-        const bool small_unmodified =
-            has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-            !memory_tracker.IsRegionGpuModified(device_addr, size);
-        if (small_unmodified) {
-            use_fast_buffer = true;
-        } else {
-            compute_offset_and_alignment();
-            use_fast_buffer = needs_alignment_stream;
-        }
-    } else {
-        use_fast_buffer =
-            needs_alignment_stream ||
-            (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-             !memory_tracker.IsRegionGpuModified(device_addr, size));
-    }
+    const bool use_fast_buffer = needs_alignment_stream
+        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+            && !memory_tracker.IsRegionGpuModified(device_addr, size));
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
@@ -3424,8 +3203,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds;
                 streamed = VideoCommon::BindSmallUniformReusing(
-                    runtime, device_memory, stage, index, binding_index, device_addr, size,
-                    ubo_opt && !ubo_keep_verify);
+                    runtime, device_memory, stage, index, binding_index, device_addr, size);
                 const u64 rebound =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds -
@@ -3588,12 +3366,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        if (SsboKeepEnabled()) {
-            const u32 slot_offset = static_cast<u32>((stage * 6 + index) % STORAGE_SYNC_SLOTS);
-            SynchronizeStorageBuffer(slot_offset, binding.buffer_id, binding.device_addr, size);
-        } else {
-            SynchronizeBuffer(buffer, binding.device_addr, size);
-        }
+        SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -3832,10 +3605,6 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
         }
         RefreshMultiRangeSegments(graphics_segments);
     });
-    if (!storage_keep.active_for_draw && storage_keep.valid) {
-        storage_keep.deletions = buffer_deletions;
-        storage_keep.has_multi_range = !graphics_segments.empty();
-    }
 }
 
 template <class P>
@@ -4034,15 +3803,6 @@ template <class P>
 void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
     if (channel_state->enabled_storage_buffers[stage] == 0) [[likely]] {
         return;
-    }
-    if (storage_keep.active_for_draw && !storage_keep.has_multi_range &&
-        storage_keep.deletions == buffer_deletions &&
-        !Settings::IsGPUFenceBehaviorAccurate()) [[likely]] {
-        return;
-    }
-    if (storage_keep.active_for_draw && storage_keep.deletions != buffer_deletions) {
-        storage_keep.active_for_draw = false;
-        storage_keep.valid = false;
     }
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         // Resolve buffer
@@ -4870,39 +4630,6 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
 }
 
 template <class P>
-void BufferCache<P>::SynchronizeStorageBuffer(u32 slot_offset, BufferId buffer_id,
-                                              DAddr device_addr, u32 size) {
-    Buffer& buffer = slot_buffers[buffer_id];
-    const u32 slot = STORAGE_SYNC_BASE + slot_offset;
-    GeometrySync& sync = storage_syncs[slot_offset];
-    ++storage_keep_stats.syncs;
-    if (memory_tracker.IsSynchronized(slot) && sync.buffer_id == buffer_id &&
-        sync.device_addr == device_addr && sync.size == size &&
-        sync.deletions == buffer_deletions) {
-        ++storage_keep_stats.syncs_skipped;
-        if (SsboKeepVerifyEnabled() && !SynchronizeBuffer(buffer, device_addr, size)) {
-            ++storage_keep_stats.sync_verify_mismatches;
-            if (storage_keep_sync_verify_logged < 16) {
-                ++storage_keep_sync_verify_logged;
-                LOG_ERROR(Render_Vulkan,
-                          "SSBO keep sync verify mismatch: slot {} (offset {}) buffer {} "
-                          "addr {:#x} size {:#x} still had pending uploads",
-                          slot, slot_offset, buffer_id.index, device_addr, size);
-            }
-        }
-        return;
-    }
-    SynchronizeBuffer(buffer, device_addr, size);
-    sync = GeometrySync{
-        .buffer_id = buffer_id,
-        .device_addr = device_addr,
-        .size = size,
-        .deletions = buffer_deletions,
-    };
-    memory_tracker.WatchSynchronized(slot, device_addr, size);
-}
-
-template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
@@ -5162,8 +4889,6 @@ template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
-    storage_keep.valid = false;
-    storage_keep.active_for_draw = false;
     // A slot id is reused by the next buffer: forget the native banks uploaded into this one.
     std::erase_if(native_bank_uploads,
                   [buffer_id](const auto& entry) { return entry.second.buffer_id == buffer_id; });

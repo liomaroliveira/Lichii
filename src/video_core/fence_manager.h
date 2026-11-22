@@ -28,7 +28,6 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -102,7 +101,6 @@ public:
             NoteFenceDecision(delay_fence, committed_flushes);
         }
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
-            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::FenceSkipped);
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
             rasterizer.InvalidateGPUCache();
@@ -130,7 +128,6 @@ public:
             }
         }
         pending_flushes.push_back(committed_flushes);
-        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Fence);
         QueueFence(new_fence);
         if (!delay_fence) {
             func();

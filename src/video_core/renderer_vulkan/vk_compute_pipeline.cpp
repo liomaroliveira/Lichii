@@ -15,7 +15,6 @@
 #include <fmt/format.h>
 
 #include "video_core/nx2_back_split.h"
-#include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
@@ -686,9 +685,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }};
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
-    if (index > 0) {
-        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexBufferBind);
-    }
 
     buffer_cache.UpdateComputeBuffers();
     buffer_cache.BindHostComputeBuffers();
@@ -844,7 +840,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 void ComputePipeline::PrepareSideA(const Tegra::Engines::KeplerCompute& kepler_compute,
                                    Tegra::MemoryManager& gpu_memory, TextureCache& texture_cache,
                                    H2ComputePacket& pkt) {
-    const VideoCommon::Nx2H2Model::SideScope h2_a{VideoCommon::Nx2H2Model::Side::A};
     pkt.fallback_sync = false;
     pkt.is_rescaling = false;
     pkt.rescaling_words = {};
@@ -998,9 +993,6 @@ void ComputePipeline::PrepareSideA(const Tegra::Engines::KeplerCompute& kepler_c
     }};
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
-    if (!pkt.tex_buffers.empty()) {
-        VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::TexBufferBind);
-    }
 
     RescalingPushConstant rescaling;
     ImageDescriptorSink sink;
@@ -1016,7 +1008,6 @@ bool ComputePipeline::ExecuteSideB(const H2ComputePacketBase& pkt,
                                    std::span<const DescriptorUpdateEntry> image_entries,
                                    std::span<const H2TexBufferBind> tex_buffers,
                                    Scheduler& scheduler, BufferCache& buffer_cache) {
-    const VideoCommon::Nx2H2Model::SideScope h2_b{VideoCommon::Nx2H2Model::Side::B};
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);

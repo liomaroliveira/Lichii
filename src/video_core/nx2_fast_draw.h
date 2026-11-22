@@ -98,21 +98,6 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
-/// EDEN_NX2_REVISIT_OPT: 1 = per-pipeline RevisitRecord + neutral fragment_barrier (H4a);
-/// 2 = also neutral invalidate_texture_data_cache (0x3dd) & wait_for_idle (0x44) and allow
-/// RevisitDraw across WaitForIdle render pass breaks (H4b).
-[[nodiscard]] inline int RevisitOptLevel() {
-    static const int level = [] {
-        const char* value = std::getenv("EDEN_NX2_REVISIT_OPT");
-        return value != nullptr && value[0] != '\0' ? std::atoi(value) : 0;
-    }();
-    return level;
-}
-
-[[nodiscard]] inline bool RevisitOptEnabled() {
-    return RevisitOptLevel() >= 1;
-}
-
 /// On their own cache lines, away from what every thread reads (g_enabled).
 alignas(64) inline std::atomic<u64> g_serial{1};
 /// Bumped by every break but a 3D register change: register writes change no memory, so draws

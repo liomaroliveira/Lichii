@@ -617,19 +617,6 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
-    // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
-    static const GPUVAddr watch = [] {
-        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-        return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
-    }();
-    if (watch != 0 && (regs.semaphore_address.SemaphoreAddress() & ~GPUVAddr{0xf}) == watch) {
-        LOG_INFO(HW_GPU, "Semaphore watch: channel {} as {} device {:#x} op {} {:#x} value {:#x} (now {:#x})",
-                 dma_pusher.channel_state.bind_id, dma_pusher.memory_manager.GetID(),
-                 dma_pusher.memory_manager.GpuToCpuAddress(regs.semaphore_address.SemaphoreAddress()).value_or(0),
-                 static_cast<u32>(op),
-                 regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence,
-                 dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()));
-    }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;

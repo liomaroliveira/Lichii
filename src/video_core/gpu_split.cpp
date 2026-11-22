@@ -38,7 +38,6 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_h2_model.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -903,7 +902,6 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     }
     case Kind::Call: {
         if ((head & FastDrawNeutral) == 0) {
-            VideoCommon::Nx2H2Model::NoteBarrier(VideoCommon::Nx2H2Model::Barrier::Call);
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
@@ -933,7 +931,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
-    VideoCommon::Nx2H2Model::MarkBackThread();
     back_running.store(true, std::memory_order_release);
     // E04.T6 step 3g: with the legacy back split, FastDraw breaks ship with each draw;
     // under E04.T12 H2Async, FastDraw runs on Stage A, so Nx2FastDraw::t_stage_a stays false
@@ -981,13 +978,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
         VideoCommon::BackSplit::MaybeReport();
-        VideoCommon::Nx2H2Model::MaybeReport();
         MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
-            const VideoCommon::Nx2H2Model::SideScope h2_idle_scope{
-                VideoCommon::Nx2H2Model::Side::Idle};
             const GpuWaitStats::IdleScope idle{GpuWaitStats::g_back_idle_ns};
             if (idle_trace && idle_since == 0) {
                 idle_since = BackIdleTrace::Now();
@@ -1048,7 +1042,6 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
-        const VideoCommon::Nx2H2Model::SideScope h2_work_scope{VideoCommon::Nx2H2Model::Side::A};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             back_entry_start = read_position;

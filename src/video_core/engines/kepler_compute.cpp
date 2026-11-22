@@ -218,16 +218,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const u32 entry = ((*native_executing_macro - 0xe00) / 2) % native_macro_positions.size();
         native_executing_macro_logged = native_executing_macro;
         native_executing_macro.reset();
-        static const u32 watch = [] {
-            const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-            return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
-        }();
-        const bool watched = watch != 0 && std::ranges::any_of(native_parameters,
-            [](u32 parameter) { return (parameter & ~0xfU) == watch; });
-        if (watched) {
-            LOG_INFO(HW_GPU, "Semaphore watch: compute macro start={:#x} parameters={:08x}",
-                     native_macro_positions[entry], fmt::join(native_parameters, ","));
-        }
         // EDEN_NX2_MME_DUMP: write the compute macro code once per engine, and log each macro
         // call with its entry and parameters (diagnostics).
         if (static const bool mme_dump = std::getenv("EDEN_NX2_MME_DUMP") != nullptr; mme_dump) {
@@ -247,8 +237,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const u32 start = native_macro_positions[entry];
         const auto emit = [&](u32 address, u32 value) {
             static u32 diagnostic_writes{};
-            static const bool log_emits = std::getenv("EDEN_NX2_SEM_WATCH_EMITS") != nullptr;
-            if (watched && log_emits) LOG_INFO(HW_GPU, "Semaphore watch: compute macro emit {:#x} = {:#x}", address, value);
             if (diagnostic_writes++ < 4096) LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
             if (address >= 0xe00) return false;
             VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
@@ -491,13 +479,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                                              *device, address, guest, value, combine),
                                 Tegra::Nx2SemaphoreWaiters::Source::QmdReduction);
                         }
-                        static const u64 watch = [] {
-                            const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
-                            return text ? u64{std::strtoull(text, nullptr, 16)} : u64{};
-                        }();
-                        if (watch != 0 && (address & ~u64{0xf}) == watch) {
-                            LOG_INFO(HW_GPU, "Semaphore watch: QMD release reduction {:#x} -> {:#x}", address, value);
-                        }
                         VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
                             memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
                     });
@@ -527,13 +508,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         }
                     });
                 } else {
-                    static const u64 watch = [] {
-                        const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
-                        return text ? u64{std::strtoull(text, nullptr, 16)} : u64{};
-                    }();
-                    if (watch != 0 && (address & ~u64{0xf}) == (watch & ~u64{0xf})) {
-                        LOG_INFO(HW_GPU, "Semaphore watch: QMD release {:#x} = {:#x} flags {:#x}", address, payload, flags);
-                    }
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                     checked(0, payload);

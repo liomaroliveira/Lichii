@@ -510,54 +510,21 @@ public:
     /// Whether compute or copy work sent so far is still queued (EDEN_NX2_DRAIN_CHECK).
     [[nodiscard]] bool WritersPending() const;
     /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<device address>): whether releases to the semaphore word
-    /// at `device_address` are logged.
-    [[nodiscard]] static u64 SemaphoreWatch() {
-        return WatchRanges()[0].first;
+    /// at `device_address` are logged. Compile-time zero-cost on hot paths (E63.T2).
+    [[nodiscard]] static constexpr u64 SemaphoreWatch() {
+        return 0;
     }
     /// TEST: where the entry the back runs starts in the ring.
     [[nodiscard]] static u64 EntryStart() {
         return Get().back_entry_start;
     }
-    [[nodiscard]] static bool WatchesSemaphore(u64 device_address) {
-        if (SemaphoreWatch() == 0) [[likely]] {
-            return false;
-        }
-        for (const auto& [start, size] : WatchRanges()) {
-            if (start != 0 && device_address >= start && device_address < start + size) {
-                return true;
-            }
-        }
+    [[nodiscard]] static constexpr bool WatchesSemaphore([[maybe_unused]] u64 device_address) {
         return false;
     }
     /// TEST: the first watched word [device_address, +size) covers, or 0.
-    [[nodiscard]] static u64 WatchCovers(u64 device_address, u64 size) {
-        if (SemaphoreWatch() == 0) [[likely]] {
-            return 0;
-        }
-        for (const auto& [start, length] : WatchRanges()) {
-            if (start != 0 && device_address < start + length && start < device_address + size) {
-                return std::max(start, device_address);
-            }
-        }
+    [[nodiscard]] static constexpr u64 WatchCovers([[maybe_unused]] u64 device_address,
+                                                   [[maybe_unused]] u64 size) {
         return 0;
-    }
-    /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<hex device address>[:<size>],...): up to four ranges.
-    [[nodiscard]] static const std::array<std::pair<u64, u64>, 4>& WatchRanges() {
-        static const std::array<std::pair<u64, u64>, 4> ranges = [] {
-            std::array<std::pair<u64, u64>, 4> parsed{};
-            const char* text = std::getenv("EDEN_NX2_SEM_WATCH_DEVICE");
-            for (size_t i = 0; text != nullptr && *text != '\0' && i < parsed.size(); ++i) {
-                char* end{};
-                parsed[i].first = std::strtoull(text, &end, 16) & ~u64{3};
-                parsed[i].second = 4;
-                if (*end == ':') {
-                    parsed[i].second = std::max<u64>(4, std::strtoull(end + 1, &end, 0));
-                }
-                text = *end == ',' ? end + 1 : nullptr;
-            }
-            return parsed;
-        }();
-        return ranges;
     }
     /// TEST: the calling thread's part in the split, for watch logs.
     [[nodiscard]] static const char* ThreadRole() {

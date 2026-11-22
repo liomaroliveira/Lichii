@@ -347,14 +347,8 @@ public:
     void ResolveSplitMethod(GPUVAddr entry_address);
     static constexpr size_t MaxParkedMethods = 16;
 
-    // Read per channel, not at static initialization, which runs before the frontend loads
-    // nx2_switches.txt.
-    // EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
-    // address in the 16 bytes there (finds the engine and method that release a semaphore).
-    const u32 semaphore_watch = [] {
-        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-        return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
-    }();
+    // Zero-cost compile-time constant on hot command dispatch paths (E63.T2).
+    static constexpr u32 semaphore_watch = 0U;
     // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
     const bool record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
