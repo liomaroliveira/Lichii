@@ -57,6 +57,10 @@ public:
         return sparse_compatible;
     }
 
+    [[nodiscard]] bool IsNull() const noexcept {
+        return is_null;
+    }
+
     [[nodiscard]] vk::MemoryLocation Location() const noexcept {
         return buffer.Location();
     }

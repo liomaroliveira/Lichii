@@ -119,13 +119,12 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 } // Anonymous namespace
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler} {
+    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, is_null{true} {
     if (runtime.device.HasNullDescriptor()) {
         return;
     }
     device = &runtime.device;
     buffer = runtime.CreateNullBuffer();
-    is_null = true;
     if (device->IsBufferDeviceAddressSupported()) {
         device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
     }

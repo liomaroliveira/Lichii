@@ -196,6 +196,7 @@ struct Runtime {
     }
     void PreCopyBarrier() {}
     void PostCopyBarrier() {}
+    void PostDownloadBarrier() {}
     void BindUniformBuffer(Buffer&, u32, u32) {}
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
         stream.resize(size);

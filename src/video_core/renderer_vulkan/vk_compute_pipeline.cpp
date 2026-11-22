@@ -694,7 +694,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     if (guest_descriptor_queue.HasRejectedTexelBuffer()) {
-        return ConfigureResult::Failed;
+        return false;
     }
 
     RescalingPushConstant rescaling;

@@ -249,7 +249,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             const char* value = std::getenv("EDEN_NX2_MME_JIT");
             return value == nullptr || value[0] != '0';
         }();
-        if (use_jit && !watched) {
+        if (use_jit) {
             if (!native_macro->native_jit) {
                 native_macro->native_jit = std::make_shared<TuringMacroJit>();
             }
@@ -275,7 +275,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             return value == nullptr || value[0] != '0';
         }();
         auto& memo = native_macro->native_memo;
-        if (use_memo && !watched) {
+        if (use_memo) {
             memo.Synchronize(native_macro->native_code_generation);
             if (std::remove_reference_t<decltype(memo)>::Effects effects;
                 memo.Find(start, native_parameters, *native_macro->native_interpreter.active_dram,
@@ -305,7 +305,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 return emit(address, value);
             });
         const auto& interpreter = native_macro->native_interpreter;
-        if (use_memo && !watched && result.success && !interpreter.read_registers &&
+        if (use_memo && result.success && !interpreter.read_registers &&
             !interpreter.reread_data_ram && code_generation == native_macro->native_code_generation) {
             memo.Store(start, native_memo_parameters, interpreter.data_ram_reads,
                        interpreter.data_ram_writes, native_macro->native_writes);

@@ -1494,3 +1494,46 @@ inline void MaybeReport() {
 }
 
 } // namespace VideoCommon::BackSplit
+
+namespace VideoCommon {
+
+/// EDEN_NX2_H2_SPLIT (E04.T11/T12):
+///   0 (default): off.
+///   1 (E04.T11): Side A and Side B physically decoupled on one thread via H2DrawPacket.
+///   2 (E04.T12): Side B executes asynchronously on GPUBackB via the SPSC ring.
+[[nodiscard]] inline int Nx2H2SplitMode() noexcept {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_H2_SPLIT");
+        if (value == nullptr) {
+            return 0;
+        }
+        if (value[0] == '2') {
+            return 2;
+        }
+        if (value[0] == '1') {
+            return 1;
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+[[nodiscard]] inline bool Nx2H2SplitEnabled() noexcept {
+    return Nx2H2SplitMode() >= 1;
+}
+
+[[nodiscard]] inline bool Nx2H2SplitAsyncEnabled() noexcept {
+    return Nx2H2SplitMode() >= 2;
+}
+
+/// EDEN_NX2_H2_SPLIT_LOCKSTEP=1 (E04.T12): drains GPUBackB after every enqueued H2 draw for
+/// correctness/verification runs. Disabled by default.
+[[nodiscard]] inline bool Nx2H2SplitLockstepEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_H2_SPLIT_LOCKSTEP");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+} // namespace VideoCommon
