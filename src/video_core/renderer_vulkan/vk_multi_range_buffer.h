@@ -61,6 +61,14 @@ public:
 
     void TickFrame(Scheduler& scheduler);
 
+    [[nodiscard]] static bool TraceEnabled();
+
+    // EDEN_NX2_VA_TRACE log for a deleted cache buffer; no-op when the trace is off.
+    static void TraceBufferDeleted(VkBuffer handle, VkDeviceSize size, u64 frame,
+                                   bool multi_range_owner);
+
+    [[nodiscard]] bool IsOwner(VkBuffer owner) const;
+
     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
     bool use_sparse{};
 
@@ -69,6 +77,8 @@ private:
         SparseBuffer handle;
         vk::Buffer gathered;
         u64 tick{};
+        VkDeviceAddress address{};
+        VkBuffer owner{};
     };
 
     struct Entry {
@@ -94,7 +104,7 @@ private:
 
     [[nodiscard]] VkDeviceSize QueryBlockSize(const Device& device, u32& memory_type_bits) const;
 
-    void RetireEntry(Scheduler& scheduler, Entry& entry);
+    void RetireEntry(Scheduler& scheduler, Entry& entry, VkBuffer owner = VK_NULL_HANDLE);
 
     void DrainRetired(Scheduler& scheduler);
 

@@ -324,7 +324,16 @@ public:
         multi_range_buffers.Invalidate(key);
     }
 
+    void SetTraceFrame(u64 frame) noexcept {
+        trace_frame = frame;
+    }
+
     void OnBufferDeleted(const Buffer& buffer) {
+        if (MultiRangeBufferCache::TraceEnabled()) {
+            MultiRangeBufferCache::TraceBufferDeleted(buffer.Handle(), buffer.SizeBytes(),
+                                                      trace_frame,
+                                                      multi_range_buffers.IsOwner(buffer.Handle()));
+        }
         multi_range_buffers.DropOwner(scheduler, buffer.Handle());
     }
 
@@ -394,6 +403,7 @@ private:
     MultiRangeBufferCache multi_range_buffers;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
     VkDeviceSize multi_range_total{};
+    u64 trace_frame{};
 
     StreamUniformRef last_stream_uniform{};
 

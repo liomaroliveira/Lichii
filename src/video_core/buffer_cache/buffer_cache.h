@@ -4893,6 +4893,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     std::erase_if(native_bank_uploads,
                   [buffer_id](const auto& entry) { return entry.second.buffer_id == buffer_id; });
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
+        if constexpr (requires { runtime.SetTraceFrame(frame_tick); }) {
+            runtime.SetTraceFrame(frame_tick);
+        }
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
     read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
