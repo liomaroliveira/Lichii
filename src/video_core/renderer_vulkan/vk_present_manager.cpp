@@ -756,7 +756,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             oot_bridge.UpdateVramStats(device.GetDeviceMemoryUsage(), device.GetDeviceMemoryBudget());
         }
         if (!oot_overlay) {
-            oot_overlay = std::make_unique<OotOverlay>(instance, device, memory_allocator, swapchain);
+            oot_overlay = std::make_unique<OotOverlay>(instance, device, memory_allocator, swapchain,
+                                                      scheduler.submit_mutex);
         }
         oot_overlay->Record(cmdbuf, image, swapchain.GetImageIndex(), extent,
                             swapchain.GetImageFormat(),

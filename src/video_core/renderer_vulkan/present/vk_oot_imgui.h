@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,8 @@ class Swapchain;
 class OotOverlay {
 public:
     OotOverlay(const vk::Instance& instance, const Device& device,
-               MemoryAllocator& memory_allocator, Swapchain& swapchain);
+               MemoryAllocator& memory_allocator, Swapchain& swapchain,
+               std::mutex& queue_submit_mutex);
     ~OotOverlay();
 
     OotOverlay(const OotOverlay&) = delete;
@@ -61,7 +63,8 @@ private:
 
     bool EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent);
     void BuildFontAtlas();
-    void CleanupRetired(bool force_all);
+    void CleanupRetired(bool force_all, bool lock_held = false);
+    void ProcessBackendTextures(ImDrawData* draw_data);
     void UploadTextures(const vk::CommandBuffer& cmdbuf, ImDrawData* draw_data);
     void Shutdown();
 
@@ -69,6 +72,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Swapchain& swapchain;
+    std::mutex& queue_submit_mutex_; ///< Scheduler::submit_mutex: guards the graphics queue
 
     ImGuiContext* ctx = nullptr;
     OotUi::Fonts fonts_{};
@@ -99,6 +103,7 @@ private:
     std::unique_ptr<ImTextureData> game_icon_;
     bool icon_failed_ = false;
     u64 game_info_serial_ = 0;
+    u64 backend_tex_events_ = 0;
     std::string game_title_;
     std::string game_id_;
 };

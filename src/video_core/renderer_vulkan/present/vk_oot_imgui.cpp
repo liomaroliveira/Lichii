@@ -166,9 +166,10 @@ void TransitionSwapchainImage(const vk::CommandBuffer& cmdbuf, VkImage image, Vk
 } // namespace
 
 OotOverlay::OotOverlay(const vk::Instance& instance_, const Device& device_,
-                       MemoryAllocator& memory_allocator_, Swapchain& swapchain_)
+                       MemoryAllocator& memory_allocator_, Swapchain& swapchain_,
+                       std::mutex& queue_submit_mutex)
     : instance(instance_), device(device_), memory_allocator(memory_allocator_),
-      swapchain(swapchain_) {}
+      swapchain(swapchain_), queue_submit_mutex_(queue_submit_mutex) {}
 
 OotOverlay::~OotOverlay() {
     Shutdown();
@@ -179,10 +180,13 @@ void OotOverlay::Shutdown() {
         return;
     }
     ImGui::SetCurrentContext(ctx);
+    // Held across WaitIdle and every destruction below (E65). Not recursive: CleanupRetired is
+    // told the lock is held. No caller of Shutdown holds submit_mutex (see PresentManager dtor).
+    std::scoped_lock queue_lock{queue_submit_mutex_};
     if (backend_ready_) {
         (void)device.GetLogical().WaitIdle(); // nothing of ours may still be in flight
     }
-    CleanupRetired(true);
+    CleanupRetired(true, true);
     for (auto& tex : live_textures_) {
         if (tex && tex->ds != VK_NULL_HANDLE && backend_ready_) {
             ImGui_ImplVulkan_RemoveTexture(tex->ds);
@@ -221,13 +225,26 @@ void OotOverlay::Shutdown() {
     }
 }
 
-void OotOverlay::CleanupRetired(bool force_all) {
+void OotOverlay::CleanupRetired(bool force_all, bool lock_held) {
     constexpr u64 kKeepFrames = 10;
-    std::erase_if(retired_uploads_, [&](const RetiredUpload& item) {
-        return force_all || (present_serial_ - item.serial >= kKeepFrames);
-    });
+    const auto due = [&](u64 serial) { return force_all || (present_serial_ - serial >= kKeepFrames); };
+    const bool any_due =
+        std::ranges::any_of(retired_uploads_, [&](const RetiredUpload& r) { return due(r.serial); }) ||
+        std::ranges::any_of(retired_textures_, [&](const RetiredTex& r) { return due(r.serial); });
+    if (!any_due) {
+        return;
+    }
+    // Rare: wait for the GPU under the queue lock instead of trusting a frame count (E65)
+    std::unique_lock<std::mutex> lock{queue_submit_mutex_, std::defer_lock};
+    if (!lock_held) {
+        lock.lock();
+        if (backend_ready_ || !retired_uploads_.empty() || !retired_textures_.empty()) {
+            (void)device.GetLogical().WaitIdle();
+        }
+    }
+    std::erase_if(retired_uploads_, [&](const RetiredUpload& item) { return due(item.serial); });
     for (auto it = retired_textures_.begin(); it != retired_textures_.end();) {
-        if (force_all || (present_serial_ - it->serial >= kKeepFrames)) {
+        if (due(it->serial)) {
             if (it->tex && it->tex->ds != VK_NULL_HANDLE && backend_ready_) {
                 ImGui_ImplVulkan_RemoveTexture(it->tex->ds);
                 it->tex->ds = VK_NULL_HANDLE;
@@ -235,6 +252,36 @@ void OotOverlay::CleanupRetired(bool force_all) {
             it = retired_textures_.erase(it);
         } else {
             ++it;
+        }
+    }
+}
+
+void OotOverlay::ProcessBackendTextures(ImDrawData* draw_data) {
+    if (!draw_data || !draw_data->Textures) {
+        return;
+    }
+    std::vector<ImTextureData*> pending;
+    for (ImTextureData* tex : *draw_data->Textures) {
+        if (tex != game_icon_.get() && tex->Status != ImTextureStatus_OK) {
+            pending.push_back(tex);
+        }
+    }
+    if (pending.empty()) {
+        return;
+    }
+    // The backend's UpdateTexture allocates, submits on the graphics queue and waits idle:
+    // keep it out of the emulator's own submits and make sure nothing in flight uses what it frees.
+    std::scoped_lock lock{queue_submit_mutex_};
+    (void)device.GetLogical().WaitIdle();
+    for (ImTextureData* tex : pending) {
+        const int before = static_cast<int>(tex->Status);
+        const int id = tex->UniqueID;
+        ImGui_ImplVulkan_UpdateTexture(tex);
+        const u64 n = backend_tex_events_++;
+        if (n < 32 || n % 64 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "OotOverlay: backend texture {} status {}->{} {}x{} (queue locked, device idle)",
+                     id, before, static_cast<int>(tex->Status), tex->Width, tex->Height);
         }
     }
 }
@@ -353,6 +400,9 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
 
     if (!render_pass_ || render_pass_format_ != swapchain_format) {
         if (backend_ready_) {
+            // E65: queue lock across WaitIdle + destruction (EnsureInitialized is called from Record,
+            // which runs without submit_mutex held)
+            std::scoped_lock queue_lock{queue_submit_mutex_};
             (void)device.GetLogical().WaitIdle();
             for (auto& tex : live_textures_) {
                 if (tex && tex->ds != VK_NULL_HANDLE) {
@@ -440,6 +490,7 @@ bool OotOverlay::EnsureInitialized(VkFormat swapchain_format, VkExtent2D extent)
         init_info.PipelineInfoMain.RenderPass = *render_pass_;
         init_info.PipelineInfoMain.Subpass = 0;
         init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        init_info.MinAllocationSize = 1024 * 1024; // keep per-frame vertex/index buffers across growth
         init_info.CheckVkResultFn = &CheckVk;
 
         if (!ImGui_ImplVulkan_Init(&init_info)) {
@@ -881,6 +932,7 @@ void OotOverlay::Record(const vk::CommandBuffer& cmdbuf, VkImage swapchain_image
                                   : 200.0;
     RemapDrawDataColors(draw_data, IsSrgbFormat(swapchain_format), is_hdr, white_nits);
     UploadTextures(cmdbuf, draw_data);
+    ProcessBackendTextures(draw_data);
 
     TransitionSwapchainImage(cmdbuf, swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
