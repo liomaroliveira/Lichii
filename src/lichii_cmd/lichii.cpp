@@ -31,11 +31,14 @@
 
 #include <fmt/ostream.h>
 
+#include <SDL3/SDL_events.h>
+
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/oot_menu_bridge.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -891,6 +894,20 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.Run();
     });
 
+    // The in-game menu's "close game" and "quit" end eden-cli through the window's quit path
+    // (there is no game list to return to). SDL_PushEvent is safe from the menu's thread.
+    {
+        const auto push_quit = [] {
+            SDL_Event quit_event{};
+            quit_event.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit_event);
+        };
+        Common::OotMenu::HostCallbacks callbacks{};
+        callbacks.stop_game = push_quit;
+        callbacks.quit_game = push_quit;
+        Common::OotMenu::Bridge::Instance().RegisterCallbacks(std::move(callbacks));
+    }
+
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
@@ -973,6 +990,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (!state) {
         return;
     }
+    Common::OotMenu::Bridge::Instance().ClearCallbacks();
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
