@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <deque>
 #include <limits>
 #include <optional>
 #include <source_location>
@@ -328,14 +329,21 @@ public:
         trace_frame = frame;
     }
 
-    void OnBufferDeleted(const Buffer& buffer) {
+    /// Returns whether the buffer is a source of a multi-range buffer (live or retired), whose
+    /// memory a sparse alias may still read: the caller keeps it with RetireBufferUntilGpuDone.
+    [[nodiscard]] bool OnBufferDeleted(const Buffer& buffer) {
+        const bool owner = multi_range_buffers.IsOwner(buffer.Handle());
         if (MultiRangeBufferCache::TraceEnabled()) {
             MultiRangeBufferCache::TraceBufferDeleted(buffer.Handle(), buffer.SizeBytes(),
-                                                      trace_frame,
-                                                      multi_range_buffers.IsOwner(buffer.Handle()));
+                                                      trace_frame, owner);
         }
         multi_range_buffers.DropOwner(scheduler, buffer.Handle());
+        return owner;
     }
+
+    /// Keeps a deleted multi-range source until the GPU is past the work recorded so far: the
+    /// frame-count ring frees it regardless of GPU progress, while a sparse alias reads its memory.
+    void RetireBufferUntilGpuDone(Buffer&& buffer);
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
         BindBuffer(buffer, offset, size);
@@ -401,6 +409,8 @@ private:
     QuadIndexedPass quad_index_pass;
 
     MultiRangeBufferCache multi_range_buffers;
+    /// Deleted multi-range sources and the GPU tick that frees each one (TickFrame).
+    std::deque<std::pair<u64, Buffer>> retired_multi_range_sources;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
     VkDeviceSize multi_range_total{};
     u64 trace_frame{};

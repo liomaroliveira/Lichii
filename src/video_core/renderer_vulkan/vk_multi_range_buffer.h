@@ -67,6 +67,11 @@ public:
     static void TraceBufferDeleted(VkBuffer handle, VkDeviceSize size, u64 frame,
                                    bool multi_range_owner);
 
+    // EDEN_NX2_VA_TRACE logs for a deleted multi-range source kept until the GPU is past `tick`,
+    // and for its final release; no-ops when the trace is off.
+    static void TraceBufferRetired(VkBuffer handle, u64 tick, u64 current_tick);
+    static void TraceBufferFreed(VkBuffer handle, u64 tick, u64 current_tick);
+
     [[nodiscard]] bool IsOwner(VkBuffer owner) const;
 
     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
@@ -79,6 +84,7 @@ private:
         u64 tick{};
         VkDeviceAddress address{};
         VkBuffer owner{};
+        std::vector<VkBuffer> owners;
     };
 
     struct Entry {

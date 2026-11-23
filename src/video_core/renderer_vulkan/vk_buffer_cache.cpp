@@ -574,6 +574,24 @@ void BufferCacheRuntime::TickFrame(
     [[maybe_unused]] Common::SlotVector<Buffer>& slot_buffers) noexcept {
     // Buffers' uses need no reset: they are kept by submission (VideoCommon::SubmissionUses).
     multi_range_buffers.TickFrame(scheduler);
+    // Sources after the sparse entries above: an entry retired with its source shares its tick.
+    while (!retired_multi_range_sources.empty() &&
+           scheduler.IsFree(retired_multi_range_sources.front().first)) {
+        if (MultiRangeBufferCache::TraceEnabled()) {
+            const auto& [tick, buffer] = retired_multi_range_sources.front();
+            MultiRangeBufferCache::TraceBufferFreed(buffer.Handle(), tick,
+                                                    scheduler.CurrentTick());
+        }
+        retired_multi_range_sources.pop_front();
+    }
+}
+
+void BufferCacheRuntime::RetireBufferUntilGpuDone(Buffer&& buffer) {
+    const u64 tick = scheduler.CurrentTick();
+    if (MultiRangeBufferCache::TraceEnabled()) {
+        MultiRangeBufferCache::TraceBufferRetired(buffer.Handle(), tick, tick);
+    }
+    retired_multi_range_sources.emplace_back(tick, std::move(buffer));
 }
 
 u64 BufferCacheRuntime::CurrentTick() {

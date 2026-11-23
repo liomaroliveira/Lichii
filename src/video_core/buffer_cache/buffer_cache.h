@@ -4892,11 +4892,19 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // A slot id is reused by the next buffer: forget the native banks uploaded into this one.
     std::erase_if(native_bank_uploads,
                   [buffer_id](const auto& entry) { return entry.second.buffer_id == buffer_id; });
+    // A multi-range source may be aliased by a sparse buffer the GPU still reads: it is freed by
+    // GPU tick instead of the frame-count ring below.
+    [[maybe_unused]] bool multi_range_owner = false;
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         if constexpr (requires { runtime.SetTraceFrame(frame_tick); }) {
             runtime.SetTraceFrame(frame_tick);
         }
-        runtime.OnBufferDeleted(slot_buffers[buffer_id]);
+        using Result = decltype(runtime.OnBufferDeleted(slot_buffers[buffer_id]));
+        if constexpr (std::is_same_v<Result, bool>) {
+            multi_range_owner = runtime.OnBufferDeleted(slot_buffers[buffer_id]);
+        } else {
+            runtime.OnBufferDeleted(slot_buffers[buffer_id]);
+        }
     }
     read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
                                  slot_buffers[buffer_id].SizeBytes());
@@ -4967,7 +4975,20 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 #ifdef LICHII_LEGACY
     if (!do_not_mark || !immediately_free)
 #endif
-        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
+    {
+        bool retired = false;
+        if constexpr (requires(Buffer&& buffer) {
+                          runtime.RetireBufferUntilGpuDone(std::move(buffer));
+                      }) {
+            if (multi_range_owner) {
+                runtime.RetireBufferUntilGpuDone(std::move(slot_buffers[buffer_id]));
+                retired = true;
+            }
+        }
+        if (!retired) {
+            delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
+        }
+    }
 
     slot_buffers.erase(buffer_id);
 }

@@ -18,12 +18,11 @@ namespace Vulkan {
 
 namespace {
 
-// Sparse aliasing is off by default: only EDEN_NX2_MULTI_RANGE_SPARSE=1 enables it, anything else
-// uses the gathered-copy path.
+// EDEN_NX2_MULTI_RANGE_SPARSE=0 forces the gathered-copy path; anything else keeps sparse aliasing.
 bool SparseAllowedByEnv() {
     static const bool allowed = [] {
         const char* value = std::getenv("EDEN_NX2_MULTI_RANGE_SPARSE");
-        return value != nullptr && std::strcmp(value, "1") == 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return allowed;
 }
@@ -40,7 +39,16 @@ bool VaTraceEnabled() {
 constexpr u64 TRACE_VA_BEGIN = 0xffff800100000000ULL;
 constexpr u64 TRACE_VA_END = 0xffff800100400000ULL;
 
-enum class TraceKind : size_t { Create, Retire, Free, Drop, Delete, Count };
+enum class TraceKind : size_t {
+    Create,
+    Retire,
+    Free,
+    Drop,
+    Delete,
+    BufferRetire,
+    BufferFree,
+    Count,
+};
 
 // Events inside the watched VA window always log; the rest log 1 line per 64 events. A summary of
 // event counts is logged once per second.
@@ -61,10 +69,12 @@ void VaTrace(TraceKind kind, u64 address, fmt::format_string<Args...> format, Ar
     if (now - last_summary >= std::chrono::seconds(1)) {
         last_summary = now;
         LOG_INFO(Render_Vulkan,
-                 "VA trace: summary/s creates={} retires={} frees={} drops={} deletes={}",
+                 "VA trace: summary/s creates={} retires={} frees={} drops={} deletes={} "
+                 "buffer_retires={} buffer_frees={}",
                  counts[0] - last_counts[0], counts[1] - last_counts[1],
                  counts[2] - last_counts[2], counts[3] - last_counts[3],
-                 counts[4] - last_counts[4]);
+                 counts[4] - last_counts[4], counts[5] - last_counts[5],
+                 counts[6] - last_counts[6]);
         last_counts = counts;
     }
 }
@@ -84,6 +94,22 @@ void MultiRangeBufferCache::TraceBufferDeleted(VkBuffer handle, VkDeviceSize siz
             fmt::ptr(handle), u64(size), frame, multi_range_owner);
 }
 
+void MultiRangeBufferCache::TraceBufferRetired(VkBuffer handle, u64 tick, u64 current_tick) {
+    if (!VaTraceEnabled()) {
+        return;
+    }
+    VaTrace(TraceKind::BufferRetire, 0, "retire source buffer={} until_tick={} current_tick={}",
+            fmt::ptr(handle), tick, current_tick);
+}
+
+void MultiRangeBufferCache::TraceBufferFreed(VkBuffer handle, u64 tick, u64 current_tick) {
+    if (!VaTraceEnabled()) {
+        return;
+    }
+    VaTrace(TraceKind::BufferFree, 0, "free source buffer={} retire_tick={} current_tick={}",
+            fmt::ptr(handle), tick, current_tick);
+}
+
 MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     sparse_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -94,8 +120,7 @@ MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     const bool supported = device.IsSparseBindingSupported();
     if (!env_allows || !supported) {
         LOG_INFO(Render_Vulkan, "MultiRange: sparse aliasing {}",
-                 !supported ? "unsupported"
-                            : "disabled (default; EDEN_NX2_MULTI_RANGE_SPARSE=1 enables)");
+                 !supported ? "unsupported" : "disabled by EDEN_NX2_MULTI_RANGE_SPARSE=0");
         return;
     }
     u32 memory_type_bits = 0;
@@ -106,7 +131,8 @@ MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     block_size = queried;
     sparse_memory_type_bits = memory_type_bits;
     use_sparse = true;
-    LOG_INFO(Render_Vulkan, "MultiRange: sparse aliasing enabled by EDEN_NX2_MULTI_RANGE_SPARSE=1");
+    LOG_INFO(Render_Vulkan,
+             "MultiRange: sparse aliasing enabled (default; EDEN_NX2_MULTI_RANGE_SPARSE=0 disables)");
 }
 
 VkDeviceSize MultiRangeBufferCache::QueryBlockSize(const Device& device,
@@ -151,6 +177,8 @@ u64 MultiRangeBufferCache::HashSources(std::span<const MultiRangeSource> sources
     };
     for (const MultiRangeSource& source : sources) {
         mix(u64(source.handle));
+        // A VkBuffer handle value reused with other memory must not match a stale entry.
+        mix(u64(source.memory));
         mix(u64(source.offset));
         mix(u64(source.size));
     }
@@ -290,6 +318,7 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry, VkBu
         .tick = scheduler.CurrentTick(),
         .address = entry.address,
         .owner = owner,
+        .owners = std::move(entry.owners),
     });
 }
 
@@ -447,6 +476,12 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
 bool MultiRangeBufferCache::IsOwner(VkBuffer owner) const {
     for (const auto& [key, entry] : entries) {
         if (std::ranges::find(entry.owners, owner) != entry.owners.end()) {
+            return true;
+        }
+    }
+    // A retired sparse entry still aliases its sources' memory until the GPU is past it.
+    for (const Retired& pending : retired) {
+        if (pending.handle && std::ranges::find(pending.owners, owner) != pending.owners.end()) {
             return true;
         }
     }
