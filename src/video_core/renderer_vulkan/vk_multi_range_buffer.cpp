@@ -18,11 +18,12 @@ namespace Vulkan {
 
 namespace {
 
-// EDEN_NX2_MULTI_RANGE_SPARSE=0 forces the gathered-copy path; anything else keeps the default.
+// Sparse aliasing is off by default: only EDEN_NX2_MULTI_RANGE_SPARSE=1 enables it, anything else
+// uses the gathered-copy path.
 bool SparseAllowedByEnv() {
     static const bool allowed = [] {
         const char* value = std::getenv("EDEN_NX2_MULTI_RANGE_SPARSE");
-        return value == nullptr || std::strcmp(value, "0") != 0;
+        return value != nullptr && std::strcmp(value, "1") == 0;
     }();
     return allowed;
 }
@@ -93,7 +94,8 @@ MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     const bool supported = device.IsSparseBindingSupported();
     if (!env_allows || !supported) {
         LOG_INFO(Render_Vulkan, "MultiRange: sparse aliasing {}",
-                 !env_allows ? "disabled by EDEN_NX2_MULTI_RANGE_SPARSE=0" : "unsupported");
+                 !supported ? "unsupported"
+                            : "disabled (default; EDEN_NX2_MULTI_RANGE_SPARSE=1 enables)");
         return;
     }
     u32 memory_type_bits = 0;
@@ -104,7 +106,7 @@ MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
     block_size = queried;
     sparse_memory_type_bits = memory_type_bits;
     use_sparse = true;
-    LOG_INFO(Render_Vulkan, "MultiRange: sparse aliasing enabled");
+    LOG_INFO(Render_Vulkan, "MultiRange: sparse aliasing enabled by EDEN_NX2_MULTI_RANGE_SPARSE=1");
 }
 
 VkDeviceSize MultiRangeBufferCache::QueryBlockSize(const Device& device,
